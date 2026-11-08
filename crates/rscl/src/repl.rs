@@ -16,6 +16,24 @@ extern "C" fn on_sigint(_: i32) {
     rscl_runtime::native::request_interrupt();
 }
 
+/// Shift the REPL history vars: `*3` ← `*2` ← `*1` ← the new result.
+fn remember(v: rscl_runtime::Value) {
+    let user = ns::current();
+    let v2 = user.intern("*2").root();
+    user.intern("*3").bind_root(if v2.is_unbound() {
+        rscl_runtime::Value::NIL
+    } else {
+        v2
+    });
+    let v1 = user.intern("*1").root();
+    user.intern("*2").bind_root(if v1.is_unbound() {
+        rscl_runtime::Value::NIL
+    } else {
+        v1
+    });
+    user.intern("*1").bind_root(v);
+}
+
 pub fn run() -> i32 {
     // Ctrl-C during an evaluation raises InterruptedException instead of killing the
     // process; at the prompt rustyline reports it as `Interrupted`.
@@ -40,6 +58,11 @@ pub fn run() -> i32 {
         let _ = rl.load_history(h);
     }
     eprintln!("rscl {} — Ctrl-D to exit", env!("CARGO_PKG_VERSION"));
+    for name in ["*1", "*2", "*3", "*e"] {
+        ns::current()
+            .intern(name)
+            .bind_root(rscl_runtime::Value::NIL);
+    }
 
     let mut buffer = String::new();
     loop {
@@ -83,9 +106,13 @@ pub fn run() -> i32 {
                 buffer.clear();
                 for form in forms {
                     match jit.eval(&form) {
-                        Ok(v) => println!("{}", pr_str(&v)),
+                        Ok(v) => {
+                            println!("{}", pr_str(&v));
+                            remember(v);
+                        }
                         Err(EvalError::Exception(e)) => {
                             eprintln!("Execution error: {}", exc::format_exception(&e));
+                            ns::current().intern("*e").bind_root(e);
                         }
                         Err(e) => eprintln!("{e}"),
                     }

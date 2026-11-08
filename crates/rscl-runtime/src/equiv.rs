@@ -30,45 +30,50 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
             let (x, y) = (obj::symbol::get(a), obj::symbol::get(b));
             x.ns == y.ns && x.name == y.name
         }
-        (Kind::List | Kind::Vector, Kind::List | Kind::Vector) => seq_equiv(a, b),
+        (
+            Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq,
+            Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq,
+        ) => seq_equiv(a, b),
         (Kind::Map, Kind::Map) => obj::map::get(a).m == obj::map::get(b).m,
         (Kind::Set, Kind::Set) => obj::set::get(a).s == obj::set::get(b).s,
+        (Kind::Regex, Kind::Regex) => obj::regex::get(a).source == obj::regex::get(b).source,
         _ => false,
     }
 }
 
+/// Element-wise comparison of sequential values. A realisation error inside a lazy
+/// seq cannot be reported from `==`; it is discarded and the values compare unequal.
 fn seq_equiv(a: &Value, b: &Value) -> bool {
-    if count(a) != count(b) {
+    let (ca, cb) = (fast_count(a), fast_count(b));
+    if let (Some(x), Some(y)) = (ca, cb)
+        && x != y
+    {
         return false;
     }
-    let mut ia = items(a);
-    let mut ib = items(b);
+    let mut ia = crate::coll::seq_iter(a);
+    let mut ib = crate::coll::seq_iter(b);
     loop {
         match (ia.next(), ib.next()) {
             (None, None) => return true,
-            (Some(x), Some(y)) => {
-                if !equiv(x, y) {
+            (Some(Ok(x)), Some(Ok(y))) => {
+                if !equiv(&x, &y) {
                     return false;
                 }
+            }
+            (Some(Err(_)), _) | (_, Some(Err(_))) => {
+                crate::exc::take();
+                return false;
             }
             _ => return false,
         }
     }
 }
 
-fn count(v: &Value) -> usize {
+fn fast_count(v: &Value) -> Option<usize> {
     match v.kind() {
-        Some(Kind::List) => obj::list::get(v).count as usize,
-        Some(Kind::Vector) => obj::vector::get(v).v.len(),
-        _ => 0,
-    }
-}
-
-fn items<'a>(v: &'a Value) -> Box<dyn Iterator<Item = &'a Value> + 'a> {
-    match v.kind() {
-        Some(Kind::List) => Box::new(obj::list::get(v).iter()),
-        Some(Kind::Vector) => Box::new(obj::vector::get(v).v.iter()),
-        _ => Box::new(std::iter::empty()),
+        Some(Kind::List) => Some(obj::list::get(v).count as usize),
+        Some(Kind::Vector) => Some(obj::vector::get(v).v.len()),
+        _ => None,
     }
 }
 
@@ -124,13 +129,20 @@ pub fn hasheq(v: &Value) -> u64 {
             mix64(hash_named(s.ns(), s.name()))
         }
         Kind::Keyword => obj::keyword::get(v).hash,
-        Kind::List | Kind::Vector => {
+        Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq => {
             let mut h = SEQ_SEED;
-            for x in items(v) {
-                h = h.wrapping_mul(31).wrapping_add(hasheq(x));
+            for x in crate::coll::seq_iter(v) {
+                match x {
+                    Ok(x) => h = h.wrapping_mul(31).wrapping_add(hasheq(&x)),
+                    Err(_) => {
+                        crate::exc::take();
+                        break;
+                    }
+                }
             }
             mix64(h)
         }
+        Kind::Regex => mix64(hash_bytes(obj::regex::get(v).source.as_bytes()) ^ 0x5e5e),
         Kind::Map => {
             let mut h = MAP_SEED;
             for (k, val) in obj::map::get(v).m.iter() {
@@ -146,9 +158,7 @@ pub fn hasheq(v: &Value) -> u64 {
             mix64(h)
         }
         // Identity-hashed kinds.
-        Kind::Fn | Kind::Var | Kind::Exception | Kind::Atom | Kind::LazySeq | Kind::Namespace => {
-            mix64(v.bits())
-        }
+        Kind::Fn | Kind::Var | Kind::Exception | Kind::Atom | Kind::Namespace => mix64(v.bits()),
     }
 }
 

@@ -206,7 +206,7 @@ fn compile_errors() {
         assert!(eval(j, "nope").starts_with("ERR Compile error"));
         assert!(eval(j, "(recur 1)").contains("recur"));
         assert!(eval(j, "(fn [a] (if a (recur 1) 2) 3)").contains("tail position"));
-        assert!(eval(j, "(let [1 2] 3)").contains("Bad binding form"));
+        assert!(eval(j, "(let [1 2] 3)").contains("Unsupported binding form"));
         assert!(eval(j, "(fn ([a] a) ([b] b))").contains("same arity"));
     });
 }
@@ -365,5 +365,53 @@ fn stack_overflow_is_an_exception() {
             eval(j, "(try (deep 0) (catch StackOverflowError e :caught))"),
             ":caught"
         );
+    });
+}
+
+#[test]
+fn macros_and_lazy_seqs() {
+    with_jit(|j| {
+        def(j, "(defmacro unless [t & body] `(if ~t nil (do ~@body)))");
+        assert_eq!(eval(j, "(unless false (str \"ran\"))"), "\"ran\"");
+        assert_eq!(
+            eval(j, "(macroexpand-1 '(unless x 1))"),
+            "(if x nil (do 1))"
+        );
+        assert_eq!(
+            eval(j, "(take 3 (map (fn [x] (str x)) (range)))"),
+            "(\"0\" \"1\" \"2\")"
+        );
+        assert_eq!(eval(j, "(reduce + (filter even? (range 100)))"), "2450");
+        assert_eq!(
+            eval(j, "(doall (take 5 (iterate (fn [s] (str s \"a\")) \"\")))"),
+            "(\"\" \"a\" \"aa\" \"aaa\" \"aaaa\")"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [[a b & r] [(str \"x\") 2 3 4] {:keys [k]} {:k (str \"v\")}] [a b r k])"
+            ),
+            "[\"x\" 2 (3 4) \"v\"]"
+        );
+        assert_eq!(eval(j, "((fn [[a b]] (str a b)) [\"p\" \"q\"])"), "\"pq\"");
+        assert_eq!(
+            eval(j, "(for [x (range 3) :when (odd? x)] (str x))"),
+            "(\"1\")"
+        );
+        assert_eq!(
+            eval(j, "(let [a (atom (str \"s\"))] (swap! a str \"t\") @a)"),
+            "\"st\""
+        );
+        assert_eq!(eval(j, "(re-seq #\"\\d\" \"a1b2\")"), "(\"1\" \"2\")");
+        assert_eq!(eval(j, "(count (doall (range 20000)))"), "20000");
+        assert_eq!(
+            eval(
+                j,
+                "(let [s (map (fn [x] (if (= x 5) (throw (ex-info \"five\" {})) x)) (range 10))] (try (doall s) (catch Exception e (ex-message e))))"
+            ),
+            "\"five\""
+        );
+        assert_eq!(eval(j, "(#(str % %2) \"a\" \"b\")"), "\"ab\"");
+        assert_eq!(eval(j, "(case (str \"a\") \"a\" :a :other)"), ":a");
     });
 }

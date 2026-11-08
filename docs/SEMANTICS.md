@@ -44,6 +44,22 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   `UnsupportedOperationException`, `StackOverflowError`, `InterruptedException`,
   `RuntimeException`. `Throwable`, `Exception` and `Error` catch everything.
 
+## Macros and sequences
+
+- `defmacro` fns receive `&form` and `&env` (always `nil`) before their declared params.
+  Macros are expanded by the analyzer by calling the macro fn at compile time; an
+  exception inside a macro is reported as a compile error at the call site. Special
+  forms win over macros; a local shadows a macro of the same name.
+- Syntax-quote qualifies unqualified symbols with the namespace of the var they resolve
+  to (else the current namespace); `x#` makes one gensym per syntax-quote.
+- Lazy seqs are unchunked: `(map f coll)` realises one element at a time. `rest` of a
+  cons cell returns its tail unrealised. Printing, equality, `count` and `hash` realise
+  the whole seq. A lazy seq whose body throws stays unrealised and can be retried.
+- `(range 0)` and other empty lazy seqs are `()`, not `nil`; `(seq ())` is `nil`.
+- Sequential collections of every kind (list, vector, cons, lazy seq) are `=` when
+  their elements are, and hash alike.
+- `letfn` and transducers are not implemented yet.
+
 ## Exceptions, continued
 
 - `catch` clauses match in order; `catch Throwable`/`Exception`/`Error` catch
@@ -74,6 +90,9 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 - `rscl run FILE` and an AOT-built binary behave identically: every top-level form
   runs in order, then `-main` is called with the command-line arguments if it is
   bound. Exit status: 0 ok, 1 uncaught exception, 2 compile error, 3 reader error.
-- Until macros exist, `build` is a pure compile. From Phase 4 it also evaluates each
-  top-level form at build time (Clojure AOT semantics); `--no-eval` will opt out.
+- `build` evaluates every top-level form at build time in a JIT as it compiles it
+  (Clojure AOT semantics), so macros and `def`s earlier in the file are available to
+  later forms; side effects therefore run at build time and again at program start.
+  `--no-eval` turns that off (only `core.clj` macros are then usable). `core.clj` is
+  compiled into every binary.
 - AOT binaries have no `eval`.

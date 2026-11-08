@@ -1,14 +1,45 @@
 //! The reader: text → forms (runtime `Value`s), so the compiler is homoiconic and
 //! `read-string` is available at run time. Records source positions in object
-//! headers. Syntax-quote, `#()` and `#""` arrive in Phase 4.
+//! headers. Implements syntax-quote, `#()` and `#""` regex literals.
+use std::collections::{BTreeMap, HashMap};
+
 use crate::obj::{self, Kind, keyword, list, map, set, string, symbol, vector};
 use crate::pos::{self, SrcPos};
 use crate::value::Value;
 
-/// What the reader needs from its environment to resolve `::kw` and `::alias/kw`.
+/// Special forms: never qualified by syntax-quote and never shadowed by macros.
+pub const SPECIAL_FORMS: &[&str] = &[
+    "def",
+    "if",
+    "do",
+    "let*",
+    "loop*",
+    "recur",
+    "fn*",
+    "quote",
+    "var",
+    "throw",
+    "try",
+    "set!",
+    "letfn*",
+    "case*",
+    "native-call*",
+];
+
+pub fn is_special(name: &str) -> bool {
+    SPECIAL_FORMS.contains(&name)
+}
+
+/// What the reader needs from its environment: `::kw` resolution and symbol
+/// qualification inside syntax-quote.
 pub trait ReaderEnv {
     fn current_ns(&self) -> String;
     fn resolve_alias(&self, alias: &str) -> Option<String>;
+    /// Namespace an unqualified symbol is qualified with inside syntax-quote: the
+    /// namespace of the var it resolves to, else the current namespace.
+    fn resolve_symbol_ns(&self, _name: &str) -> String {
+        self.current_ns()
+    }
 }
 
 /// Uses the runtime's current namespace.
@@ -23,6 +54,24 @@ impl ReaderEnv for DefaultEnv {
             .resolve_alias(alias)
             .map(|n| n.name.to_string())
     }
+    fn resolve_symbol_ns(&self, name: &str) -> String {
+        let cur = crate::ns::current();
+        match crate::ns::resolve(cur, None, name) {
+            Some(v) => v.ns.to_string(),
+            None => cur.name.to_string(),
+        }
+    }
+}
+
+fn core_sym(name: &str) -> Value {
+    symbol::new(Some("clojure.core"), name)
+}
+
+fn is_core_call(items: &[Value], name: &str) -> bool {
+    items
+        .first()
+        .and_then(symbol::as_sym)
+        .is_some_and(|s| s.is(Some("clojure.core"), name))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +108,11 @@ pub struct Reader<'a> {
     /// `read-string` must not grow the global position table).
     record_pos: bool,
     env: &'a dyn ReaderEnv,
+    /// One auto-gensym table per enclosing syntax-quote (`x#` → the same symbol
+    /// within one quote).
+    gensyms: Vec<HashMap<String, Value>>,
+    /// `%`-argument table while reading a `#(...)` body (index → symbol; -1 is `%&`).
+    arg_env: Option<BTreeMap<i64, Value>>,
 }
 
 /// Read exactly one form from `s`.
@@ -103,6 +157,8 @@ impl<'a> Reader<'a> {
             file: 0,
             record_pos: false,
             env,
+            gensyms: Vec::new(),
+            arg_env: None,
         }
     }
 
@@ -263,8 +319,25 @@ impl<'a> Reader<'a> {
                     f,
                 ]))
             }
-            '`' => Err(self.syntax("syntax-quote is not supported yet")),
-            '~' => Err(self.syntax("unquote is not supported yet")),
+            '`' => {
+                self.bump();
+                self.gensyms.push(HashMap::new());
+                let f = self.read_required("syntax-quoted form");
+                let r = f.and_then(|f| self.syntax_quote(&f));
+                self.gensyms.pop();
+                r
+            }
+            '~' => {
+                self.bump();
+                if self.peek() == Some('@') {
+                    self.bump();
+                    let f = self.read_required("unquote-splicing form")?;
+                    Ok(list::from_slice(&[core_sym("unquote-splicing"), f]))
+                } else {
+                    let f = self.read_required("unquote form")?;
+                    Ok(list::from_slice(&[core_sym("unquote"), f]))
+                }
+            }
             '^' => {
                 self.bump();
                 self.read_meta()
@@ -533,8 +606,39 @@ impl<'a> Reader<'a> {
                     _ => Err(self.syntax(format!("Unknown symbolic value: ##{tok}"))),
                 }
             }
-            '(' => Err(self.syntax("#() anonymous functions are not supported yet")),
-            '"' => Err(self.syntax("#\"\" regex literals are not supported yet")),
+            '(' => {
+                if self.arg_env.is_some() {
+                    return Err(self.syntax("Nested #()s are not allowed"));
+                }
+                self.arg_env = Some(BTreeMap::new());
+                self.bump();
+                let body = self.read_seq(')');
+                let env = self.arg_env.take().unwrap_or_default();
+                let body = body?;
+                let max_arg = env.keys().copied().filter(|k| *k > 0).max().unwrap_or(0);
+                let mut params = Vec::new();
+                for i in 1..=max_arg {
+                    params.push(env.get(&i).cloned().unwrap_or_else(|| {
+                        symbol::new(
+                            None,
+                            &format!("p{i}__{}#", crate::core::lazy::next_gensym()),
+                        )
+                    }));
+                }
+                if let Some(rest) = env.get(&-1) {
+                    params.push(symbol::new(None, "&"));
+                    params.push(rest.clone());
+                }
+                Ok(list::from_slice(&[
+                    symbol::new(None, "fn*"),
+                    vector::from_slice(&params),
+                    list::from_slice(&body),
+                ]))
+            }
+            '"' => {
+                self.bump();
+                self.read_regex()
+            }
             '?' => Err(self.syntax("reader conditionals are not supported")),
             _ => Err(self.syntax(format!("No dispatch macro for: {c}"))),
         }
@@ -547,6 +651,9 @@ impl<'a> Reader<'a> {
             "false" => return Ok(Value::FALSE),
             _ => {}
         }
+        if self.arg_env.is_some() && tok.starts_with('%') {
+            return self.fn_arg(tok);
+        }
         let first = tok.chars().next().unwrap();
         let second = tok.chars().nth(1);
         if first.is_ascii_digit()
@@ -558,6 +665,172 @@ impl<'a> Reader<'a> {
             return Err(self.syntax(format!("Invalid token: {tok}")));
         }
         Ok(symbol::parse(tok))
+    }
+
+    /// `%`, `%N` and `%&` inside `#(...)`.
+    fn fn_arg(&mut self, tok: &str) -> ReadResult<Value> {
+        let idx: i64 = match &tok[1..] {
+            "" => 1,
+            "&" => -1,
+            n => n.parse().map_err(|_| {
+                self.syntax(format!("arg literal must be %, %& or %integer: {tok}"))
+            })?,
+        };
+        if idx == 0 || idx > 20 {
+            return Err(self.syntax(format!("arg literal must be %, %& or %1..%20: {tok}")));
+        }
+        let env = self.arg_env.as_mut().unwrap();
+        if let Some(s) = env.get(&idx) {
+            return Ok(s.clone());
+        }
+        let name = if idx == -1 {
+            "rest".to_string()
+        } else {
+            format!("p{idx}")
+        };
+        let s = symbol::new(
+            None,
+            &format!("{name}__{}#", crate::core::lazy::next_gensym()),
+        );
+        env.insert(idx, s.clone());
+        Ok(s)
+    }
+
+    /// `#"..."`: backslash sequences are kept verbatim for the regex engine.
+    fn read_regex(&mut self) -> ReadResult<Value> {
+        let mut src = String::new();
+        loop {
+            let Some(c) = self.bump() else {
+                return Err(self.eof("regex"));
+            };
+            match c {
+                '"' => break,
+                '\\' => {
+                    src.push('\\');
+                    let Some(n) = self.bump() else {
+                        return Err(self.eof("regex"));
+                    };
+                    src.push(n);
+                }
+                _ => src.push(c),
+            }
+        }
+        obj::regex::new(&src).map_err(|_| {
+            let msg = crate::exc::take()
+                .map(|e| crate::exc::format_exception(&e))
+                .unwrap_or_default();
+            self.syntax(msg)
+        })
+    }
+
+    // ---- syntax-quote -----------------------------------------------------------
+
+    fn gensym_for(&mut self, name: &str) -> Value {
+        let base = &name[..name.len() - 1];
+        let table = self.gensyms.last_mut().expect("inside syntax-quote");
+        if let Some(s) = table.get(name) {
+            return s.clone();
+        }
+        let s = symbol::new(
+            None,
+            &format!("{base}__{}__auto__", crate::core::lazy::next_gensym()),
+        );
+        table.insert(name.to_string(), s.clone());
+        s
+    }
+
+    /// Clojure's syntax-quote transformation: symbols are qualified (or gensym'd),
+    /// `~` and `~@` are spliced, and collections become `seq`/`concat` templates.
+    fn syntax_quote(&mut self, form: &Value) -> ReadResult<Value> {
+        let quote = |v: Value| list::from_slice(&[symbol::new(None, "quote"), v]);
+        match form.kind() {
+            Some(Kind::Symbol) => {
+                let s = symbol::get(form);
+                let resolved = if s.ns().is_some() || is_special(s.name()) {
+                    form.clone()
+                } else if s.name().ends_with('#') && s.name().len() > 1 {
+                    self.gensym_for(s.name())
+                } else {
+                    let ns = self.env.resolve_symbol_ns(s.name());
+                    symbol::new(Some(&ns), s.name())
+                };
+                Ok(quote(resolved))
+            }
+            Some(Kind::List) => {
+                let items = list::get(form).to_vec();
+                if items.is_empty() {
+                    return Ok(list::from_slice(&[core_sym("list")]));
+                }
+                if is_core_call(&items, "unquote") {
+                    return Ok(items.get(1).cloned().unwrap_or(Value::NIL));
+                }
+                if is_core_call(&items, "unquote-splicing") {
+                    return Err(self.syntax("splice not in list"));
+                }
+                let c = self.sq_concat(&items)?;
+                Ok(list::from_slice(&[core_sym("seq"), c]))
+            }
+            Some(Kind::Vector) => {
+                let items: Vec<Value> = vector::get(form).v.iter().cloned().collect();
+                let c = self.sq_concat(&items)?;
+                Ok(list::from_slice(&[
+                    core_sym("apply"),
+                    core_sym("vector"),
+                    list::from_slice(&[core_sym("seq"), c]),
+                ]))
+            }
+            Some(Kind::Map) => {
+                let mut items = Vec::new();
+                for (k, v) in map::get(form).m.iter() {
+                    items.push(k.clone());
+                    items.push(v.clone());
+                }
+                let c = self.sq_concat(&items)?;
+                Ok(list::from_slice(&[
+                    core_sym("apply"),
+                    core_sym("hash-map"),
+                    list::from_slice(&[core_sym("seq"), c]),
+                ]))
+            }
+            Some(Kind::Set) => {
+                let items: Vec<Value> = set::get(form).s.iter().cloned().collect();
+                let c = self.sq_concat(&items)?;
+                Ok(list::from_slice(&[
+                    core_sym("apply"),
+                    core_sym("hash-set"),
+                    list::from_slice(&[core_sym("seq"), c]),
+                ]))
+            }
+            None | Some(Kind::Keyword | Kind::String | Kind::Long | Kind::Double | Kind::Regex) => {
+                Ok(form.clone())
+            }
+            _ => Ok(quote(form.clone())),
+        }
+    }
+
+    /// `(clojure.core/concat part...)` where each part is `(list x)`, `(list ~x)` or a
+    /// spliced `~@x`.
+    fn sq_concat(&mut self, items: &[Value]) -> ReadResult<Value> {
+        let mut parts = vec![core_sym("concat")];
+        for it in items {
+            if let Some(l) = list::as_list(it) {
+                let v = l.to_vec();
+                if is_core_call(&v, "unquote") {
+                    parts.push(list::from_slice(&[
+                        core_sym("list"),
+                        v.get(1).cloned().unwrap_or(Value::NIL),
+                    ]));
+                    continue;
+                }
+                if is_core_call(&v, "unquote-splicing") {
+                    parts.push(v.get(1).cloned().unwrap_or(Value::NIL));
+                    continue;
+                }
+            }
+            let q = self.syntax_quote(it)?;
+            parts.push(list::from_slice(&[core_sym("list"), q]));
+        }
+        Ok(list::from_slice(&parts))
     }
 
     fn parse_number(&self, tok: &str) -> ReadResult<Value> {
@@ -622,6 +895,8 @@ mod tests {
     use crate::printer::pr_str;
 
     fn rt(s: &str) -> String {
+        // Syntax-quote resolves symbols against the registered core vars.
+        crate::entry::init();
         pr_str(&read_str(s).unwrap())
     }
 
@@ -696,7 +971,29 @@ mod tests {
         assert_eq!(e.kind, ReadErrorKind::Syntax);
         assert!(read_str("{:a}").is_err());
         assert!(read_str("{:a 1 :a 2}").is_err());
-        assert!(read_str("`x").is_err());
+        assert!(read_str("~x").is_ok());
+        assert_eq!(
+            rt("`x"),
+            "(clojure.core/seq (clojure.core/concat (clojure.core/list (quote user/x))))".replace(
+                "(clojure.core/seq (clojure.core/concat (clojure.core/list (quote user/x))))",
+                "(quote user/x)"
+            )
+        );
+        assert_eq!(
+            rt("`(a ~b ~@c)"),
+            "(clojure.core/seq (clojure.core/concat (clojure.core/list (quote user/a)) (clojure.core/list b) c))"
+        );
+        assert_eq!(rt("`inc"), "(quote clojure.core/inc)");
+        assert_eq!(rt("`if"), "(quote if)");
+        assert_eq!(
+            rt("`[1 ~x]"),
+            "(clojure.core/apply clojure.core/vector (clojure.core/seq (clojure.core/concat (clojure.core/list 1) (clojure.core/list x))))"
+        );
+        let g = rt("`(x# x#)");
+        assert!(g.contains("__auto__"), "{g}");
+        let a = rt("#(+ % %2)");
+        assert!(a.starts_with("(fn* [p1__") && a.contains("p2__"), "{a}");
+        assert_eq!(rt("#\"a\\d+\""), "#\"a\\d+\"");
     }
 
     #[test]

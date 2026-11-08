@@ -9,7 +9,7 @@ use rscl_runtime::api::RtFn;
 use rscl_runtime::reader::ReadError;
 use rscl_runtime::{Value, exc, ns, value};
 
-use crate::analyzer::Analyzer;
+use crate::analyzer::{Analyzer, Node};
 use crate::codegen::Compiler;
 use crate::errors::CompileError;
 
@@ -72,9 +72,18 @@ impl Jit {
             .map_err(|e| format!("cannot reserve JIT memory: {e}"))?;
         builder.memory_provider(Box::new(arena));
         let module = JITModule::new(builder);
-        Ok(Jit {
+        let mut jit = Jit {
             compiler: ManuallyDrop::new(Compiler::new(module)),
-        })
+        };
+        crate::boot::load_core(&mut jit).map_err(|e| format!("error loading core.clj: {e}"))?;
+        Ok(jit)
+    }
+
+    /// Compile an analysed form into the JIT and run it (used by `build` to evaluate
+    /// forms at build time while a second compiler emits them into the object file).
+    pub fn compile_and_run(&mut self, node: &Node, an: &Analyzer) -> Result<Value, EvalError> {
+        let ids = self.compiler.compile_unit(node, an)?;
+        self.run_unit(ids)
     }
 
     /// Evaluate a top-level form. A top-level `(do ...)` is evaluated one sub-form at a
@@ -91,6 +100,10 @@ impl Jit {
         let mut an = Analyzer::new(ns::current());
         let node = an.analyze_toplevel(form)?;
         let ids = self.compiler.compile_unit(&node, &an)?;
+        self.run_unit(ids)
+    }
+
+    fn run_unit(&mut self, ids: crate::codegen::UnitIds) -> Result<Value, EvalError> {
         self.compiler
             .module
             .finalize_definitions()
@@ -123,11 +136,12 @@ impl Jit {
 
 impl Drop for Jit {
     fn drop(&mut self) {
-        // SAFETY: no JIT code runs after the driver is gone.
-        unsafe {
-            ManuallyDrop::take(&mut self.compiler)
-                .into_module()
-                .free_memory()
-        }
+        // JIT code is never unmapped: vars are process-global and keep pointing at
+        // compiled fns (core.clj's macros, for one) after the driver that compiled
+        // them is gone, and a later `Jit` in the same process would call into freed
+        // memory. The arena is reserved address space; the pages actually used stay
+        // mapped until the process exits.
+        let module = unsafe { ManuallyDrop::take(&mut self.compiler) }.into_module();
+        std::mem::forget(module);
     }
 }

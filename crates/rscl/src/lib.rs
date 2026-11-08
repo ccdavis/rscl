@@ -2,6 +2,7 @@
 //! `rscl` binary is a thin CLI over this crate; tests use it in-process.
 pub mod analyzer;
 pub mod aot;
+pub mod boot;
 pub mod codegen;
 pub mod errors;
 pub mod jit;

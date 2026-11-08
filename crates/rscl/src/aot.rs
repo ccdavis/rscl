@@ -1,8 +1,9 @@
 //! Ahead-of-time compilation: the same codegen into a `cranelift-object` module, an
 //! emitted `main`, and a link step against the runtime static library.
 //!
-//! Until macros exist (Phase 4) `build` is a pure compile: forms are analysed and
-//! compiled but not executed at build time.
+//! Like Clojure's AOT compiler, `build` also evaluates every top-level form in a JIT
+//! as it compiles it, so macros and `def`s earlier in the file are available to later
+//! forms. `--no-eval` turns that off (then only `core.clj`'s macros are usable).
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -37,6 +38,8 @@ pub struct BuildOptions {
     pub native: bool,
     pub link_libs: Vec<String>,
     pub lib_paths: Vec<String>,
+    /// Skip evaluating the program's own top-level forms at build time.
+    pub no_eval: bool,
 }
 
 impl BuildOptions {
@@ -54,6 +57,7 @@ impl BuildOptions {
             native: false,
             link_libs: Vec::new(),
             lib_paths: Vec::new(),
+            no_eval: false,
         }
     }
 }
@@ -98,16 +102,35 @@ pub fn build(o: &BuildOptions) -> Result<(), BuildError> {
     let src = std::fs::read_to_string(&o.input)
         .map_err(|e| BuildError::Io(format!("cannot read {path}: {e}")))?;
 
+    // The JIT evaluates forms at build time (and already holds core.clj).
+    let mut jit = crate::jit::Jit::new().map_err(BuildError::Internal)?;
     let mut compiler = Compiler::new(object_module(o)?);
+    let mut units: Vec<UnitIds> = Vec::new();
+
+    // core.clj first, so the binary defines the same library at start-up.
+    let core_forms = crate::boot::in_core(crate::boot::core_forms)?;
+    crate::boot::in_core(|| -> Result<(), BuildError> {
+        for form in &core_forms {
+            for unit_form in crate::analyzer::split_do(form) {
+                let mut an = Analyzer::new(ns::current());
+                let node = an.analyze_toplevel(&unit_form)?;
+                units.push(compiler.compile_unit(&node, &an)?);
+            }
+        }
+        Ok(())
+    })?;
+
     let file_id = pos::intern_file(&path);
     let mut reader = Reader::new(&src, &DefaultEnv).with_file(file_id);
-    let mut units: Vec<UnitIds> = Vec::new();
     loop {
         match reader.read() {
             Ok(Some(form)) => {
                 for unit_form in crate::analyzer::split_do(&form) {
                     let mut an = Analyzer::new(ns::current());
                     let node = an.analyze_toplevel(&unit_form)?;
+                    if !o.no_eval {
+                        drop(jit.compile_and_run(&node, &an)?);
+                    }
                     units.push(compiler.compile_unit(&node, &an)?);
                 }
             }

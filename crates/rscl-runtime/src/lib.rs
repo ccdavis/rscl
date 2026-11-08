@@ -25,6 +25,9 @@ pub mod printer;
 pub mod reader;
 pub mod value;
 
+/// The bootstrap library, compiled into every session and every AOT binary.
+pub const CORE_CLJ: &str = include_str!("../core/core.clj");
+
 pub use exc::{Exc, RtResult};
 pub use obj::Kind;
 pub use value::{VRef, Value, live_objects};

@@ -15,7 +15,7 @@ run_mode() { # mode file -> prints stdout, returns status
   local mode=$1 file=$2
   case $mode in
     jit) timeout 20 "$BIN" run "$file" 2>/tmp/rscl_validate_err ;;
-    aot) local exe; exe=$(mktemp); timeout 60 "$BIN" build "$file" -o "$exe" 2>/tmp/rscl_validate_err && timeout 20 "$exe" 2>>/tmp/rscl_validate_err; local s=$?; rm -f "$exe"; return $s ;;
+    aot) local exe; exe=$(mktemp); timeout 120 "$BIN" build "$file" -o "$exe" >/dev/null 2>/tmp/rscl_validate_err && timeout 20 "$exe" 2>>/tmp/rscl_validate_err; local s=$?; rm -f "$exe"; return $s ;;
   esac
 }
 for f in "${files[@]}"; do

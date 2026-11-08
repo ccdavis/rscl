@@ -3,7 +3,7 @@
 (println (filter odd? (range 10)) (remove odd? (range 10)) (keep (fn [x] (when (odd? x) (* x x))) (range 6)))
 (println (reduce + [1 2 3 4]) (reduce + 10 [1 2 3]) (reduce + []) (reduce conj [] '(1 2)) (reduce-kv (fn [acc k v] (+ acc v)) 0 {:a 1 :b 2}))
 (println (some even? [1 3 4]) (some even? [1 3]) (every? even? [2 4]) (every? even? [2 3]) (not-any? even? [1 3]))
-(println (take-while odd? [1 3 4 5]) (drop-while odd? [1 3 4 5]) (repeat 3 :x) (repeatedly 2 (fn [] 7)) (iterate inc 1 4))
+(println (take-while odd? [1 3 4 5]) (drop-while odd? [1 3 4 5]) (repeat 3 :x) (repeatedly 2 (fn [] 7)) (take 4 (iterate inc 1)))
 (def add5 (partial + 5))
 (def inc-twice (comp inc inc))
 (println (add5 1) (inc-twice 1) ((comp str inc) 1) ((comp) 9) ((complement even?) 3) ((constantly 42) 1 2) ((juxt inc dec) 5))

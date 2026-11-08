@@ -16,7 +16,7 @@ pub const EXIT_USAGE: i32 = 2;
 
 const USAGE: &str = "usage: rscl                       start the REPL
        rscl run FILE [ARGS...]    compile FILE with the JIT and run it
-       rscl build FILE [-o OUT] [--keep-obj] [--opt] [--native]
+       rscl build FILE [-o OUT] [--keep-obj] [--opt] [--native] [--no-eval]
                   [--link LIB] [--lib-path DIR]
                                   compile FILE to a native executable
        rscl -e EXPR               evaluate EXPR and print the result
@@ -73,6 +73,10 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                     }
                     "--native" => {
                         o.native = true;
+                        i += 1;
+                    }
+                    "--no-eval" => {
+                        o.no_eval = true;
                         i += 1;
                     }
                     "--link" => {

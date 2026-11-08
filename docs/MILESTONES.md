@@ -69,3 +69,30 @@ Execution error: InterruptedException: interrupted
 
 `scripts/valgrind_check.sh tests/corpus/*.clj` leak-checks every corpus program under both
 modes (release build).
+
+## Phase 4 — Macros, lazy seqs, core.clj (done)
+
+```
+user=> (defmacro unless [test & body] `(if ~test nil (do ~@body)))
+#'user/unless
+user=> (macroexpand-1 '(unless x 1 2))
+(if x nil (do 1 2))
+user=> (take 5 (map #(* % %) (filter odd? (range))))
+(1 9 25 49 81)
+user=> (let [[a & rest :as all] [1 2 3] {:keys [x] :or {x 9}} {}] [a rest all x])
+[1 (2 3) [1 2 3] 9]
+user=> (for [x (range 3) y (range 3) :when (< x y)] [x y])
+([0 1] [0 2] [1 2])
+user=> (def a (atom 0))  (swap! a + 5)  @a
+#'user/a
+5
+5
+user=> (re-seq #"\d+" "a1 b22 c333")
+("1" "22" "333")
+user=> *1
+("1" "22" "333")
+```
+
+`core.clj` (about 650 lines, written from scratch) is compiled into every session and
+into every `rscl build` binary; `build` now also evaluates each top-level form at build
+time so macros defined in the program work (`--no-eval` opts out).

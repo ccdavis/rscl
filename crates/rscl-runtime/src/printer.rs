@@ -124,7 +124,36 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
             write(out, &obj::atom::get(v).deref(), readably, depth + 1);
             out.push_str(&format!(" 0x{:x}]", v.bits()));
         }
-        Kind::LazySeq => out.push_str("#<LazySeq>"),
+        Kind::Cons | Kind::LazySeq => {
+            out.push('(');
+            let mut first = true;
+            for x in crate::coll::seq_iter(v) {
+                match x {
+                    Ok(x) => {
+                        if !first {
+                            out.push(' ');
+                        }
+                        first = false;
+                        write(out, &x, readably, depth + 1);
+                    }
+                    Err(_) => {
+                        crate::exc::take();
+                        out.push_str(if first {
+                            "#<error realising seq>"
+                        } else {
+                            " #<error realising seq>"
+                        });
+                        break;
+                    }
+                }
+            }
+            out.push(')');
+        }
+        Kind::Regex => {
+            out.push_str("#\"");
+            out.push_str(&obj::regex::get(v).source);
+            out.push('"');
+        }
         Kind::Namespace => {
             out.push_str("#namespace[");
             out.push_str(&crate::ns::get(v).name);

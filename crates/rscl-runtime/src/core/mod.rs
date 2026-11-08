@@ -9,6 +9,8 @@ pub mod basic;
 pub mod coll;
 pub mod fns;
 pub mod io;
+pub mod lazy;
+pub mod re;
 pub mod string;
 
 pub struct BuiltinDesc {
@@ -29,6 +31,8 @@ pub fn all() -> impl Iterator<Item = &'static BuiltinDesc> {
         .chain(io::TABLE.iter())
         .chain(string::TABLE.iter())
         .chain(string::core_fns::TABLE.iter())
+        .chain(lazy::TABLE.iter())
+        .chain(re::TABLE.iter())
 }
 
 pub fn find(ns: &str, name: &str) -> Option<&'static BuiltinDesc> {
@@ -155,6 +159,8 @@ pub fn type_name(v: &Value) -> &'static str {
         Some(Kind::Atom) => "Atom",
         Some(Kind::LazySeq) => "LazySeq",
         Some(Kind::Namespace) => "Namespace",
+        Some(Kind::Cons) => "Cons",
+        Some(Kind::Regex) => "Pattern",
         None => "Object",
     }
 }

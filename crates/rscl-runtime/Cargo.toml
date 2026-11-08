@@ -12,6 +12,7 @@ crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 imbl = { workspace = true }
+regex = "1"
 
 [features]
 default = []

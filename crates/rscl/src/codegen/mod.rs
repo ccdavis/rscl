@@ -1289,9 +1289,13 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 let s = obj::symbol::get(v);
                 ConstEntry::Symbol(s.ns().map(str::to_string), s.name().to_string())
             }
-            Kind::List | Kind::Vector | Kind::Map | Kind::Set => {
-                ConstEntry::Edn(printer::pr_str(v))
-            }
+            Kind::List
+            | Kind::Vector
+            | Kind::Map
+            | Kind::Set
+            | Kind::Regex
+            | Kind::Cons
+            | Kind::LazySeq => ConstEntry::Edn(printer::pr_str(v)),
             k => {
                 return Err(internal(format!(
                     "cannot embed a {} as a constant",

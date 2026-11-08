@@ -1,7 +1,5 @@
 //! Persistent singly linked list with a cached count. `()` is a distinct empty list
 //! object (not `nil`), as in Clojure.
-use std::sync::atomic::{Ordering, fence};
-
 use super::{Kind, alloc, cast};
 use crate::value::{ObjHeader, Value};
 
@@ -118,27 +116,3 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 impl ExactSizeIterator for Iter<'_> {}
-
-/// Free a list cell, walking the tail iteratively so long lists cannot overflow the
-/// stack through recursive drops.
-pub(super) unsafe fn free(p: *mut ListObj) {
-    unsafe {
-        let mut cell = Box::from_raw(p);
-        let mut rest = std::mem::take(&mut cell.rest);
-        drop(cell);
-        while rest.is_kind(Kind::List) {
-            let hdr = rest.header().unwrap();
-            if hdr.rc.fetch_sub(1, Ordering::Release) != 1 {
-                std::mem::forget(rest);
-                return;
-            }
-            fence(Ordering::Acquire);
-            crate::value::note_freed();
-            let mut cell = Box::from_raw(rest.ptr() as *mut ListObj);
-            std::mem::forget(rest);
-            rest = std::mem::take(&mut cell.rest);
-            drop(cell);
-        }
-        drop(rest);
-    }
-}

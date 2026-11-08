@@ -4,13 +4,16 @@
 use crate::value::{ObjHeader, Value};
 
 pub mod atom;
+pub mod cons;
 pub mod double;
 pub mod exception;
 pub mod func;
 pub mod keyword;
+pub mod lazyseq;
 pub mod list;
 pub mod long;
 pub mod map;
+pub mod regex;
 pub mod set;
 pub mod string;
 pub mod symbol;
@@ -37,6 +40,8 @@ pub enum Kind {
     Atom = 13,
     LazySeq = 14,
     Namespace = 15,
+    Cons = 16,
+    Regex = 17,
 }
 
 impl Kind {
@@ -57,6 +62,8 @@ impl Kind {
             Kind::Atom => "Atom",
             Kind::LazySeq => "LazySeq",
             Kind::Namespace => "Namespace",
+            Kind::Cons => "Cons",
+            Kind::Regex => "Regex",
         }
     }
 }
@@ -72,18 +79,73 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
             Kind::Double => drop(Box::from_raw(p as *mut double::DoubleObj)),
             Kind::String => drop(Box::from_raw(p as *mut string::StrObj)),
             Kind::Symbol => drop(Box::from_raw(p as *mut symbol::SymObj)),
-            Kind::List => list::free(p as *mut list::ListObj),
             Kind::Vector => drop(Box::from_raw(p as *mut vector::VecObj)),
             Kind::Map => drop(Box::from_raw(p as *mut map::MapObj)),
             Kind::Set => drop(Box::from_raw(p as *mut set::SetObj)),
             Kind::Fn => func::free(p as *mut func::FnObj),
             Kind::Exception => drop(Box::from_raw(p as *mut exception::ExcObj)),
             Kind::Atom => drop(Box::from_raw(p as *mut atom::AtomObj)),
+            Kind::Regex => drop(Box::from_raw(p as *mut regex::RegexObj)),
+            // Sequence cells are dismantled iteratively: a long realised chain would
+            // otherwise recurse once per element while dropping.
+            Kind::List | Kind::Cons | Kind::LazySeq => {
+                let tail = dismantle(p);
+                free_tail(tail);
+            }
             // Immortal kinds never reach a zero refcount.
-            Kind::Keyword | Kind::Var | Kind::Namespace | Kind::LazySeq => {
-                unreachable!("attempt to free an immortal or unimplemented object kind")
+            Kind::Keyword | Kind::Var | Kind::Namespace => {
+                unreachable!("attempt to free an immortal object kind")
             }
         }
+    }
+}
+
+/// Free one sequence cell whose last reference is gone and hand back its tail
+/// (still owned by the caller).
+unsafe fn dismantle(p: *mut ObjHeader) -> Value {
+    unsafe {
+        match (*p).kind {
+            Kind::List => {
+                let mut b = Box::from_raw(p as *mut list::ListObj);
+                let t = std::mem::take(&mut b.rest);
+                drop(b);
+                t
+            }
+            Kind::Cons => {
+                let mut b = Box::from_raw(p as *mut cons::ConsObj);
+                let t = std::mem::take(&mut b.more);
+                drop(b);
+                t
+            }
+            Kind::LazySeq => {
+                let mut b = Box::from_raw(p as *mut lazyseq::LazySeqObj);
+                let t = lazyseq::take_tail(&mut b);
+                drop(b);
+                t
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Release `tail`, walking sequence cells iteratively while this is their last
+/// reference.
+fn free_tail(mut tail: Value) {
+    use std::sync::atomic::{Ordering, fence};
+    loop {
+        let Some(h) = tail.header() else { return };
+        if !matches!(h.kind, Kind::List | Kind::Cons | Kind::LazySeq) {
+            return; // an ordinary value: dropped normally
+        }
+        if h.rc.fetch_sub(1, Ordering::Release) != 1 {
+            std::mem::forget(tail);
+            return;
+        }
+        fence(Ordering::Acquire);
+        crate::value::note_freed();
+        let p = tail.ptr() as *mut ObjHeader;
+        std::mem::forget(tail);
+        tail = unsafe { dismantle(p) };
     }
 }
 

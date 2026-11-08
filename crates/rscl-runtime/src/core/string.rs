@@ -47,16 +47,17 @@ builtins! {
     }
     "split" => fn cs_split(args) [2, 3] {
         let s = args::string(&args[0], "s")?;
-        let sep = crate::printer::print_str(&args[1]);
-        let parts: Vec<Value> = if args.len() == 3 {
-            let limit = args::int(&args[2], "limit")?;
-            if limit <= 0 { s.split(sep.as_str()).map(string::new).collect() } else { s.splitn(limit as usize, sep.as_str()).map(string::new).collect() }
+        let limit = if args.len() == 3 { args::int(&args[2], "limit")? } else { 0 };
+        let mut parts: Vec<&str> = if let Some(re) = crate::obj::regex::as_regex(&args[1]) {
+            if limit > 0 { re.re.splitn(s, limit as usize).collect() } else { re.re.split(s).collect() }
         } else {
-            let mut v: Vec<&str> = s.split(sep.as_str()).collect();
-            while v.len() > 1 && v.last().is_some_and(|x| x.is_empty()) { v.pop(); }
-            v.into_iter().map(string::new).collect()
+            let sep = crate::printer::print_str(&args[1]);
+            if limit > 0 { s.splitn(limit as usize, sep.as_str()).collect() } else { s.split(sep.as_str()).collect() }
         };
-        Ok(crate::obj::vector::from_iter(parts))
+        if limit <= 0 {
+            while parts.len() > 1 && parts.last().is_some_and(|x| x.is_empty()) { parts.pop(); }
+        }
+        Ok(crate::obj::vector::from_iter(parts.into_iter().map(string::new).collect::<Vec<_>>()))
     }
     "split-lines" => fn cs_split_lines(args) [1] {
         Ok(crate::obj::vector::from_iter(args::string(&args[0], "s")?.lines().map(string::new).collect::<Vec<_>>()))
@@ -68,14 +69,20 @@ builtins! {
     }
     "replace" => fn cs_replace(args) [3] {
         let s = args::string(&args[0], "s")?;
-        let from = crate::printer::print_str(&args[1]);
         let to = crate::printer::print_str(&args[2]);
+        if let Some(re) = crate::obj::regex::as_regex(&args[1]) {
+            return Ok(string::from_string(re.re.replace_all(s, to.as_str()).into_owned()));
+        }
+        let from = crate::printer::print_str(&args[1]);
         Ok(string::from_string(s.replace(&from, &to)))
     }
     "replace-first" => fn cs_replace_first(args) [3] {
         let s = args::string(&args[0], "s")?;
-        let from = crate::printer::print_str(&args[1]);
         let to = crate::printer::print_str(&args[2]);
+        if let Some(re) = crate::obj::regex::as_regex(&args[1]) {
+            return Ok(string::from_string(re.re.replace(s, to.as_str()).into_owned()));
+        }
+        let from = crate::printer::print_str(&args[1]);
         Ok(string::from_string(s.replacen(&from, &to, 1)))
     }
     "reverse" => fn cs_reverse(args) [1] { Ok(string::from_string(args::string(&args[0], "s")?.chars().rev().collect())) }

@@ -1,0 +1,23 @@
+:ran nil
+(if x nil (do 1 2))
+[2 1]
+tmp is 3
+3
+3 nil true
+2 :ok :b :pos
+true 2 nil nil 2 false
+12 9
+14 :none 3
+false nil
+8 2 nil 4
+:two :string :x :default
+:three found 2
+[1 2]
+6
+[3 2 1]
+Assert failed: math
+(= 1 2)
+computing once
+42
+:defined-later
+true false true false

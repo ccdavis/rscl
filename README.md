@@ -7,12 +7,13 @@ Where Clojure on the JVM calls Java, rscl calls Rust: the core library is Rust
 functions exposed as first-class fns, and later phases add a typed C-ABI FFI and a
 bridge for exposing whole Rust crates.
 
-Status: Phases 1–3 of the plan are done (see `docs/MILESTONES.md`): a working REPL
+Status: Phases 1–4 of the plan are done (see `docs/MILESTONES.md`): a working REPL
 with per-form incremental compilation and redefinition, `rscl run`, `rscl build`
-producing native binaries, the core collection/string/higher-order library in Rust,
-`try`/`catch`/`finally`, a typed C FFI (`defnative`), stack-overflow and Ctrl-C
-guards, and a differential test corpus that runs every program under both the JIT
-and the AOT compiler. Next: macros, lazy seqs and `core.clj` (Phase 4).
+producing native binaries, `defmacro` with syntax-quote, lazy sequences, destructuring,
+atoms, regular expressions, a `core.clj` written from scratch on top of the Rust
+builtins, `try`/`catch`/`finally`, a typed C FFI (`defnative`), stack-overflow and
+Ctrl-C guards, and a differential test corpus that runs every program under both the
+JIT and the AOT compiler. Next: namespaces and multi-file programs (Phase 5).
 
 ## Build and run
 
@@ -56,8 +57,8 @@ as compiled rscl fns, so it is a first-class value with no wrapper.
 ## Layout
 
 - `crates/rscl-runtime` — values, objects, reader, printer, namespaces, exceptions,
-  core builtins. No Cranelift dependency; also built as a static library that AOT
-  binaries link against.
+  core builtins, and `core/core.clj` (the part of the standard library written in rscl).
+  No Cranelift dependency; also built as a static library that AOT binaries link against.
 - `crates/rscl` — analyzer (forms → `Node`), Cranelift codegen (generic over
   `Module`), JIT driver, AOT driver, REPL, CLI.
 - `tests/corpus` + `tests/expected` — the differential program corpus.

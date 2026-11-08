@@ -1,10 +1,10 @@
-//! Built-in rewrite macros. Each turns a form into another form and is used only
-//! until `core.clj` defines the real macro (Phase 4), after which the entry here is
-//! deleted. They are consulted only when the head symbol is not a local.
+//! Built-in rewrite macros: the bootstrap primitives `defmacro`, `defn`, `fn`, `let`,
+//! `loop` (no destructuring) and `defnative`. `core.clj` redefines the first five as
+//! real macros with destructuring, which then take precedence because macro vars are
+//! checked before these rewrites. Consulted only when the head symbol is not a local.
 use rscl_runtime::obj::{Kind, keyword, list, symbol, vector};
 use rscl_runtime::{Value, printer};
 
-use super::Analyzer;
 use crate::errors::{CResult, fail};
 
 fn sym(name: &str) -> Value {
@@ -17,12 +17,7 @@ fn lst(items: &[Value]) -> Value {
 
 /// Expand `form` whose head is the unqualified symbol `name`; `None` if `name` is not
 /// a built-in rewrite.
-pub fn expand(
-    an: &mut Analyzer,
-    name: &str,
-    form: &Value,
-    items: &[Value],
-) -> CResult<Option<Value>> {
+pub fn expand(name: &str, form: &Value, items: &[Value]) -> CResult<Option<Value>> {
     let args = &items[1..];
     let out = match name {
         "defn" => defn(form, args)?,
@@ -41,90 +36,7 @@ pub fn expand(
             v.extend_from_slice(args);
             lst(&v)
         }
-        "when" => {
-            if args.is_empty() {
-                return fail(form, "when requires a test");
-            }
-            let mut body = vec![sym("do")];
-            body.extend_from_slice(&args[1..]);
-            lst(&[sym("if"), args[0].clone(), lst(&body)])
-        }
-        "when-not" => {
-            if args.is_empty() {
-                return fail(form, "when-not requires a test");
-            }
-            let mut body = vec![sym("do")];
-            body.extend_from_slice(&args[1..]);
-            lst(&[sym("if"), args[0].clone(), Value::NIL, lst(&body)])
-        }
-        "if-not" => {
-            if args.len() < 2 || args.len() > 3 {
-                return fail(form, "if-not takes 2 or 3 args");
-            }
-            let else_ = args.get(2).cloned().unwrap_or(Value::NIL);
-            lst(&[sym("if"), args[0].clone(), else_, args[1].clone()])
-        }
-        "cond" => {
-            if args.is_empty() {
-                return Ok(Some(Value::NIL));
-            }
-            if !args.len().is_multiple_of(2) {
-                return fail(form, "cond requires an even number of forms");
-            }
-            let mut rest = vec![sym("cond")];
-            rest.extend_from_slice(&args[2..]);
-            lst(&[sym("if"), args[0].clone(), args[1].clone(), lst(&rest)])
-        }
-        "and" => match args.len() {
-            0 => Value::TRUE,
-            1 => args[0].clone(),
-            _ => {
-                let t = an.gensym("and");
-                let mut rest = vec![sym("and")];
-                rest.extend_from_slice(&args[1..]);
-                lst(&[
-                    sym("let*"),
-                    vector::from_slice(&[t.clone(), args[0].clone()]),
-                    lst(&[sym("if"), t.clone(), lst(&rest), t]),
-                ])
-            }
-        },
-        "or" => match args.len() {
-            0 => Value::NIL,
-            1 => args[0].clone(),
-            _ => {
-                let t = an.gensym("or");
-                let mut rest = vec![sym("or")];
-                rest.extend_from_slice(&args[1..]);
-                lst(&[
-                    sym("let*"),
-                    vector::from_slice(&[t.clone(), args[0].clone()]),
-                    lst(&[sym("if"), t.clone(), t, lst(&rest)]),
-                ])
-            }
-        },
-        "->" | "->>" => {
-            if args.is_empty() {
-                return fail(form, format!("{name} requires at least one form"));
-            }
-            let mut acc = args[0].clone();
-            for step in &args[1..] {
-                acc = match list::as_list(step) {
-                    Some(l) if !l.is_empty() => {
-                        let mut v = l.to_vec();
-                        if name == "->" {
-                            v.insert(1, acc)
-                        } else {
-                            v.push(acc)
-                        }
-                        lst(&v)
-                    }
-                    _ => lst(&[step.clone(), acc]),
-                };
-            }
-            acc
-        }
-        "comment" => Value::NIL,
+        "defmacro" => defmacro(form, args)?,
         "defnative" => defnative(form, args)?,
         _ => return Ok(None),
     };
@@ -209,6 +121,55 @@ fn defnative(form: &Value, args: &[Value]) -> CResult<Value> {
         lst(&call),
     ]);
     Ok(lst(&[sym("def"), name.clone(), f]))
+}
+
+/// `(defmacro name doc? attr? [params] body...)` or multi-arity →
+/// `(do (def name (fn* name ([&form &env params...] body...)...)) (set-macro! (var name)))`
+fn defmacro(form: &Value, args: &[Value]) -> CResult<Value> {
+    let Some(name) = args.first().filter(|a| a.is_kind(Kind::Symbol)) else {
+        return fail(form, "First argument to defmacro must be a symbol");
+    };
+    let mut rest = &args[1..];
+    if rest.first().is_some_and(|f| f.is_kind(Kind::String)) {
+        rest = &rest[1..];
+    }
+    if rest.first().is_some_and(|f| f.is_kind(Kind::Map)) {
+        rest = &rest[1..];
+    }
+    if rest.is_empty() {
+        return fail(form, "defmacro requires a parameter vector");
+    }
+    let arities: Vec<Vec<Value>> = if rest[0].is_kind(Kind::Vector) {
+        vec![rest.to_vec()]
+    } else {
+        let mut out = Vec::new();
+        for a in rest {
+            let Some(items) = super::seq_items(a) else {
+                return fail(a, "defmacro arity must be a list ([params] body...)");
+            };
+            out.push(items);
+        }
+        out
+    };
+    let mut f = vec![sym("fn*"), name.clone()];
+    for a in &arities {
+        let Some(params) = vector::as_vec(&a[0]) else {
+            return fail(&a[0], "defmacro requires a parameter vector");
+        };
+        let mut ps = vec![sym("&form"), sym("&env")];
+        ps.extend(params.v.iter().cloned());
+        let mut arity = vec![vector::from_slice(&ps)];
+        arity.extend_from_slice(&a[1..]);
+        f.push(lst(&arity));
+    }
+    Ok(lst(&[
+        sym("do"),
+        lst(&[sym("def"), name.clone(), lst(&f)]),
+        lst(&[
+            symbol::new(Some("clojure.core"), "set-macro!"),
+            lst(&[sym("var"), name.clone()]),
+        ]),
+    ]))
 }
 
 fn defn(form: &Value, args: &[Value]) -> CResult<Value> {

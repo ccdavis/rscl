@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 
 use crate::exc::{RtResult, err};
 use crate::obj::exception::{CLASS_CAST, ILLEGAL_ARGUMENT, INDEX_OUT_OF_BOUNDS, UNSUPPORTED};
-use crate::obj::{self, Kind, list, map, set, string, vector};
+use crate::obj::{self, Kind, cons, lazyseq, list, map, set, string, vector};
 use crate::value::Value;
 
 fn type_name(v: &Value) -> &'static str {
@@ -18,7 +18,7 @@ fn entry(k: &Value, v: &Value) -> Value {
     vector::from_slice(&[k.clone(), v.clone()])
 }
 
-/// Materialise any seqable value as a `Vec` of owned elements.
+/// Materialise any seqable value as a `Vec` of owned elements (realising lazy seqs).
 pub fn to_vec(v: &Value) -> RtResult<Vec<Value>> {
     Ok(match v.kind() {
         None if v.is_nil() => Vec::new(),
@@ -27,6 +27,7 @@ pub fn to_vec(v: &Value) -> RtResult<Vec<Value>> {
         Some(Kind::Map) => map::get(v).m.iter().map(|(k, x)| entry(k, x)).collect(),
         Some(Kind::Set) => set::get(v).s.iter().cloned().collect(),
         Some(Kind::String) => string::get(v).chars().map(Value::char).collect(),
+        Some(Kind::Cons | Kind::LazySeq) => seq_iter(v).collect::<RtResult<Vec<Value>>>()?,
         _ => {
             return err(
                 ILLEGAL_ARGUMENT,
@@ -40,8 +41,63 @@ pub fn is_seqable(v: &Value) -> bool {
     v.is_nil()
         || matches!(
             v.kind(),
-            Some(Kind::List | Kind::Vector | Kind::Map | Kind::Set | Kind::String)
+            Some(
+                Kind::List
+                    | Kind::Vector
+                    | Kind::Map
+                    | Kind::Set
+                    | Kind::String
+                    | Kind::Cons
+                    | Kind::LazySeq
+            )
         )
+}
+
+/// A seq object (as opposed to a seqable collection).
+pub fn is_seq(v: &Value) -> bool {
+    matches!(v.kind(), Some(Kind::List | Kind::Cons | Kind::LazySeq))
+}
+
+/// Walk any seqable value element by element, realising lazy seqs as it goes.
+pub struct SeqIter {
+    cur: Value,
+    done: bool,
+}
+
+pub fn seq_iter(v: &Value) -> SeqIter {
+    SeqIter {
+        cur: v.clone(),
+        done: false,
+    }
+}
+
+impl Iterator for SeqIter {
+    type Item = RtResult<Value>;
+    fn next(&mut self) -> Option<RtResult<Value>> {
+        if self.done {
+            return None;
+        }
+        let step = (|| {
+            let s = seq(&self.cur)?;
+            if s.is_nil() {
+                return Ok(None);
+            }
+            let f = first(&s)?;
+            self.cur = rest(&s)?;
+            Ok(Some(f))
+        })();
+        match step {
+            Ok(Some(x)) => Some(Ok(x)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
 }
 
 pub fn count(v: &Value) -> RtResult<i64> {
@@ -52,6 +108,14 @@ pub fn count(v: &Value) -> RtResult<i64> {
         Some(Kind::Map) => map::get(v).m.len() as i64,
         Some(Kind::Set) => set::get(v).s.len() as i64,
         Some(Kind::String) => string::get(v).chars().count() as i64,
+        Some(Kind::Cons | Kind::LazySeq) => {
+            let mut n = 0;
+            for x in seq_iter(v) {
+                x?;
+                n += 1;
+            }
+            n
+        }
         _ => {
             return err(
                 UNSUPPORTED,
@@ -61,23 +125,35 @@ pub fn count(v: &Value) -> RtResult<i64> {
     })
 }
 
-/// `seq`: `nil` for empty, otherwise a non-empty list.
+/// `seq`: `nil` for empty, otherwise a seq object (list, cons or realised lazy seq).
+/// Vectors, maps, sets and strings are materialised into a list.
 pub fn seq(v: &Value) -> RtResult<Value> {
-    if let Some(l) = list::as_list(v) {
-        return Ok(if l.is_empty() { Value::NIL } else { v.clone() });
+    match v.kind() {
+        None if v.is_nil() => Ok(Value::NIL),
+        Some(Kind::List) => Ok(if list::get(v).is_empty() {
+            Value::NIL
+        } else {
+            v.clone()
+        }),
+        Some(Kind::Cons) => Ok(v.clone()),
+        Some(Kind::LazySeq) => lazyseq::realize(v),
+        _ => {
+            let items = to_vec(v)?;
+            Ok(if items.is_empty() {
+                Value::NIL
+            } else {
+                list::from_iter(items)
+            })
+        }
     }
-    let items = to_vec(v)?;
-    Ok(if items.is_empty() {
-        Value::NIL
-    } else {
-        list::from_iter(items)
-    })
 }
 
 pub fn first(v: &Value) -> RtResult<Value> {
     Ok(match v.kind() {
         None if v.is_nil() => Value::NIL,
         Some(Kind::List) => list::get(v).first.clone(),
+        Some(Kind::Cons) => cons::get(v).first.clone(),
+        Some(Kind::LazySeq) => first(&lazyseq::realize(v)?)?,
         Some(Kind::Vector) => vector::get(v).v.front().cloned().unwrap_or(Value::NIL),
         Some(Kind::String) => string::get(v)
             .chars()
@@ -87,11 +163,30 @@ pub fn first(v: &Value) -> RtResult<Value> {
     })
 }
 
-/// `rest`: always a list (the empty list for empty or one-element input).
+/// `rest`: a seq (possibly an unrealised lazy seq), or the empty list.
 pub fn rest(v: &Value) -> RtResult<Value> {
     Ok(match v.kind() {
         None if v.is_nil() => list::empty(),
         Some(Kind::List) => list::get(v).rest(),
+        Some(Kind::Cons) => {
+            let more = &cons::get(v).more;
+            match more.kind() {
+                None if more.is_nil() => list::empty(),
+                Some(Kind::List) => {
+                    if list::get(more).is_empty() {
+                        list::empty()
+                    } else {
+                        more.clone()
+                    }
+                }
+                Some(Kind::Cons | Kind::LazySeq) => more.clone(),
+                _ => {
+                    let s = seq(more)?;
+                    if s.is_nil() { list::empty() } else { s }
+                }
+            }
+        }
+        Some(Kind::LazySeq) => rest(&lazyseq::realize(v)?)?,
         Some(Kind::Vector) => {
             let vv = &vector::get(v).v;
             if vv.len() <= 1 {
@@ -128,6 +223,8 @@ pub fn last(v: &Value) -> RtResult<Value> {
     })
 }
 
+/// `cons`: onto `nil` or a list gives a list; onto anything else a cons cell whose
+/// tail is the (possibly lazy) collection itself.
 pub fn cons(x: Value, coll: &Value) -> RtResult<Value> {
     if coll.is_nil() {
         return Ok(list::from_iter(vec![x]));
@@ -135,15 +232,20 @@ pub fn cons(x: Value, coll: &Value) -> RtResult<Value> {
     if coll.is_kind(Kind::List) {
         return Ok(list::cons(x, coll.clone()));
     }
-    let mut items = to_vec(coll)?;
-    items.insert(0, x);
-    Ok(list::from_iter(items))
+    if !is_seqable(coll) {
+        return err(
+            ILLEGAL_ARGUMENT,
+            format!("Don't know how to create ISeq from: {}", type_name(coll)),
+        );
+    }
+    Ok(cons::new(x, coll.clone()))
 }
 
 pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
     match coll.kind() {
         None if coll.is_nil() => Ok(list::from_iter(vec![x])),
         Some(Kind::List) => Ok(list::cons(x, coll.clone())),
+        Some(Kind::Cons | Kind::LazySeq) => Ok(cons::new(x, coll.clone())),
         Some(Kind::Vector) => {
             let mut v = vector::get(coll).v.clone();
             v.push_back(x);
@@ -256,6 +358,17 @@ pub fn nth(coll: &Value, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
                 Some(x) => Ok(x.clone()),
                 None => oob(l.count as usize),
             }
+        }
+        Some(Kind::Cons | Kind::LazySeq) => {
+            let mut n = 0usize;
+            for x in seq_iter(coll) {
+                let x = x?;
+                if n == i as usize {
+                    return Ok(x);
+                }
+                n += 1;
+            }
+            oob(n)
         }
         _ => err(
             UNSUPPORTED,
@@ -444,7 +557,7 @@ pub fn pop(coll: &Value) -> RtResult<Value> {
 /// An empty collection of the same kind.
 pub fn empty(coll: &Value) -> Value {
     match coll.kind() {
-        Some(Kind::List) => list::empty(),
+        Some(Kind::List | Kind::Cons | Kind::LazySeq) => list::empty(),
         Some(Kind::Vector) => vector::new(vector::Vec_::new()),
         Some(Kind::Map) => map::new(map::empty_map()),
         Some(Kind::Set) => set::new(set::empty_set()),

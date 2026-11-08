@@ -190,31 +190,10 @@ pub struct Analyzer {
     pub locals: Vec<LocalInfo>,
     frames: Vec<Frame>,
     next_loop: LoopId,
-    next_sym: u32,
     fn_counter: u32,
 }
 
-const SPECIAL_FORMS: &[&str] = &[
-    "def",
-    "if",
-    "do",
-    "let*",
-    "loop*",
-    "recur",
-    "fn*",
-    "quote",
-    "var",
-    "throw",
-    "try",
-    "set!",
-    "letfn*",
-    "case*",
-    "native-call*",
-];
-
-pub fn is_special(name: &str) -> bool {
-    SPECIAL_FORMS.contains(&name)
-}
+pub use rscl_runtime::reader::is_special;
 
 impl Analyzer {
     pub fn new(ns: &'static ns::NsObj) -> Self {
@@ -223,7 +202,6 @@ impl Analyzer {
             locals: Vec::new(),
             frames: Vec::new(),
             next_loop: 0,
-            next_sym: 0,
             fn_counter: 0,
         }
     }
@@ -298,17 +276,13 @@ impl Analyzer {
             .any(|f| f.scopes.iter().any(|s| s.iter().any(|(n, _)| n == name)))
     }
 
-    pub fn gensym(&mut self, prefix: &str) -> Value {
-        self.next_sym += 1;
-        symbol::new(None, &format!("{prefix}__{}__auto__", self.next_sym))
-    }
-
     // ---- dispatch ----------------------------------------------------------------
 
     pub fn analyze(&mut self, form: &Value, tail: bool) -> CResult<Node> {
         match form.kind() {
             Some(Kind::Symbol) => self.analyze_symbol(form),
-            Some(Kind::List) => self.analyze_list(form, tail),
+            // Macro expansions may return cons cells or lazy seqs: any seq is a call form.
+            Some(Kind::List | Kind::Cons | Kind::LazySeq) => self.analyze_list(form, tail),
             Some(Kind::Vector) => {
                 let items = vector::get(form).v.iter().cloned().collect::<Vec<_>>();
                 self.analyze_coll(form, CollKind::Vector, &items)
@@ -371,28 +345,34 @@ impl Analyzer {
     }
 
     fn analyze_list(&mut self, form: &Value, tail: bool) -> CResult<Node> {
-        let l = list::get(form);
-        if l.is_empty() {
-            return Ok(Node::Const(form.clone()));
+        let Some(items) = seq_items(form) else {
+            return fail(form, "cannot realise sequence form");
+        };
+        if items.is_empty() {
+            return Ok(Node::Const(list::empty()));
         }
-        let items = l.to_vec();
         let head = &items[0];
         if let Some(sym) = symbol::as_sym(head) {
             if sym.ns().is_none() && is_special(sym.name()) {
                 return self.analyze_special(sym.name(), form, &items, tail);
             }
-            if sym.ns().is_none()
-                && !self.is_local(sym.name())
-                && let Some(expanded) = rewrite::expand(self, sym.name(), form, &items)?
-            {
-                // A rewrite may hand back one of the original sub-forms (`(or x)` → x);
-                // only a freshly built form takes the position of the form it replaces.
-                if pos::pos_id(&expanded) == 0
-                    && expanded.header().is_some_and(|h| !h.is_immortal())
+            let shadowed = sym.ns().is_none() && self.is_local(sym.name());
+            if !shadowed {
+                // A macro var: call it at compile time on the unevaluated forms.
+                if let Some(var) = self.resolve_var(sym.ns(), sym.name())
+                    && var.get().is_macro()
                 {
-                    pos::set_pos(&expanded, pos::pos_id(form));
+                    let expanded = self.macroexpand(var, form, &items)?;
+                    self.stamp_expansion(form, &expanded);
+                    return self.analyze(&expanded, tail);
                 }
-                return self.analyze(&expanded, tail);
+                // Built-in rewrites: bootstrap fallbacks until core.clj defines the macro.
+                if sym.ns().is_none()
+                    && let Some(expanded) = rewrite::expand(sym.name(), form, &items)?
+                {
+                    self.stamp_expansion(form, &expanded);
+                    return self.analyze(&expanded, tail);
+                }
             }
         }
         let f = self.analyze(head, false)?;
@@ -405,6 +385,42 @@ impl Analyzer {
             args,
             pos: pos::pos_id(form),
         })
+    }
+
+    /// Run a macro: `(macro-fn &form &env args...)`. An exception thrown by the macro
+    /// is a compile error at the call site.
+    fn macroexpand(&mut self, var: VarPtr, form: &Value, items: &[Value]) -> CResult<Value> {
+        let f = var.get().root();
+        if f.is_unbound() {
+            std::mem::forget(f);
+            return fail(form, format!("macro {} is unbound", var.get().qualified()));
+        }
+        let mut args = Vec::with_capacity(items.len() + 1);
+        args.push(form.clone());
+        args.push(Value::NIL);
+        args.extend(items[1..].iter().cloned());
+        match f.call(&args) {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                let e = rscl_runtime::exc::take().unwrap_or(Value::NIL);
+                fail(
+                    form,
+                    format!(
+                        "Unexpected error macroexpanding {}: {}",
+                        var.get().qualified(),
+                        rscl_runtime::exc::format_exception(&e)
+                    ),
+                )
+            }
+        }
+    }
+
+    /// A macro or rewrite may hand back one of the original sub-forms (`(or x)` → x);
+    /// only a freshly built form takes the position of the form it replaces.
+    fn stamp_expansion(&self, form: &Value, expanded: &Value) {
+        if pos::pos_id(expanded) == 0 && expanded.header().is_some_and(|h| !h.is_immortal()) {
+            pos::set_pos(expanded, pos::pos_id(form));
+        }
     }
 
     // ---- special forms -------------------------------------------------------------
@@ -646,10 +662,10 @@ impl Analyzer {
         } else {
             let mut out = Vec::new();
             for a in rest {
-                let Some(l) = list::as_list(a) else {
+                let Some(items) = seq_items(a) else {
                     return fail(a, "fn arity must be a list ([params] body...)");
                 };
-                out.push(l.to_vec());
+                out.push(items);
             }
             out
         };
@@ -768,8 +784,8 @@ impl Analyzer {
 impl Analyzer {
     fn analyze_try(&mut self, items: &[Value]) -> CResult<Node> {
         let is_clause = |v: &Value, name: &str| {
-            list::as_list(v)
-                .and_then(|l| l.iter().next().cloned())
+            seq_items(v)
+                .and_then(|items| items.first().cloned())
                 .and_then(|h| symbol::as_sym(&h).map(|s| s.ns().is_none() && s.name() == name))
                 .unwrap_or(false)
         };
@@ -778,7 +794,7 @@ impl Analyzer {
         let mut finally = None;
         for (i, it) in items.iter().enumerate().skip(1) {
             if is_clause(it, "catch") {
-                let parts = list::get(it).to_vec();
+                let parts = seq_items(it).unwrap_or_default();
                 if parts.len() < 3 {
                     return fail(
                         it,
@@ -812,7 +828,7 @@ impl Analyzer {
                 if i + 1 != items.len() {
                     return fail(it, "finally clause must be last in try expression");
                 }
-                let parts = list::get(it).to_vec();
+                let parts = seq_items(it).unwrap_or_default();
                 self.frame().try_depth += 1;
                 let f = self.analyze_body(&parts[1..], false);
                 self.frame().try_depth -= 1;
@@ -894,13 +910,29 @@ pub fn native_ty(v: &Value) -> CResult<NativeTy> {
 /// macros are visible to later sub-forms (Clojure semantics). Nested `do`s inside are
 /// flattened too.
 pub fn split_do(form: &Value) -> Vec<Value> {
-    if let Some(l) = list::as_list(form)
-        && let Some(head) = l.iter().next()
+    if let Some(items) = seq_items(form)
+        && let Some(head) = items.first()
         && symbol::as_sym(head).is_some_and(|s| s.ns().is_none() && s.name() == "do")
     {
-        return l.iter().skip(1).flat_map(split_do).collect();
+        return items.iter().skip(1).flat_map(split_do).collect();
     }
     vec![form.clone()]
+}
+
+/// The elements of a list, cons or lazy seq form (`None` for anything else). Lazy
+/// seqs produced by macros are realised here.
+pub fn seq_items(v: &Value) -> Option<Vec<Value>> {
+    if rscl_runtime::coll::is_seq(v) {
+        match rscl_runtime::coll::to_vec(v) {
+            Ok(items) => Some(items),
+            Err(_) => {
+                rscl_runtime::exc::take();
+                None
+            }
+        }
+    } else {
+        None
+    }
 }
 
 /// Self-evaluating form that needs no code to construct.
