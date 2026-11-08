@@ -1,0 +1,12 @@
+;; String functions: core and clojure.string.
+(println (subs "hello" 1) (subs "hello" 1 3) (count "héllo") (str \a \b) (char 97) (int \a) (int 3.7) (long 2.5) (double 2))
+(println (clojure.string/upper-case "abc") (clojure.string/lower-case "ABC") (clojure.string/capitalize "hELLO"))
+(println (clojure.string/trim "  x  ") (clojure.string/triml "  x  ") (clojure.string/trimr "  x  ") (clojure.string/blank? "  ") (clojure.string/blank? "a") (clojure.string/blank? nil))
+(println (clojure.string/starts-with? "hello" "he") (clojure.string/ends-with? "hello" "lo") (clojure.string/includes? "hello" "ell") (clojure.string/index-of "hello" "l") (clojure.string/index-of "hello" "z"))
+(println (clojure.string/split "a,b,c" ",") (clojure.string/split "a,b,,c,," ",") (clojure.string/split "a,b,c" "," 2) (clojure.string/split-lines "a\nb\nc"))
+(println (clojure.string/join ", " [1 2 3]) (clojure.string/join [1 2 3]) (clojure.string/join "-" '("a" nil "c")))
+(println (clojure.string/replace "banana" "a" "o") (clojure.string/replace-first "banana" "a" "o") (clojure.string/reverse "abc") (clojure.string/escape "<a>" {\< "&lt;" \> "&gt;"}))
+(println (chars "abc") (parse-long "42") (parse-long "x") (parse-double "2.5") (str (read-string "[1 2]")) (name (read-string ":k")))
+(println (= "a" "a") (= "a" "b") (compare "a" "b") (sort ["pear" "apple" "fig"]))
+(println (str "tab\there" "\n" "newline done"))
+(println (pr-str "quote\"d") (pr-str \a) (pr-str "a\\b"))

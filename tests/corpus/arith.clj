@@ -1,0 +1,13 @@
+;; Integer and double arithmetic, promotion past the fixnum range, comparisons.
+(println (+ 1 2) (- 10 4 3) (* 2 3 4) (/ 12 4) (/ 1 4))
+(println (+ 1 2.5) (* 2 0.5) (/ 9 2.0))
+(println (quot 17 5) (rem 17 5) (mod -17 5) (rem -17 5) (quot -17 5))
+(println (inc 4611686018427387903) (dec -4611686018427387904))
+(println (* 3037000499 3037000499))
+(println (< 1 2 3) (< 1 3 2) (<= 1 1 2) (> 3 2 1) (>= 3 3 1))
+(println (= 1 1) (= 1 1.0) (== 1 1.0) (not= 1 2) (= 2 2 2) (= 2 2 3))
+(println (max 1 5 3) (min 4 2 8) (max 1 2.5))
+(println (zero? 0) (pos? 1) (neg? -1) (even? 4) (odd? 4))
+(println (+) (*) (- 5) (/ 2))
+(println 1e3 1.5e-7 100000000.0 0.001 (+ 0.1 0.2))
+(println 0x1F 2r1010 017 -42 +7)

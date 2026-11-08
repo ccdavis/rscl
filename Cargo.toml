@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/rscl-runtime", "crates/rscl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.97"
+repository = "https://github.com/ccdavis/rscl"
+
+[workspace.dependencies]
+# Every Cranelift crate must stay on exactly one version.
+cranelift-codegen = "=0.137.1"
+cranelift-frontend = "=0.137.1"
+cranelift-module = "=0.137.1"
+cranelift-jit = "=0.137.1"
+cranelift-object = "=0.137.1"
+cranelift-native = "=0.137.1"
+imbl = "7"
+rustyline = "19"
+libloading = "0.9"
+
+[profile.release]
+debug = 1
+
+[profile.dev]
+# Cranelift is slow in debug; optimise dependencies but keep our crates debuggable.
+[profile.dev.package."*"]
+opt-level = 2

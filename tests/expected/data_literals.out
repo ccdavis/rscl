@@ -1,0 +1,5 @@
+[1 2 3] {:b two, :a 1} #{1 2} (1 2) ()
+true true true true false
+[2 {:k x1} #{2}]
+{:v [1 {:deep #{:x}}]}
+true

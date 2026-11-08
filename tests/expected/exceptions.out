@@ -1,0 +1,23 @@
+caught: Divide by zero
+:any
+[boom {:code 7}]
+:right
+finally runs
+1
+finally after catch
+:caught
+(2 -2 6)
+inner finally
+outer caught inner
+ab
+owned-string kept
+[0 :e 2]
+thrown value 42
+index 5 out of bounds for length 1
+body
+cleanup
+:done
+always
+:ok
+always
+late

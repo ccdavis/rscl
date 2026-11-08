@@ -1,0 +1,10 @@
+;; Vectors, maps, sets and lists as values; equality and hashing.
+(def v [1 2 3])
+(def m {:a 1 :b "two"})
+(def s #{1 2})
+(println v m s '(1 2) '())
+(println (= v [1 2 3]) (= v '(1 2 3)) (= m {:b "two" :a 1}) (= s #{2 1}) (= s [1 2]))
+(println [(+ 1 1) {:k (str "x" 1)} #{(inc 1)}])
+(def nested {:v [1 {:deep #{:x}}]})
+(println nested)
+(println (= nested {:v [1 {:deep #{:x}}]}))

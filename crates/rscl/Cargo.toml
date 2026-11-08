@@ -1,0 +1,30 @@
+[package]
+name = "rscl"
+description = "rscl: a Clojure variant in Rust with a Cranelift JIT and AOT compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+default-run = "rscl"
+
+[lib]
+name = "rscl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rscl"
+path = "src/main.rs"
+
+[dependencies]
+rscl-runtime = { path = "../rscl-runtime" }
+cranelift-codegen = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-module = { workspace = true }
+cranelift-jit = { workspace = true }
+cranelift-object = { workspace = true }
+cranelift-native = { workspace = true }
+rustyline = { workspace = true }
+libloading = { workspace = true }
+
+[dev-dependencies]
+rscl-runtime = { path = "../rscl-runtime", features = ["live-count"] }

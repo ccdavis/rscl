@@ -1,0 +1,720 @@
+//! The reader: text → forms (runtime `Value`s), so the compiler is homoiconic and
+//! `read-string` is available at run time. Records source positions in object
+//! headers. Syntax-quote, `#()` and `#""` arrive in Phase 4.
+use crate::obj::{self, Kind, keyword, list, map, set, string, symbol, vector};
+use crate::pos::{self, SrcPos};
+use crate::value::Value;
+
+/// What the reader needs from its environment to resolve `::kw` and `::alias/kw`.
+pub trait ReaderEnv {
+    fn current_ns(&self) -> String;
+    fn resolve_alias(&self, alias: &str) -> Option<String>;
+}
+
+/// Uses the runtime's current namespace.
+pub struct DefaultEnv;
+
+impl ReaderEnv for DefaultEnv {
+    fn current_ns(&self) -> String {
+        crate::ns::current().name.to_string()
+    }
+    fn resolve_alias(&self, alias: &str) -> Option<String> {
+        crate::ns::current()
+            .resolve_alias(alias)
+            .map(|n| n.name.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadErrorKind {
+    /// End of input inside a form: a REPL should ask for more input.
+    Eof,
+    Syntax,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadError {
+    pub kind: ReadErrorKind,
+    pub line: u32,
+    pub col: u32,
+    pub msg: String,
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "line {}, col {}: {}", self.line, self.col, self.msg)
+    }
+}
+impl std::error::Error for ReadError {}
+
+pub type ReadResult<T> = Result<T, ReadError>;
+
+pub struct Reader<'a> {
+    src: &'a str,
+    pos: usize,
+    line: u32,
+    col: u32,
+    file: u32,
+    /// Record source positions (only for source that is being compiled; run-time
+    /// `read-string` must not grow the global position table).
+    record_pos: bool,
+    env: &'a dyn ReaderEnv,
+}
+
+/// Read exactly one form from `s`.
+pub fn read_str(s: &str) -> ReadResult<Value> {
+    let mut r = Reader::new(s, &DefaultEnv);
+    match r.read()? {
+        Some(v) => Ok(v),
+        None => Err(r.error(ReadErrorKind::Eof, "EOF while reading")),
+    }
+}
+
+/// Read every form in `s`.
+pub fn read_all(s: &str) -> ReadResult<Vec<Value>> {
+    let mut r = Reader::new(s, &DefaultEnv);
+    let mut out = Vec::new();
+    while let Some(v) = r.read()? {
+        out.push(v);
+    }
+    Ok(out)
+}
+
+fn is_ws(c: char) -> bool {
+    c.is_whitespace() || c == ','
+}
+
+/// Characters that end a token.
+fn is_terminator(c: char) -> bool {
+    is_ws(c)
+        || matches!(
+            c,
+            '(' | ')' | '[' | ']' | '{' | '}' | '"' | ';' | '`' | '~' | '@' | '^' | '\\'
+        )
+}
+
+impl<'a> Reader<'a> {
+    pub fn new(src: &'a str, env: &'a dyn ReaderEnv) -> Self {
+        Reader {
+            src,
+            pos: 0,
+            line: 1,
+            col: 1,
+            file: 0,
+            record_pos: false,
+            env,
+        }
+    }
+
+    /// Name the source file and start recording positions on the forms read.
+    pub fn with_file(mut self, file: u32) -> Self {
+        self.file = file;
+        self.record_pos = true;
+        self
+    }
+
+    /// Byte offset of the next unread character.
+    pub fn offset(&self) -> usize {
+        self.pos
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.src[self.pos..].chars().next()
+    }
+
+    fn peek2(&self) -> Option<char> {
+        let mut it = self.src[self.pos..].chars();
+        it.next();
+        it.next()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.pos += c.len_utf8();
+        if c == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(c)
+    }
+
+    fn error(&self, kind: ReadErrorKind, msg: impl Into<String>) -> ReadError {
+        ReadError {
+            kind,
+            line: self.line,
+            col: self.col,
+            msg: msg.into(),
+        }
+    }
+
+    fn syntax(&self, msg: impl Into<String>) -> ReadError {
+        self.error(ReadErrorKind::Syntax, msg)
+    }
+
+    fn eof(&self, what: &str) -> ReadError {
+        self.error(ReadErrorKind::Eof, format!("EOF while reading {what}"))
+    }
+
+    fn skip_ws_and_comments(&mut self) {
+        loop {
+            match self.peek() {
+                Some(c) if is_ws(c) => {
+                    self.bump();
+                }
+                Some(';') => self.skip_line(),
+                Some('#') if self.peek2() == Some('!') => self.skip_line(),
+                _ => return,
+            }
+        }
+    }
+
+    fn skip_line(&mut self) {
+        while let Some(c) = self.bump() {
+            if c == '\n' {
+                break;
+            }
+        }
+    }
+
+    fn here(&self) -> SrcPos {
+        SrcPos {
+            file: self.file,
+            line: self.line,
+            col: self.col,
+        }
+    }
+
+    fn stamp(&self, v: Value, at: SrcPos) -> Value {
+        // Interned keywords (and other immortal objects) are shared: never write
+        // into their headers.
+        if self.record_pos && v.header().is_some_and(|h| !h.is_immortal()) {
+            pos::set_pos(&v, pos::add(at));
+        }
+        v
+    }
+
+    /// Read the next form; `Ok(None)` at a clean end of input.
+    pub fn read(&mut self) -> ReadResult<Option<Value>> {
+        loop {
+            self.skip_ws_and_comments();
+            let Some(c) = self.peek() else {
+                return Ok(None);
+            };
+            let at = self.here();
+            // `#_` discards the next form and keeps going.
+            if c == '#' && self.peek2() == Some('_') {
+                self.bump();
+                self.bump();
+                match self.read()? {
+                    Some(_) => continue,
+                    None => return Err(self.eof("form after #_")),
+                }
+            }
+            let v = self.read_form(c)?;
+            return Ok(Some(self.stamp(v, at)));
+        }
+    }
+
+    fn read_required(&mut self, what: &str) -> ReadResult<Value> {
+        match self.read()? {
+            Some(v) => Ok(v),
+            None => Err(self.eof(what)),
+        }
+    }
+
+    fn read_form(&mut self, c: char) -> ReadResult<Value> {
+        match c {
+            '(' => {
+                self.bump();
+                let items = self.read_seq(')')?;
+                Ok(list::from_slice(&items))
+            }
+            '[' => {
+                self.bump();
+                let items = self.read_seq(']')?;
+                Ok(vector::from_slice(&items))
+            }
+            '{' => {
+                self.bump();
+                let items = self.read_seq('}')?;
+                self.make_map(items)
+            }
+            ')' | ']' | '}' => Err(self.syntax(format!("Unmatched delimiter: {c}"))),
+            '"' => {
+                self.bump();
+                self.read_string()
+            }
+            '\\' => {
+                self.bump();
+                self.read_char()
+            }
+            '\'' => {
+                self.bump();
+                let f = self.read_required("quoted form")?;
+                Ok(list::from_slice(&[symbol::new(None, "quote"), f]))
+            }
+            '@' => {
+                self.bump();
+                let f = self.read_required("deref form")?;
+                Ok(list::from_slice(&[
+                    symbol::new(Some("clojure.core"), "deref"),
+                    f,
+                ]))
+            }
+            '`' => Err(self.syntax("syntax-quote is not supported yet")),
+            '~' => Err(self.syntax("unquote is not supported yet")),
+            '^' => {
+                self.bump();
+                self.read_meta()
+            }
+            '#' => {
+                self.bump();
+                self.read_dispatch()
+            }
+            ':' => {
+                self.bump();
+                self.read_keyword()
+            }
+            _ => {
+                let tok = self.read_token();
+                if tok.is_empty() {
+                    // A lone terminator we do not handle (should not happen).
+                    self.bump();
+                    return Err(self.syntax(format!("Unexpected character: {c}")));
+                }
+                self.interpret_token(&tok)
+            }
+        }
+    }
+
+    fn read_seq(&mut self, close: char) -> ReadResult<Vec<Value>> {
+        let mut items = Vec::new();
+        loop {
+            self.skip_ws_and_comments();
+            match self.peek() {
+                None => return Err(self.eof(&format!("sequence, expected {close}"))),
+                Some(c) if c == close => {
+                    self.bump();
+                    return Ok(items);
+                }
+                Some(c) if matches!(c, ')' | ']' | '}') => {
+                    return Err(self.syntax(format!("Unmatched delimiter: {c}, expected {close}")));
+                }
+                Some(_) => match self.read()? {
+                    Some(v) => items.push(v),
+                    None => return Err(self.eof(&format!("sequence, expected {close}"))),
+                },
+            }
+        }
+    }
+
+    fn make_map(&self, items: Vec<Value>) -> ReadResult<Value> {
+        if !items.len().is_multiple_of(2) {
+            return Err(self.syntax("Map literal must contain an even number of forms"));
+        }
+        let mut m = map::empty_map();
+        for kv in items.chunks(2) {
+            if m.contains_key(&kv[0]) {
+                return Err(
+                    self.syntax(format!("Duplicate key: {}", crate::printer::pr_str(&kv[0])))
+                );
+            }
+            m.insert(kv[0].clone(), kv[1].clone());
+        }
+        Ok(map::new(m))
+    }
+
+    fn read_token(&mut self) -> String {
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if is_terminator(c) {
+                break;
+            }
+            self.bump();
+        }
+        self.src[start..self.pos].to_string()
+    }
+
+    fn read_string(&mut self) -> ReadResult<Value> {
+        let mut s = String::new();
+        loop {
+            let Some(c) = self.bump() else {
+                return Err(self.eof("string"));
+            };
+            match c {
+                '"' => return Ok(string::from_string(s)),
+                '\\' => {
+                    let Some(e) = self.bump() else {
+                        return Err(self.eof("string escape"));
+                    };
+                    match e {
+                        't' => s.push('\t'),
+                        'n' => s.push('\n'),
+                        'r' => s.push('\r'),
+                        'b' => s.push('\u{8}'),
+                        'f' => s.push('\u{c}'),
+                        '"' => s.push('"'),
+                        '\\' => s.push('\\'),
+                        '\'' => s.push('\''),
+                        'u' => s.push(self.read_unicode_escape(4)?),
+                        '0'..='7' => {
+                            let mut n = e.to_digit(8).unwrap();
+                            for _ in 0..2 {
+                                match self.peek().and_then(|c| c.to_digit(8)) {
+                                    Some(d) => {
+                                        self.bump();
+                                        n = n * 8 + d;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            if n > 0o377 {
+                                return Err(
+                                    self.syntax("Octal escape sequence must be in range [0, 377]")
+                                );
+                            }
+                            s.push(char::from_u32(n).unwrap());
+                        }
+                        _ => {
+                            return Err(self.syntax(format!("Unsupported escape character: \\{e}")));
+                        }
+                    }
+                }
+                _ => s.push(c),
+            }
+        }
+    }
+
+    fn read_unicode_escape(&mut self, digits: usize) -> ReadResult<char> {
+        let mut n = 0u32;
+        for _ in 0..digits {
+            let Some(c) = self.bump() else {
+                return Err(self.eof("unicode escape"));
+            };
+            let Some(d) = c.to_digit(16) else {
+                return Err(self.syntax("Invalid unicode escape"));
+            };
+            n = n * 16 + d;
+        }
+        char::from_u32(n).ok_or_else(|| self.syntax("Invalid unicode code point"))
+    }
+
+    fn read_char(&mut self) -> ReadResult<Value> {
+        let Some(first) = self.bump() else {
+            return Err(self.eof("character"));
+        };
+        let mut tok = String::new();
+        tok.push(first);
+        while let Some(c) = self.peek() {
+            if is_terminator(c) {
+                break;
+            }
+            self.bump();
+            tok.push(c);
+        }
+        if tok.chars().count() == 1 {
+            return Ok(Value::char(first));
+        }
+        let c = match tok.as_str() {
+            "newline" => '\n',
+            "space" => ' ',
+            "tab" => '\t',
+            "backspace" => '\u{8}',
+            "formfeed" => '\u{c}',
+            "return" => '\r',
+            t if t.starts_with('u') && t.len() == 5 => {
+                let n = u32::from_str_radix(&t[1..], 16)
+                    .map_err(|_| self.syntax(format!("Invalid character: \\{t}")))?;
+                char::from_u32(n).ok_or_else(|| self.syntax("Invalid unicode code point"))?
+            }
+            t if t.starts_with('o') && t.len() >= 2 && t.len() <= 4 => {
+                let n = u32::from_str_radix(&t[1..], 8)
+                    .map_err(|_| self.syntax(format!("Invalid octal character: \\{t}")))?;
+                if n > 0o377 {
+                    return Err(self.syntax("Octal escape sequence must be in range [0, 377]"));
+                }
+                char::from_u32(n).unwrap()
+            }
+            t => return Err(self.syntax(format!("Unsupported character: \\{t}"))),
+        };
+        Ok(Value::char(c))
+    }
+
+    fn read_keyword(&mut self) -> ReadResult<Value> {
+        let auto = self.peek() == Some(':');
+        if auto {
+            self.bump();
+        }
+        let tok = self.read_token();
+        if tok.is_empty() {
+            return Err(self.syntax("Invalid token: :"));
+        }
+        if tok.contains("::") || tok.ends_with(':') {
+            return Err(self.syntax(format!("Invalid token: :{tok}")));
+        }
+        let (ns, name) = symbol::split_ns(&tok);
+        if !auto {
+            return Ok(keyword::intern(ns, name));
+        }
+        let ns = match ns {
+            None => self.env.current_ns(),
+            Some(alias) => self.env.resolve_alias(alias).ok_or_else(|| {
+                self.syntax(format!(
+                    "Invalid token: ::{tok} (no such namespace alias: {alias})"
+                ))
+            })?,
+        };
+        Ok(keyword::intern(Some(&ns), name))
+    }
+
+    fn read_meta(&mut self) -> ReadResult<Value> {
+        let meta = self.read_required("metadata")?;
+        let meta = match meta.kind() {
+            Some(Kind::Map) => meta,
+            Some(Kind::Keyword) => map::from_pairs(&[meta, Value::TRUE]),
+            Some(Kind::Symbol) | Some(Kind::String) => {
+                map::from_pairs(&[keyword::intern(None, "tag"), meta])
+            }
+            _ => return Err(self.syntax("Metadata must be Symbol, Keyword, String or Map")),
+        };
+        let target = self.read_required("form after metadata")?;
+        match target.kind() {
+            Some(Kind::List | Kind::Vector | Kind::Map | Kind::Set | Kind::Symbol) => {
+                let merged = match obj::meta(&target) {
+                    Some(existing) if !existing.is_nil() => {
+                        let mut m = map::get(&existing).m.clone();
+                        for (k, v) in map::get(&meta).m.iter() {
+                            m.insert(k.clone(), v.clone());
+                        }
+                        map::new(m)
+                    }
+                    _ => meta,
+                };
+                obj::set_meta_unshared(&target, merged);
+                Ok(target)
+            }
+            _ => Err(self.syntax("Metadata can only be applied to collections and symbols")),
+        }
+    }
+
+    fn read_dispatch(&mut self) -> ReadResult<Value> {
+        let Some(c) = self.peek() else {
+            return Err(self.eof("dispatch"));
+        };
+        match c {
+            '{' => {
+                self.bump();
+                let items = self.read_seq('}')?;
+                let mut s = set::empty_set();
+                for x in items {
+                    if s.contains(&x) {
+                        return Err(
+                            self.syntax(format!("Duplicate key: {}", crate::printer::pr_str(&x)))
+                        );
+                    }
+                    s.insert(x);
+                }
+                Ok(set::new(s))
+            }
+            '\'' => {
+                self.bump();
+                let f = self.read_required("var form")?;
+                Ok(list::from_slice(&[symbol::new(None, "var"), f]))
+            }
+            '#' => {
+                self.bump();
+                let tok = self.read_token();
+                match tok.as_str() {
+                    "Inf" => Ok(Value::double(f64::INFINITY)),
+                    "-Inf" => Ok(Value::double(f64::NEG_INFINITY)),
+                    "NaN" => Ok(Value::double(f64::NAN)),
+                    _ => Err(self.syntax(format!("Unknown symbolic value: ##{tok}"))),
+                }
+            }
+            '(' => Err(self.syntax("#() anonymous functions are not supported yet")),
+            '"' => Err(self.syntax("#\"\" regex literals are not supported yet")),
+            '?' => Err(self.syntax("reader conditionals are not supported")),
+            _ => Err(self.syntax(format!("No dispatch macro for: {c}"))),
+        }
+    }
+
+    fn interpret_token(&mut self, tok: &str) -> ReadResult<Value> {
+        match tok {
+            "nil" => return Ok(Value::NIL),
+            "true" => return Ok(Value::TRUE),
+            "false" => return Ok(Value::FALSE),
+            _ => {}
+        }
+        let first = tok.chars().next().unwrap();
+        let second = tok.chars().nth(1);
+        if first.is_ascii_digit()
+            || ((first == '+' || first == '-') && second.is_some_and(|c| c.is_ascii_digit()))
+        {
+            return self.parse_number(tok);
+        }
+        if tok.contains("::") || (tok.ends_with(':') && tok != ":") {
+            return Err(self.syntax(format!("Invalid token: {tok}")));
+        }
+        Ok(symbol::parse(tok))
+    }
+
+    fn parse_number(&self, tok: &str) -> ReadResult<Value> {
+        let bad = || self.syntax(format!("Invalid number: {tok}"));
+        let (neg, body) = match tok.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, tok.strip_prefix('+').unwrap_or(tok)),
+        };
+        if body.ends_with('N') {
+            return Err(self.syntax(format!("BigInt literals are not supported yet: {tok}")));
+        }
+        if body.ends_with('M') {
+            return Err(self.syntax(format!("BigDecimal literals are not supported yet: {tok}")));
+        }
+        if body.contains('/') {
+            return Err(self.syntax(format!("Ratio literals are not supported yet: {tok}")));
+        }
+        let int = |digits: &str, radix: u32| -> ReadResult<Value> {
+            if digits.is_empty() {
+                return Err(bad());
+            }
+            let mag = u64::from_str_radix(digits, radix).map_err(|_| bad())?;
+            let n = if neg {
+                if mag > (i64::MAX as u64) + 1 {
+                    return Err(self.syntax(format!("Integer literal out of range: {tok}")));
+                }
+                (mag as i64).wrapping_neg()
+            } else {
+                i64::try_from(mag)
+                    .map_err(|_| self.syntax(format!("Integer literal out of range: {tok}")))?
+            };
+            Ok(Value::int(n))
+        };
+        if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            return int(hex, 16);
+        }
+        if let Some(i) = body.find(['r', 'R'])
+            && body[..i].chars().all(|c| c.is_ascii_digit())
+            && !body[..i].is_empty()
+        {
+            let radix: u32 = body[..i].parse().map_err(|_| bad())?;
+            if !(2..=36).contains(&radix) {
+                return Err(self.syntax(format!("Radix out of range: {tok}")));
+            }
+            return int(&body[i + 1..], radix);
+        }
+        let is_float = body.contains(['.', 'e', 'E']);
+        if is_float {
+            let d: f64 = body.parse().map_err(|_| bad())?;
+            return Ok(Value::double(if neg { -d } else { d }));
+        }
+        if body.len() > 1 && body.starts_with('0') {
+            return int(&body[1..], 8);
+        }
+        int(body, 10)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::printer::pr_str;
+
+    fn rt(s: &str) -> String {
+        pr_str(&read_str(s).unwrap())
+    }
+
+    #[test]
+    fn round_trips() {
+        for s in [
+            "nil",
+            "true",
+            "false",
+            "42",
+            "-7",
+            "3.5",
+            "1.0E20",
+            "\"hi\\n\"",
+            "\\a",
+            "\\newline",
+            ":k",
+            ":ns/k",
+            "sym",
+            "ns/sym",
+            "(f 1 2)",
+            "[1 [2 3]]",
+            "{:a 1}",
+            "#{1}",
+            "()",
+            "[]",
+            "{}",
+            "(quote x)",
+            "/",
+            "clojure.core//",
+        ] {
+            assert_eq!(rt(s), s, "round trip of {s}");
+        }
+    }
+
+    #[test]
+    fn numbers() {
+        assert_eq!(rt("0x1F"), "31");
+        assert_eq!(rt("2r1010"), "10");
+        assert_eq!(rt("017"), "15");
+        assert_eq!(rt("1e3"), "1000.0");
+        assert_eq!(rt("+5"), "5");
+        assert_eq!(rt("9223372036854775807"), "9223372036854775807");
+        assert_eq!(rt("-9223372036854775808"), "-9223372036854775808");
+        assert!(read_str("9223372036854775808").is_err());
+        assert!(read_str("1N").is_err());
+        assert_eq!(rt("##Inf"), "##Inf");
+    }
+
+    #[test]
+    fn macros_and_meta() {
+        assert_eq!(rt("'x"), "(quote x)");
+        assert_eq!(rt("@a"), "(clojure.core/deref a)");
+        assert_eq!(rt("#'a"), "(var a)");
+        assert_eq!(rt("[1 #_2 3]"), "[1 3]");
+        assert_eq!(rt("(a ; comment\n b)"), "(a b)");
+        assert_eq!(rt("[1,2]"), "[1 2]");
+        let v = read_str("^:k [1]").unwrap();
+        assert_eq!(pr_str(&obj::meta(&v).unwrap()), "{:k true}");
+        let v = read_str("^{:a 1} ^:b x").unwrap();
+        let m = pr_str(&obj::meta(&v).unwrap());
+        assert!(m.contains(":a 1") && m.contains(":b true"), "{m}");
+    }
+
+    #[test]
+    fn errors() {
+        let e = read_str("(1 2").unwrap_err();
+        assert_eq!(e.kind, ReadErrorKind::Eof);
+        let e = read_str("\"abc").unwrap_err();
+        assert_eq!(e.kind, ReadErrorKind::Eof);
+        let e = read_str(")").unwrap_err();
+        assert_eq!(e.kind, ReadErrorKind::Syntax);
+        assert!(read_str("{:a}").is_err());
+        assert!(read_str("{:a 1 :a 2}").is_err());
+        assert!(read_str("`x").is_err());
+    }
+
+    #[test]
+    fn positions_and_multiple_forms() {
+        let mut r = Reader::new("(a)\n  [b]", &DefaultEnv).with_file(pos::intern_file("<test>"));
+        let mut forms = Vec::new();
+        while let Some(f) = r.read().unwrap() {
+            forms.push(f);
+        }
+        assert_eq!(forms.len(), 2);
+        let p = pos::pos_of(&forms[1]).unwrap();
+        assert_eq!((p.line, p.col), (2, 3));
+        let a = list::get(&forms[0]).iter().next().unwrap().clone();
+        assert_eq!(pos::pos_of(&a).map(|p| (p.line, p.col)), Some((1, 2)));
+    }
+
+    #[test]
+    fn auto_keywords() {
+        assert_eq!(rt("::k"), ":user/k");
+    }
+}

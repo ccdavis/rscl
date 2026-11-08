@@ -1,0 +1,12 @@
+;; Typed FFI to libm/libc via defnative.
+(defnative cos :double [^double x])
+(defnative sqrt :double [^double x])
+(defnative pow :double [^double x ^double y])
+(defnative strlen :long [^str s])
+(defnative abs :int [^int n])
+(defnative c-toupper :int [^int c] :symbol "toupper")
+(defnative getenv :str [^str name])
+(println (cos 0.0) (sqrt 16) (pow 2 10) (strlen "hello") (abs -5) (char (c-toupper (int \a))))
+(println (nil? (getenv "RSCL_SURELY_UNSET_VARIABLE")) (string? (getenv "PATH")))
+(println (try (strlen 42) (catch ClassCastException e :not-a-string)))
+(println (map sqrt [1 4 9.0]))

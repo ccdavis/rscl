@@ -1,0 +1,8 @@
+a1:k2.5c
+"quoted \"string\"" \newline \space [1 "two" :three]
+"x" sym :kw
+x sym :kw
+no newline
+b a x nil
+:k :ns/k s :sym
+  only

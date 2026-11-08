@@ -1,0 +1,5 @@
+/target
+*.o
+*.swp
+/tests/corpus/*.bin
+/.rscl_history

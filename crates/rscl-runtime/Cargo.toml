@@ -1,0 +1,19 @@
+[package]
+name = "rscl-runtime"
+description = "Runtime library for rscl: values, reader, printer, namespaces, core builtins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+# rlib for the compiler/REPL host, staticlib for linking into AOT-built executables.
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+imbl = { workspace = true }
+
+[features]
+default = []
+# Count live heap objects (used by tests to catch leaks without valgrind).
+live-count = []

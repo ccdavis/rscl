@@ -1,0 +1,14 @@
+{
+   cranelift-jit code memory is released with free_memory, which valgrind cannot see as a free
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   fun:*cranelift_jit*
+}
+{
+   Rust std thread-local destructors and lazy statics stay reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:*std*thread*
+}

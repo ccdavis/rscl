@@ -1,0 +1,10 @@
+;; str, println/prn/pr-str, chars, keywords and symbols.
+(println (str "a" 1 nil :k 2.5 \c))
+(prn "quoted \"string\"" \newline \space [1 "two" :three])
+(println (pr-str "x" 'sym :kw))
+(println (print-str "x" 'sym :kw))
+(print "no newline")
+(newline)
+(println (name :a/b) (namespace :a/b) (name 'x) (namespace 'x))
+(println (keyword "k") (keyword "ns" "k") (symbol "s") (keyword 'sym))
+(println (str) (str nil) (str "only"))
