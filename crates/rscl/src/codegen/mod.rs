@@ -28,6 +28,15 @@ use crate::errors::{CResult, CompileError};
 pub struct UnitIds {
     pub init: FuncId,
     pub body: FuncId,
+    /// The `fn*` functions compiled for this unit (for stack-trace registration).
+    pub fns: Vec<CompiledFn>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompiledFn {
+    pub id: FuncId,
+    pub name: String,
+    pub size: u32,
 }
 
 pub struct Compiler<M: Module> {
@@ -38,6 +47,8 @@ pub struct Compiler<M: Module> {
     next_unit: u32,
     /// The runtime's `rscl_interrupt_flag` (an imported data symbol).
     flag_id: Option<DataId>,
+    /// Every `fn*` compiled into this module (AOT registers them for stack traces).
+    registered_fns: Vec<CompiledFn>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -70,6 +81,7 @@ struct UnitCtx {
     blob_index: HashMap<String, (i64, i64)>,
     pending_fns: Vec<(FuncId, Rc<FnNode>)>,
     fn_ids: HashMap<usize, FuncId>,
+    fns: Vec<CompiledFn>,
 }
 
 impl UnitCtx {
@@ -153,6 +165,7 @@ impl<M: Module> Compiler<M> {
             debug_ir: std::env::var_os("RSCL_DEBUG_IR").is_some(),
             next_unit: 0,
             flag_id: None,
+            registered_fns: Vec::new(),
         }
     }
 
@@ -172,7 +185,42 @@ impl<M: Module> Compiler<M> {
         Ok(UnitIds {
             init: u.init_id,
             body,
+            fns: std::mem::take(&mut u.fns),
         })
+    }
+
+    /// AOT: a `() -> i64` function that runs a lib's units in order (a `require`d
+    /// namespace or a `load-file`d file); returns `EXC` if one of them throws.
+    pub fn compile_loader(&mut self, key: &str, units: &[UnitIds]) -> CResult<FuncId> {
+        let mut u = self.new_unit()?;
+        let sig = thunk_signature(&self.module);
+        let name = format!("u{}_load_{}", u.unit, sanitize(key));
+        let id = self
+            .module
+            .declare_function(&name, Linkage::Local, &sig)
+            .map_err(internal)?;
+        let own_init = u.init_id;
+        self.with_function(id, sig, &name, &mut u, false, |fc| {
+            let entry = fc.b.create_block();
+            fc.b.switch_to_block(entry);
+            fc.b.seal_block(entry);
+            fc.start(0, &[])?;
+            let fail = fc.b.create_block();
+            run_step(fc, own_init, fail, false);
+            for unit in units {
+                run_step(fc, unit.init, fail, false);
+                run_step(fc, unit.body, fail, true);
+            }
+            let zero = fc.b.ins().iconst(types::I64, 0);
+            fc.b.ins().return_(&[zero]);
+            fc.b.switch_to_block(fail);
+            fc.b.seal_block(fail);
+            let exc = fc.b.ins().iconst(types::I64, api::consts::EXC as i64);
+            fc.b.ins().return_(&[exc]);
+            Ok(())
+        })?;
+        self.finish_unit(&mut u)?;
+        Ok(id)
     }
 
     /// Declare a unit's constant table, name blob and `init` function.
@@ -206,6 +254,7 @@ impl<M: Module> Compiler<M> {
             blob_index: HashMap::new(),
             pending_fns: Vec::new(),
             fn_ids: HashMap::new(),
+            fns: Vec::new(),
         })
     }
 
@@ -233,7 +282,13 @@ impl<M: Module> Compiler<M> {
     /// AOT: `rscl_entry() -> i32` runs every unit's `init` and `body` in order, then
     /// `-main` (if bound) with the command-line arguments. Any uncaught exception is
     /// reported and becomes exit status 1.
-    pub fn compile_entry(&mut self, units: &[UnitIds], main_ns: &str) -> CResult<FuncId> {
+    pub fn compile_entry(
+        &mut self,
+        core_units: &[UnitIds],
+        main_units: &[UnitIds],
+        loaders: &[(String, FuncId)],
+        main_ns: &str,
+    ) -> CResult<FuncId> {
         let mut u = self.new_unit()?;
         let mut sig = self.module.make_signature();
         sig.returns.push(AbiParam::new(types::I32));
@@ -243,14 +298,33 @@ impl<M: Module> Compiler<M> {
             .map_err(internal)?;
         let own_init = u.init_id;
         let main_ns = main_ns.to_string();
-        self.with_function(id, sig, "rscl_entry", &mut u, |fc| {
+        let fns = self.registered_fns.clone();
+        self.with_function(id, sig, "rscl_entry", &mut u, false, |fc| {
             let entry = fc.b.create_block();
             fc.b.switch_to_block(entry);
             fc.b.seal_block(entry);
             fc.start(0, &[])?;
             let fail = fc.b.create_block();
             run_step(fc, own_init, fail, false);
-            for unit in units {
+            // Code ranges of every compiled fn, so exceptions carry fn-name traces.
+            for f in &fns {
+                let fref = fc.func_ref(f.id);
+                let addr = fc.b.ins().func_addr(types::I64, fref);
+                let size = fc.b.ins().iconst(types::I64, f.size as i64);
+                let (np, nl) = fc.blob_ptr(&f.name);
+                fc.call_rt(RtFn::RegisterCode, &[addr, size, np, nl]);
+            }
+            for unit in core_units {
+                run_step(fc, unit.init, fail, false);
+                run_step(fc, unit.body, fail, true);
+            }
+            for (key, f) in loaders {
+                let (np, nl) = fc.blob_ptr(key);
+                let fref = fc.func_ref(*f);
+                let addr = fc.b.ins().func_addr(types::I64, fref);
+                fc.call_rt(RtFn::RegisterNsLoader, &[np, nl, addr]);
+            }
+            for unit in main_units {
                 run_step(fc, unit.init, fail, false);
                 run_step(fc, unit.body, fail, true);
             }
@@ -278,7 +352,7 @@ impl<M: Module> Compiler<M> {
             .module
             .declare_function("main", Linkage::Export, &sig)
             .map_err(internal)?;
-        self.with_function(id, sig, "main", &mut u, |fc| {
+        self.with_function(id, sig, "main", &mut u, false, |fc| {
             let block = fc.b.create_block();
             fc.b.append_block_params_for_function_params(block);
             fc.b.switch_to_block(block);
@@ -302,6 +376,7 @@ impl<M: Module> Compiler<M> {
         sig: Signature,
         name: &str,
         u: &mut UnitCtx,
+        record: bool,
         body: F,
     ) -> CResult<()>
     where
@@ -343,6 +418,16 @@ impl<M: Module> Compiler<M> {
                     0,
                 )
             })?;
+        if record {
+            let size = ctx.compiled_code().map_or(0, |c| c.code_info().total_size);
+            let f = CompiledFn {
+                id: func_id,
+                name: name.to_string(),
+                size,
+            };
+            u.fns.push(f.clone());
+            self.registered_fns.push(f);
+        }
         self.module.clear_context(&mut ctx);
         Ok(())
     }
@@ -360,7 +445,7 @@ impl<M: Module> Compiler<M> {
             .declare_function(&name, Linkage::Local, &sig)
             .map_err(internal)?;
         let argv_cap = max_args(node);
-        self.with_function(id, sig, &name, u, |fc| {
+        self.with_function(id, sig, &name, u, false, |fc| {
             let entry = fc.b.create_block();
             fc.b.switch_to_block(entry);
             fc.b.seal_block(entry);
@@ -388,7 +473,7 @@ impl<M: Module> Compiler<M> {
             .map(|a| max_args(&a.body))
             .max()
             .unwrap_or(0);
-        self.with_function(id, sig, &name, u, |fc| {
+        self.with_function(id, sig, &name, u, true, |fc| {
             let entry = fc.b.create_block();
             fc.b.append_block_params_for_function_params(entry);
             fc.b.switch_to_block(entry);
@@ -448,7 +533,7 @@ impl<M: Module> Compiler<M> {
         let name = format!("u{}_init", u.unit);
         let id = u.init_id;
         let consts = u.consts.clone();
-        self.with_function(id, sig, &name, u, |fc| {
+        self.with_function(id, sig, &name, u, false, |fc| {
             let entry = fc.b.create_block();
             fc.b.switch_to_block(entry);
             fc.b.seal_block(entry);
@@ -561,7 +646,12 @@ fn run_step<M: Module>(fc: &mut FnCtx<'_, M>, f: FuncId, fail: Block, release_re
 /// counting nested fns, which have their own slot.
 fn max_args(node: &Node) -> usize {
     match node {
-        Node::Const(_) | Node::Local(_) | Node::VarRef(_) | Node::TheVar(_) | Node::Fn(_) => 0,
+        Node::Const(_)
+        | Node::Local(_)
+        | Node::VarRef(_)
+        | Node::TheVar(_)
+        | Node::Fn(_)
+        | Node::CurrentNs => 0,
         Node::Def { init, .. } => init.as_ref().map_or(0, |n| max_args(n)),
         Node::If { test, then, else_ } => max_args(test).max(max_args(then)).max(max_args(else_)),
         Node::Do(nodes) => nodes.iter().map(max_args).max().unwrap_or(0),
@@ -1005,6 +1095,10 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 let var = v.get();
                 let p = self.const_slot(ConstEntry::Var(var.ns.to_string(), var.name.to_string()));
                 Ok(Operand::borrowed(p))
+            }
+            Node::CurrentNs => {
+                let ns = self.call_rt(RtFn::CurrentNs, &[]).unwrap();
+                Ok(Operand::borrowed(ns))
             }
             Node::Def { var, init } => {
                 let vo = var.get();

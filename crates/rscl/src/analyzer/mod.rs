@@ -38,6 +38,8 @@ pub enum Node {
     Local(LocalId),
     VarRef(VarPtr),
     TheVar(VarPtr),
+    /// `*ns*`: the current namespace object.
+    CurrentNs,
     Def {
         var: VarPtr,
         init: Option<Box<Node>>,
@@ -324,6 +326,9 @@ impl Analyzer {
             && let Some(id) = self.lookup_local(sym.name())
         {
             return Ok(Node::Local(id));
+        }
+        if sym.ns().is_none() && sym.name() == "*ns*" {
+            return Ok(Node::CurrentNs);
         }
         match self.resolve_var(sym.ns(), sym.name()) {
             Some(v) => Ok(Node::VarRef(v)),

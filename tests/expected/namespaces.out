@@ -1,0 +1,12 @@
+loading mylib.strings
+42 <HI>! <x> hello hello
+twice
+twice
+demo.main (s u)
+true true mylib.strings nil
+second require is a no-op
+BUILTIN NS true
+double-load evaluated
+double-load evaluated
+1 #'other.ns/here #'mylib.util/double-it
+main in demo.main nil

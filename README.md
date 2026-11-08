@@ -7,13 +7,15 @@ Where Clojure on the JVM calls Java, rscl calls Rust: the core library is Rust
 functions exposed as first-class fns, and later phases add a typed C-ABI FFI and a
 bridge for exposing whole Rust crates.
 
-Status: Phases 1–4 of the plan are done (see `docs/MILESTONES.md`): a working REPL
+Status: Phases 1–5 of the plan are done (see `docs/MILESTONES.md`): a working REPL
 with per-form incremental compilation and redefinition, `rscl run`, `rscl build`
 producing native binaries, `defmacro` with syntax-quote, lazy sequences, destructuring,
 atoms, regular expressions, a `core.clj` written from scratch on top of the Rust
-builtins, `try`/`catch`/`finally`, a typed C FFI (`defnative`), stack-overflow and
+builtins, namespaces with `ns`/`require`/`in-ns` and multi-file programs (required
+namespaces are compiled into built binaries), fn-name stack traces on uncaught
+exceptions, `try`/`catch`/`finally`, a typed C FFI (`defnative`), stack-overflow and
 Ctrl-C guards, and a differential test corpus that runs every program under both the
-JIT and the AOT compiler. Next: namespaces and multi-file programs (Phase 5).
+JIT and the AOT compiler. Next: the Rust library bridge (Phase 6).
 
 ## Build and run
 
@@ -27,8 +29,10 @@ target/debug/rscl build prog.clj -o prog     # native executable (needs `cc`)
 ```
 
 `build` options: `--opt` (Cranelift `speed`), `--native` (host CPU features instead
-of baseline x86-64), `--keep-obj`, `--link LIB`, `--lib-path DIR`. The linker needs
-`librscl_runtime.a`, found next to the `rscl` binary or via `RSCL_RUNTIME_LIB`.
+of baseline x86-64), `--keep-obj`, `--link LIB`, `--lib-path DIR`, `--no-eval`. The
+linker needs `librscl_runtime.a`, found next to the `rscl` binary or via
+`RSCL_RUNTIME_LIB`. `require` looks for `foo/bar.clj` in the program's directory, the
+working directory, each `--path DIR`, and `RSCL_PATH`.
 
 Exit status: 0 ok, 1 uncaught exception, 2 compile error, 3 reader error.
 `RSCL_DEBUG_IR=1` dumps the Cranelift IR of every compiled function.

@@ -353,7 +353,10 @@ pub unsafe extern "C" fn rt_report_uncaught() -> i32 {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     match exc::take() {
-        Some(e) => eprintln!("Uncaught exception: {}", exc::format_exception(&e)),
+        Some(e) => eprintln!(
+            "Uncaught exception: {}",
+            exc::format_exception_with_trace(&e)
+        ),
         None => eprintln!("Uncaught exception: <none pending>"),
     }
     1

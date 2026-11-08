@@ -50,6 +50,13 @@ pub struct Jit {
     compiler: ManuallyDrop<Compiler<JITModule>>,
 }
 
+/// Entry points of a finalised unit.
+#[derive(Clone, Copy)]
+pub struct CompiledUnit {
+    init: unsafe extern "C" fn() -> u64,
+    body: unsafe extern "C" fn() -> u64,
+}
+
 impl Jit {
     pub fn new() -> Result<Jit, String> {
         rscl_runtime::entry::init();
@@ -57,6 +64,7 @@ impl Jit {
             ("opt_level", "none"),
             ("use_colocated_libcalls", "false"),
             ("is_pic", "false"),
+            ("preserve_frame_pointers", "true"),
         ];
         let mut builder =
             JITBuilder::with_flags(&flags, default_libcall_names()).map_err(|e| e.to_string())?;
@@ -79,49 +87,61 @@ impl Jit {
         Ok(jit)
     }
 
-    /// Compile an analysed form into the JIT and run it (used by `build` to evaluate
-    /// forms at build time while a second compiler emits them into the object file).
+    /// Compile an analysed form into the JIT and run it.
     pub fn compile_and_run(&mut self, node: &Node, an: &Analyzer) -> Result<Value, EvalError> {
+        let unit = self.compile(node, an)?;
+        Jit::run(unit)
+    }
+
+    /// Compile and finalise a unit, returning its entry points. Running them is a
+    /// separate step so no borrow of the JIT is held while generated code executes.
+    pub fn compile(&mut self, node: &Node, an: &Analyzer) -> Result<CompiledUnit, EvalError> {
         let ids = self.compiler.compile_unit(node, an)?;
-        self.run_unit(ids)
+        self.finalize(ids)
+    }
+
+    fn finalize(&mut self, ids: crate::codegen::UnitIds) -> Result<CompiledUnit, EvalError> {
+        self.compiler
+            .module
+            .finalize_definitions()
+            .map_err(|e| CompileError::new(format!("finalize: {e}"), 0))?;
+        for f in &ids.fns {
+            let start = self.compiler.module.get_finalized_function(f.id) as usize;
+            rscl_runtime::trace::register_code(start, f.size as usize, &f.name);
+        }
+        let init = self.compiler.module.get_finalized_function(ids.init);
+        let body = self.compiler.module.get_finalized_function(ids.body);
+        // SAFETY: both functions were compiled with the `() -> i64` signature.
+        Ok(CompiledUnit {
+            init: unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn() -> u64>(init) },
+            body: unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn() -> u64>(body) },
+        })
+    }
+
+    /// Run a compiled unit: its constant initialiser, then its body.
+    pub fn run(unit: CompiledUnit) -> Result<Value, EvalError> {
+        let r = unsafe { (unit.init)() };
+        if r == value::EXC {
+            return Err(EvalError::Exception(exc::take().unwrap_or(Value::NIL)));
+        }
+        let r = unsafe { (unit.body)() };
+        if r == value::EXC {
+            return Err(EvalError::Exception(exc::take().unwrap_or(Value::NIL)));
+        }
+        Ok(unsafe { Value::from_raw(r) })
     }
 
     /// Evaluate a top-level form. A top-level `(do ...)` is evaluated one sub-form at a
     /// time so earlier definitions are visible to later ones.
     pub fn eval(&mut self, form: &Value) -> Result<Value, EvalError> {
-        let mut last = Value::NIL;
-        for unit_form in crate::analyzer::split_do(form) {
-            last = self.eval_unit(&unit_form)?;
-        }
-        Ok(last)
+        crate::toplevel::eval(form, &mut |unit| self.eval_unit(unit))
     }
 
     fn eval_unit(&mut self, form: &Value) -> Result<Value, EvalError> {
         let mut an = Analyzer::new(ns::current());
         let node = an.analyze_toplevel(form)?;
-        let ids = self.compiler.compile_unit(&node, &an)?;
-        self.run_unit(ids)
-    }
-
-    fn run_unit(&mut self, ids: crate::codegen::UnitIds) -> Result<Value, EvalError> {
-        self.compiler
-            .module
-            .finalize_definitions()
-            .map_err(|e| CompileError::new(format!("finalize: {e}"), 0))?;
-        let init = self.compiler.module.get_finalized_function(ids.init);
-        let body = self.compiler.module.get_finalized_function(ids.body);
-        // SAFETY: both functions were compiled with the `() -> i64` signature.
-        let init: unsafe extern "C" fn() -> u64 = unsafe { std::mem::transmute(init) };
-        let body: unsafe extern "C" fn() -> u64 = unsafe { std::mem::transmute(body) };
-        let r = unsafe { init() };
-        if r == value::EXC {
-            return Err(EvalError::Exception(exc::take().unwrap_or(Value::NIL)));
-        }
-        let r = unsafe { body() };
-        if r == value::EXC {
-            return Err(EvalError::Exception(exc::take().unwrap_or(Value::NIL)));
-        }
-        Ok(unsafe { Value::from_raw(r) })
+        let unit = self.compile(&node, &an)?;
+        Jit::run(unit)
     }
 
     /// Read and evaluate every form in `src`, returning the last value.
@@ -139,9 +159,9 @@ impl Drop for Jit {
         // JIT code is never unmapped: vars are process-global and keep pointing at
         // compiled fns (core.clj's macros, for one) after the driver that compiled
         // them is gone, and a later `Jit` in the same process would call into freed
-        // memory. The arena is reserved address space; the pages actually used stay
-        // mapped until the process exits.
+        // memory. Dropping the module without `free_memory` releases its bookkeeping
+        // but leaves the code pages mapped until the process exits.
         let module = unsafe { ManuallyDrop::take(&mut self.compiler) }.into_module();
-        std::mem::forget(module);
+        drop(module);
     }
 }

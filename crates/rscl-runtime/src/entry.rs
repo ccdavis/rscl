@@ -25,6 +25,11 @@ pub fn init() {
         core.intern("*command-line-args*").bind_root(Value::NIL);
         let user = ns::find_or_create(ns::USER);
         ns::set_current(user);
+        // Namespaces that exist at start-up are provided by the runtime: `require`
+        // must not look for a source file for them.
+        for n in ns::all() {
+            ns::mark_loaded(&n.name);
+        }
     });
 }
 

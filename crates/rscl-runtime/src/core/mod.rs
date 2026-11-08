@@ -10,6 +10,7 @@ pub mod coll;
 pub mod fns;
 pub mod io;
 pub mod lazy;
+pub mod nsfns;
 pub mod re;
 pub mod string;
 
@@ -32,6 +33,7 @@ pub fn all() -> impl Iterator<Item = &'static BuiltinDesc> {
         .chain(string::TABLE.iter())
         .chain(string::core_fns::TABLE.iter())
         .chain(lazy::TABLE.iter())
+        .chain(nsfns::TABLE.iter())
         .chain(re::TABLE.iter())
 }
 

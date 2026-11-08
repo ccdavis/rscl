@@ -86,6 +86,9 @@ runtime_fns! {
     ToCstr        = "rt_to_cstr"        => crate::native::rt_to_cstr : (I64, I64) -> I64;
     StringFromCstr = "rt_string_from_cstr" => crate::native::rt_string_from_cstr : (I64) -> I64;
     ExceptionInstance = "rt_exception_instance" => crate::native::rt_exception_instance : (I64, I64, I64) -> I64;
+    RegisterNsLoader = "rt_register_ns_loader" => crate::ns::rt_register_ns_loader : (I64, I64, I64);
+    CurrentNs     = "rt_current_ns"     => crate::ns::rt_current_ns : () -> I64;
+    RegisterCode  = "rt_register_code"  => crate::trace::rt_register_code : (I64, I64, I64, I64);
     RuntimeInit   = "rt_runtime_init"   => crate::entry::rt_runtime_init : (I32, I64);
     Main          = "rt_main"           => crate::entry::rt_main : (I32, I64, I64) -> I32;
     Shutdown      = "rt_shutdown"       => crate::entry::rt_shutdown : ();

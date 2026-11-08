@@ -527,6 +527,25 @@
          (set-macro! (var ~name))
          (var ~name))))
 
+;;; ---- namespaces --------------------------------------------------------------------
+
+(defmacro refer-clojure [& args] nil)
+
+(defmacro ns [name & references]
+  (let [refs (if (string? (first references)) (next references) references)
+        refs (if (map? (first refs)) (next refs) refs)
+        quote-all (fn [args] (map (fn [a] (list 'quote a)) args))
+        process (fn [r]
+                  (let [kind (first r) args (rest r)]
+                    (cond (= kind :require) (cons 'clojure.core/require (quote-all args))
+                          (= kind :use) (cons 'clojure.core/use (quote-all args))
+                          (= kind :refer-clojure) nil
+                          (= kind :import) nil
+                          (= kind :gen-class) nil
+                          :else (throw (ex-info (str "Unsupported ns reference: " kind) {})))))]
+    `(do (clojure.core/in-ns '~name)
+         ~@(filter identity (map process refs)))))
+
 ;;; ---- macros that use destructuring -----------------------------------------------
 
 (defmacro if-let

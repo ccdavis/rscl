@@ -20,6 +20,7 @@ pub type RtResult<T> = Result<T, Exc>;
 
 /// Make `v` the pending exception (replacing and releasing any previous one).
 pub fn throw(v: Value) -> Exc {
+    exception::fill_trace(&v);
     PENDING.with(|p| {
         let old = p.replace(v.into_raw());
         if old != 0 {
@@ -83,6 +84,16 @@ pub fn format_exception(v: &Value) -> String {
         }
         None => format!("thrown value: {}", crate::printer::pr_str(v)),
     }
+}
+
+/// `Class: message` followed by one `    at ns/fn` line per rscl frame.
+pub fn format_exception_with_trace(v: &Value) -> String {
+    let mut s = format_exception(v);
+    for name in exception::trace_of(v) {
+        s.push_str("\n    at ");
+        s.push_str(&name);
+    }
+    s
 }
 
 // ---- FFI ----------------------------------------------------------------------------

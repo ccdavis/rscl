@@ -7,6 +7,8 @@ pub mod codegen;
 pub mod errors;
 pub mod jit;
 pub mod repl;
+pub mod session;
+pub mod toplevel;
 
 pub use errors::CompileError;
 pub use jit::{EvalError, Jit};

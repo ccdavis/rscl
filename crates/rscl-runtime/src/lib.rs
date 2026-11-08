@@ -23,6 +23,7 @@ pub mod obj;
 pub mod pos;
 pub mod printer;
 pub mod reader;
+pub mod trace;
 pub mod value;
 
 /// The bootstrap library, compiled into every session and every AOT binary.

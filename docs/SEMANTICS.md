@@ -37,7 +37,9 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 
 - Thrown values propagate as an `EXC` sentinel return checked after every call; the
   runtime never unwinds across generated code. Uncaught exceptions print
-  `Uncaught exception: Class: message` on stderr and exit with status 1.
+  `Uncaught exception: Class: message` on stderr, followed by one `    at ns/fn` line per
+  rscl fn on the stack when the exception was first thrown (found by walking frame
+  pointers; Rust frames in between are omitted), and exit with status 1.
 - Exception classes are a small built-in taxonomy standing in for JVM classes:
   `ExceptionInfo`, `ArithmeticException`, `ClassCastException`, `ArityException`,
   `IllegalArgumentException`, `IllegalStateException`, `IndexOutOfBoundsException`,
@@ -59,6 +61,21 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 - Sequential collections of every kind (list, vector, cons, lazy seq) are `=` when
   their elements are, and hash alike.
 - `letfn` and transducers are not implemented yet.
+
+## Namespaces
+
+- `(ns name (:require ...))` expands to `in-ns` plus `require` calls; `:refer-clojure`,
+  `:import` and `:gen-class` clauses are accepted and ignored. Every namespace sees
+  `clojure.core` without referring it; defining a core name locally shadows it.
+- `require` loads `foo/bar.clj` (dashes become underscores) from the source path once
+  per process (`:reload` loads again); a cycle is an error. Loading a lib never changes
+  the caller's current namespace. In a built binary the required namespaces are
+  compiled in and `require` runs the compiled copy; `load-file` likewise works for
+  files loaded at build time, and re-evaluates every time it is called.
+- Namespaces provided by the runtime (`clojure.core`, `clojure.string`) are always
+  loaded; a macro may call `require` while it expands.
+- `*ns*` is the current namespace object; `(in-ns 'x)` creates and switches to it.
+- Private vars (`defn-`) are not enforced yet.
 
 ## Exceptions, continued
 
@@ -93,6 +110,7 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 - `build` evaluates every top-level form at build time in a JIT as it compiles it
   (Clojure AOT semantics), so macros and `def`s earlier in the file are available to
   later forms; side effects therefore run at build time and again at program start.
-  `--no-eval` turns that off (only `core.clj` macros are then usable). `core.clj` is
-  compiled into every binary.
+  `--no-eval` turns that off: namespace directives (`ns`, `in-ns`, `require`, ...)
+  still run so libs are found and compiled in, but macros defined by the program or
+  its required libs cannot be used. `core.clj` is compiled into every binary.
 - AOT binaries have no `eval`.

@@ -10,12 +10,10 @@ use std::process::Command;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_module::default_libcall_names;
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use rscl_runtime::reader::{DefaultEnv, Reader};
-use rscl_runtime::{ns, pos};
 
-use crate::analyzer::Analyzer;
-use crate::codegen::{Compiler, UnitIds};
+use crate::codegen::Compiler;
 use crate::jit::EvalError;
+use crate::session::SessionConfig;
 
 /// Libraries a Rust `staticlib` needs on Linux (from
 /// `cargo rustc -p rscl-runtime --lib -- --print native-static-libs`).
@@ -40,6 +38,8 @@ pub struct BuildOptions {
     pub lib_paths: Vec<String>,
     /// Skip evaluating the program's own top-level forms at build time.
     pub no_eval: bool,
+    /// Extra source directories for `require`.
+    pub paths: Vec<String>,
 }
 
 impl BuildOptions {
@@ -58,6 +58,7 @@ impl BuildOptions {
             link_libs: Vec::new(),
             lib_paths: Vec::new(),
             no_eval: false,
+            paths: Vec::new(),
         }
     }
 }
@@ -102,51 +103,19 @@ pub fn build(o: &BuildOptions) -> Result<(), BuildError> {
     let src = std::fs::read_to_string(&o.input)
         .map_err(|e| BuildError::Io(format!("cannot read {path}: {e}")))?;
 
-    // The JIT evaluates forms at build time (and already holds core.clj).
-    let mut jit = crate::jit::Jit::new().map_err(BuildError::Internal)?;
-    let mut compiler = Compiler::new(object_module(o)?);
-    let mut units: Vec<UnitIds> = Vec::new();
+    let compiler = Compiler::new(object_module(o)?);
+    let cfg = SessionConfig {
+        paths: crate::session::source_paths(Some(&o.input), &o.paths),
+        aot: Some(compiler),
+        no_eval: o.no_eval,
+    };
+    crate::session::start(cfg).map_err(BuildError::Internal)?;
+    crate::session::eval_source(&src, &path)?;
+    let bytes = crate::session::finish_aot()?;
 
-    // core.clj first, so the binary defines the same library at start-up.
-    let core_forms = crate::boot::in_core(crate::boot::core_forms)?;
-    crate::boot::in_core(|| -> Result<(), BuildError> {
-        for form in &core_forms {
-            for unit_form in crate::analyzer::split_do(form) {
-                let mut an = Analyzer::new(ns::current());
-                let node = an.analyze_toplevel(&unit_form)?;
-                units.push(compiler.compile_unit(&node, &an)?);
-            }
-        }
-        Ok(())
-    })?;
-
-    let file_id = pos::intern_file(&path);
-    let mut reader = Reader::new(&src, &DefaultEnv).with_file(file_id);
-    loop {
-        match reader.read() {
-            Ok(Some(form)) => {
-                for unit_form in crate::analyzer::split_do(&form) {
-                    let mut an = Analyzer::new(ns::current());
-                    let node = an.analyze_toplevel(&unit_form)?;
-                    if !o.no_eval {
-                        drop(jit.compile_and_run(&node, &an)?);
-                    }
-                    units.push(compiler.compile_unit(&node, &an)?);
-                }
-            }
-            Ok(None) => break,
-            Err(e) => return Err(EvalError::Read(e).into()),
-        }
-    }
-    let entry = compiler.compile_entry(&units, &ns::current().name)?;
-    compiler.compile_c_main(entry)?;
-
-    let product = compiler.into_module().finish();
-    let bytes = product.emit().map_err(internal)?;
     let obj_path = o.output.with_extension("o");
     std::fs::write(&obj_path, &bytes)
         .map_err(|e| BuildError::Io(format!("cannot write {}: {e}", obj_path.display())))?;
-
     let result = link(&obj_path, &o.output, o);
     if !o.keep_obj {
         let _ = std::fs::remove_file(&obj_path);

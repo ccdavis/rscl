@@ -1,0 +1,4 @@
+# Frame pointers everywhere (our crates, dependencies, and the runtime static library),
+# so exception stack traces can walk from generated code through Rust frames.
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]

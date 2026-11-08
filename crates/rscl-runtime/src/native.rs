@@ -30,24 +30,28 @@ struct PthreadAttr {
     _data: [u64; 16],
 }
 
-/// The lowest usable address of the current thread's stack, from pthreads; 0 if
-/// unknown.
-fn thread_stack_floor() -> usize {
+/// `(floor, top)` of the current thread's stack from pthreads; `(0, 0)` if unknown.
+pub fn thread_stack_bounds() -> (usize, usize) {
     unsafe {
         let mut attr = PthreadAttr { _data: [0; 16] };
         if pthread_getattr_np(pthread_self(), &mut attr) != 0 {
-            return 0;
+            return (0, 0);
         }
         let mut addr: *mut c_void = std::ptr::null_mut();
         let mut size: usize = 0;
         let rc = pthread_attr_getstack(&attr, &mut addr, &mut size);
         pthread_attr_destroy(&mut attr);
         if rc != 0 || addr.is_null() {
-            0
+            (0, 0)
         } else {
-            addr as usize
+            (addr as usize, addr as usize + size)
         }
     }
+}
+
+/// The lowest usable address of the current thread's stack; 0 if unknown.
+fn thread_stack_floor() -> usize {
+    thread_stack_bounds().0
 }
 
 const RTLD_NOW: c_int = 2;

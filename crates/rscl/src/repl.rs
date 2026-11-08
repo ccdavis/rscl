@@ -6,7 +6,7 @@ use rscl_runtime::{exc, ns, pos};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use crate::jit::{EvalError, Jit};
+use crate::jit::EvalError;
 
 unsafe extern "C" {
     fn signal(signum: i32, handler: usize) -> usize;
@@ -34,17 +34,19 @@ fn remember(v: rscl_runtime::Value) {
     user.intern("*1").bind_root(v);
 }
 
-pub fn run() -> i32 {
+pub fn run(paths: &[String]) -> i32 {
     // Ctrl-C during an evaluation raises InterruptedException instead of killing the
     // process; at the prompt rustyline reports it as `Interrupted`.
     unsafe { signal(2, on_sigint as *const () as usize) };
-    let mut jit = match Jit::new() {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("cannot start JIT: {e}");
-            return 1;
-        }
+    let cfg = crate::session::SessionConfig {
+        paths: crate::session::source_paths(None, paths),
+        aot: None,
+        no_eval: false,
     };
+    if let Err(e) = crate::session::start(cfg) {
+        eprintln!("cannot start: {e}");
+        return 1;
+    }
     let mut rl = match DefaultEditor::new() {
         Ok(rl) => rl,
         Err(e) => {
@@ -105,13 +107,13 @@ pub fn run() -> i32 {
                 let _ = rl.add_history_entry(buffer.trim_end());
                 buffer.clear();
                 for form in forms {
-                    match jit.eval(&form) {
+                    match crate::session::eval_form(&form) {
                         Ok(v) => {
                             println!("{}", pr_str(&v));
                             remember(v);
                         }
                         Err(EvalError::Exception(e)) => {
-                            eprintln!("Execution error: {}", exc::format_exception(&e));
+                            eprintln!("Execution error: {}", exc::format_exception_with_trace(&e));
                             ns::current().intern("*e").bind_root(e);
                         }
                         Err(e) => eprintln!("{e}"),

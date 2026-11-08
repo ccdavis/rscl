@@ -3,7 +3,7 @@
 //! Resolution of an unqualified symbol looks in the namespace's own mappings and
 //! then falls back to `clojure.core` (an implicit `refer`), so user code can shadow a
 //! core name by defining it.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock};
 
@@ -143,6 +143,19 @@ impl NsObj {
             .insert(alias.to_string(), target as *const NsObj as usize);
     }
 
+    /// All aliases of this namespace, sorted.
+    pub fn aliases(&self) -> Vec<(String, &'static NsObj)> {
+        let mut v: Vec<(String, &'static NsObj)> = self
+            .aliases
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(a, &p)| (a.clone(), unsafe { &*(p as *const NsObj) }))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
     pub fn resolve_alias(&self, alias: &str) -> Option<&'static NsObj> {
         self.aliases
             .read()
@@ -231,4 +244,127 @@ pub unsafe extern "C" fn rt_var_bind_root(v: *const VarObj, val: Value) -> Value
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_var_set_flag(v: *const VarObj, flag: i64, on: i64) {
     unsafe { (*v).set_flag(flag as u32, on != 0) }
+}
+
+// ---- loading namespaces --------------------------------------------------------------
+
+/// A compiled-in loader (AOT binaries): runs a namespace's top-level forms. Returns
+/// `nil` or `EXC`.
+pub type StaticLoader = unsafe extern "C" fn() -> Value;
+
+/// The compiler's loader (JIT sessions): compile and run a lib from source.
+pub type DynamicLoader = fn(&str) -> crate::exc::RtResult<()>;
+
+struct Loading {
+    loaded: HashSet<String>,
+    in_progress: Vec<String>,
+    static_loaders: HashMap<String, usize>,
+    dynamic: Option<DynamicLoader>,
+}
+
+fn loading() -> &'static RwLock<Loading> {
+    static L: OnceLock<RwLock<Loading>> = OnceLock::new();
+    L.get_or_init(|| {
+        RwLock::new(Loading {
+            loaded: HashSet::from([CORE.to_string()]),
+            in_progress: Vec::new(),
+            static_loaders: HashMap::new(),
+            dynamic: None,
+        })
+    })
+}
+
+pub fn set_dynamic_loader(f: Option<DynamicLoader>) {
+    loading().write().unwrap().dynamic = f;
+}
+
+pub fn register_static_loader(key: &str, f: StaticLoader) {
+    loading()
+        .write()
+        .unwrap()
+        .static_loaders
+        .insert(key.to_string(), f as usize);
+}
+
+pub fn is_loaded(key: &str) -> bool {
+    loading().read().unwrap().loaded.contains(key)
+}
+
+pub fn loaded_libs() -> Vec<String> {
+    let mut v: Vec<String> = loading().read().unwrap().loaded.iter().cloned().collect();
+    v.sort();
+    v
+}
+
+/// Load a lib once. `key` is a namespace name (`foo.bar`) or `file:<path>`. Static
+/// loaders (compiled in) win; otherwise the session's dynamic loader compiles it from
+/// source. Cycles are reported, not followed.
+pub fn load_lib(key: &str) -> crate::exc::RtResult<()> {
+    load_lib_opt(key, false)
+}
+
+/// `load_lib` with `force`: run the lib again even if it was loaded before
+/// (`load-file`, `:reload`).
+pub fn load_lib_opt(key: &str, force: bool) -> crate::exc::RtResult<()> {
+    use crate::exc::err;
+    use crate::obj::exception::{ILLEGAL_STATE, RUNTIME};
+    let (static_loader, dynamic) = {
+        let mut l = loading().write().unwrap();
+        if !force && l.loaded.contains(key) {
+            return Ok(());
+        }
+        if l.in_progress.iter().any(|k| k == key) {
+            let chain = l.in_progress.join(" -> ");
+            return err(
+                ILLEGAL_STATE,
+                format!("Cyclic load dependency: {chain} -> {key}"),
+            );
+        }
+        l.in_progress.push(key.to_string());
+        (l.static_loaders.get(key).copied(), l.dynamic)
+    };
+    // Loading a lib must not change the caller's current namespace (its `ns` form
+    // switches namespaces while it runs).
+    let prev_ns = current();
+    let result = match (static_loader, dynamic) {
+        (Some(f), _) => {
+            let f: StaticLoader = unsafe { std::mem::transmute::<usize, StaticLoader>(f) };
+            crate::exc::check(unsafe { f() }).map(drop)
+        }
+        (None, Some(dynamic)) => dynamic(key),
+        (None, None) => err(
+            RUNTIME,
+            format!("Could not load {key}: no loader available in this program"),
+        ),
+    };
+    set_current(prev_ns);
+    let mut l = loading().write().unwrap();
+    l.in_progress.retain(|k| k != key);
+    if result.is_ok() {
+        l.loaded.insert(key.to_string());
+    }
+    result
+}
+
+/// Mark a lib loaded without running anything (the lib that is being compiled now).
+pub fn mark_loaded(key: &str) {
+    loading().write().unwrap().loaded.insert(key.to_string());
+}
+
+/// `foo.bar-baz` → `foo/bar_baz.clj`
+pub fn ns_to_relative_path(name: &str) -> String {
+    format!("{}.clj", name.replace('.', "/").replace('-', "_"))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_register_ns_loader(name: *const u8, len: i64, f: *const u8) {
+    let name = unsafe { crate::ffi::str_arg(name, len) };
+    let f: StaticLoader = unsafe { std::mem::transmute::<*const u8, StaticLoader>(f) };
+    register_static_loader(name, f);
+}
+
+/// `*ns*`: the current namespace as a value (immortal).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_current_ns() -> Value {
+    current().as_value()
 }

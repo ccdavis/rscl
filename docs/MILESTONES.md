@@ -96,3 +96,28 @@ user=> *1
 `core.clj` (about 650 lines, written from scratch) is compiled into every session and
 into every `rscl build` binary; `build` now also evaluates each top-level form at build
 time so macros defined in the program work (`--no-eval` opts out).
+
+## Phase 5 — Namespaces and multi-file programs (done)
+
+```
+$ cat mylib/util.clj
+(ns mylib.util (:require [mylib.strings :as s]))
+(defn shout [x] (str (s/wrap (clojure.string/upper-case x)) "!"))
+
+$ cat main.clj
+(ns demo.main (:require [mylib.util :as u :refer [shout]]))
+(println (shout "hi") (ns-name *ns*))
+(defn -main [& args] (println "args:" args))
+
+$ rscl run main.clj a b             # finds mylib/util.clj next to main.clj (or --path, RSCL_PATH)
+<HI>! demo.main
+args: (a b)
+$ rscl build main.clj -o demo && ./demo x   # required namespaces are compiled into the binary
+<HI>! demo.main
+args: (x)
+
+user=> (defn inner [x] (/ x 0)) (defn outer [x] (inner x)) (outer 1)
+Execution error: ArithmeticException: Divide by zero
+    at user/inner
+    at user/outer
+```

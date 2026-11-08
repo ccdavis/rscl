@@ -27,6 +27,8 @@ pub struct ExcObj {
     pub data: Value,
     /// Another exception or `nil`.
     pub cause: Value,
+    /// rscl fn names active when the exception was first thrown (innermost first).
+    pub trace: std::sync::Mutex<Vec<String>>,
 }
 
 pub fn new(class: &str, message: Option<&str>, data: Value, cause: Value) -> Value {
@@ -36,7 +38,24 @@ pub fn new(class: &str, message: Option<&str>, data: Value, cause: Value) -> Val
         message: message.map_or(Value::NIL, super::string::new),
         data,
         cause,
+        trace: std::sync::Mutex::new(Vec::new()),
     })
+}
+
+/// Record the stack trace once (rethrows keep the original).
+pub fn fill_trace(v: &Value) {
+    if let Some(e) = as_exc(v) {
+        let mut t = e.trace.lock().unwrap_or_else(|x| x.into_inner());
+        if t.is_empty() {
+            *t = crate::trace::capture();
+        }
+    }
+}
+
+pub fn trace_of(v: &Value) -> Vec<String> {
+    as_exc(v)
+        .map(|e| e.trace.lock().unwrap_or_else(|x| x.into_inner()).clone())
+        .unwrap_or_default()
 }
 
 pub fn get(v: &Value) -> &ExcObj {
