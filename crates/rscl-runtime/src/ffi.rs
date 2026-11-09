@@ -44,12 +44,8 @@ pub unsafe extern "C" fn rt_release(v: Value) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_unbox_double(v: VRef, out: *mut f64) -> Value {
     match crate::num::expect_num(&v) {
-        Ok(crate::num::Num::I(n)) => {
-            unsafe { *out = n as f64 };
-            Value::NIL
-        }
-        Ok(crate::num::Num::D(d)) => {
-            unsafe { *out = d };
+        Ok(n) => {
+            unsafe { *out = crate::num::f(&n) };
             Value::NIL
         }
         Err(_) => Value::EXC,
@@ -70,6 +66,13 @@ pub unsafe extern "C" fn rt_unbox_long(v: VRef, out: *mut i64, strict: i64) -> V
             Value::NIL
         }
         Ok(crate::num::Num::D(_)) => unsafe { rt_throw_prim(2) },
+        Ok(n @ crate::num::Num::B(_)) => match crate::num::to_long(&n) {
+            Ok(i) => {
+                unsafe { *out = i };
+                Value::NIL
+            }
+            Err(_) => Value::EXC,
+        },
         Err(_) => Value::EXC,
     }
 }

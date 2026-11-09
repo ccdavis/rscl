@@ -19,8 +19,10 @@ Ctrl-C guards, a bridge for exposing Rust crates as rscl namespaces, `deftype`,
 `doc`, sorted maps and sets, unboxed `long`/`double` locals with `^long`/`^double`
 hints and inline arithmetic, direct calls to Rust builtins, futures, promises,
 delays, `pmap` and `locking`, locals clearing so lazy sequences stream in constant
-memory, a cycle collector, weakly interned keywords, and a differential test corpus that runs every
-program under both the JIT and the AOT compiler.
+memory, a cycle collector, weakly interned keywords, BigInt arithmetic (`123N`, `+'`),
+source lines in stack traces, a heap limit that turns exhaustion into a catchable
+`OutOfMemoryError`, and a differential test corpus that runs every program under both
+the JIT and the AOT compiler.
 
 ## Build and run
 
@@ -43,6 +45,9 @@ working directory, each `--path DIR`, and `RSCL_PATH`.
 
 Exit status: 0 ok, 1 uncaught exception, 2 compile error, 3 reader error.
 `RSCL_DEBUG_IR=1` dumps the Cranelift IR of every compiled function.
+`RSCL_MAX_HEAP_MB` caps the heap (default: half of physical memory; `0` for none);
+crossing it throws `OutOfMemoryError` instead of letting the kernel kill the process.
+`RSCL_HASH_SEED=random` randomises map hashing for untrusted keys.
 
 ## Tests
 

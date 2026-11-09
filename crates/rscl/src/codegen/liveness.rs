@@ -152,7 +152,7 @@ fn walk(node: &Node, live: &mut HashSet<LocalId>, out: &mut Liveness) {
             walk_args(args.iter().rev(), live, out)
         }
         Node::Coll { items, .. } => walk_args(items.iter().rev(), live, out),
-        Node::Throw(e) => walk(e, live, out),
+        Node::Throw { expr, .. } => walk(expr, live, out),
         Node::Try {
             body,
             catches,
@@ -232,7 +232,7 @@ fn collect(node: &Node, used: &mut HashSet<LocalId>, bound: &mut HashSet<LocalId
                 collect(a, used, bound);
             }
         }
-        Node::Throw(e) => collect(e, used, bound),
+        Node::Throw { expr, .. } => collect(expr, used, bound),
         Node::Try {
             body,
             catches,

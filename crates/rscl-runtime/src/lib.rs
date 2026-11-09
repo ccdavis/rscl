@@ -18,6 +18,7 @@ pub mod equiv;
 pub mod exc;
 pub mod ffi;
 pub mod gc;
+pub mod heap;
 pub mod native;
 pub mod ns;
 pub mod num;
@@ -40,4 +41,8 @@ pub use value::{VRef, Value, live_objects};
 /// AOT-built programs too.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: heap::Counting<mimalloc::MiMalloc> = heap::Counting(mimalloc::MiMalloc);
+
+#[cfg(not(feature = "mimalloc"))]
+#[global_allocator]
+static GLOBAL: heap::Counting<std::alloc::System> = heap::Counting(std::alloc::System);

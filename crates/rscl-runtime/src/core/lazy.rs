@@ -204,7 +204,7 @@ builtins! {
     }
     "rand" => fn cf_rand(args) [0, 1] {
         let r = rand_f64();
-        Ok(Value::double(if args.is_empty() { r } else { r * crate::num::expect_num(&args[0]).map(|n| match n { crate::num::Num::I(i) => i as f64, crate::num::Num::D(d) => d })? }))
+        Ok(Value::double(if args.is_empty() { r } else { r * crate::num::f(&crate::num::expect_num(&args[0])?) }))
     }
     "rand-int" => fn cf_rand_int(args) [1] {
         let n = args::int(&args[0], "n")?;

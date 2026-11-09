@@ -7,7 +7,7 @@ use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crate::exc::{RtResult, err};
-use crate::obj::exception::{INTERRUPTED, RUNTIME, STACK_OVERFLOW};
+use crate::obj::exception::{INTERRUPTED, OUT_OF_MEMORY, RUNTIME, STACK_OVERFLOW};
 use crate::value::Value;
 
 unsafe extern "C" {
@@ -142,6 +142,7 @@ fn anything_pending() -> bool {
     CTRL_C.load(Ordering::Acquire)
         || PENDING_CANCELS.load(Ordering::Acquire) > 0
         || GC_PENDING.load(Ordering::Acquire)
+        || crate::heap::oom_pending()
 }
 
 /// Recompute the fast-path flag. Lock-free: every request sets its own atomic before
@@ -175,6 +176,12 @@ pub fn request_cancel() {
 pub fn cancel_consumed() {
     PENDING_CANCELS.fetch_sub(1, Ordering::AcqRel);
     refresh_flag();
+}
+
+/// The heap crossed its limit: the thread that did so must notice at its next
+/// safepoint. Called from inside the allocator, so only atomics.
+pub fn request_oom() {
+    rscl_interrupt_flag.store(1, Ordering::Release);
 }
 
 /// The collector wants every thread at a safepoint.
@@ -255,16 +262,34 @@ pub fn is_blocked() -> bool {
 }
 
 /// Deliver a pending interrupt to this thread, if there is one for it: Ctrl-C on the
-/// main thread, or the cancellation of the future it is computing. A pending
-/// collection is joined first (unless the thread is inside a blocking operation,
-/// where it already counts as stopped).
-fn take_interrupt() -> Option<&'static str> {
+/// main thread, the cancellation of the future it is computing, or the heap limit
+/// it crossed. A pending collection is joined first (unless the thread is inside a
+/// blocking operation, where it already counts as stopped). The result is the
+/// exception class and message to throw.
+fn take_interrupt() -> Option<(&'static str, String)> {
     if !is_blocked() && (GC_PENDING.load(Ordering::Acquire) || crate::gc::stopping()) {
         crate::gc::safepoint();
     }
+    if crate::heap::take_oom() {
+        refresh_flag();
+        // Cycles may hold the memory: collect once before giving up.
+        if !is_blocked() {
+            crate::gc::collect_now();
+        }
+        if let Some((used, limit)) = crate::heap::over_limit() {
+            return Some((
+                OUT_OF_MEMORY,
+                format!(
+                    "heap limit exceeded: {} MB in use, limit {} MB (RSCL_MAX_HEAP_MB)",
+                    used >> 20,
+                    limit >> 20
+                ),
+            ));
+        }
+    }
     if IS_MAIN.with(|m| m.get()) && CTRL_C.swap(false, Ordering::AcqRel) {
         refresh_flag();
-        return Some("interrupted");
+        return Some((INTERRUPTED, "interrupted".to_string()));
     }
     let cancelled = with_current_future(|p| {
         if p.cancel.swap(false, Ordering::AcqRel) {
@@ -278,7 +303,7 @@ fn take_interrupt() -> Option<&'static str> {
     })
     .unwrap_or(false);
     if cancelled {
-        return Some("future cancelled");
+        return Some((INTERRUPTED, "future cancelled".to_string()));
     }
     None
 }
@@ -286,8 +311,8 @@ fn take_interrupt() -> Option<&'static str> {
 /// For blocking runtime operations: throw if an interrupt is pending for this
 /// thread (checked directly; the global flag may not be raised for a blocked thread).
 pub fn check_interrupt() -> crate::exc::RtResult<()> {
-    if let Some(msg) = take_interrupt() {
-        return crate::exc::err(INTERRUPTED, msg);
+    if let Some((class, msg)) = take_interrupt() {
+        return crate::exc::err(class, msg);
     }
     Ok(())
 }
@@ -344,8 +369,8 @@ pub unsafe extern "C" fn rt_stack_check(sp: usize) -> Value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_interrupted() -> Value {
     match take_interrupt() {
-        Some(msg) => {
-            crate::exc::throw_new(INTERRUPTED, msg);
+        Some((class, msg)) => {
+            crate::exc::throw_new(class, &msg);
             Value::EXC
         }
         None => Value::NIL,
@@ -401,12 +426,8 @@ pub unsafe extern "C" fn rt_to_long(v: crate::value::VRef, out: *mut i64) -> Val
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_to_double(v: crate::value::VRef, out: *mut f64) -> Value {
     match crate::num::num(&v) {
-        Some(crate::num::Num::I(n)) => {
-            unsafe { *out = n as f64 };
-            Value::NIL
-        }
-        Some(crate::num::Num::D(d)) => {
-            unsafe { *out = d };
+        Some(n) => {
+            unsafe { *out = crate::num::f(&n) };
             Value::NIL
         }
         None => {

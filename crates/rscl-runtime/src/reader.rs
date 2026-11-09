@@ -844,30 +844,28 @@ impl<'a> Reader<'a> {
             Some(rest) => (true, rest),
             None => (false, tok.strip_prefix('+').unwrap_or(tok)),
         };
-        if body.ends_with('N') {
-            return Err(self.syntax(format!("BigInt literals are not supported yet: {tok}")));
-        }
+        let (body, force_big) = match body.strip_suffix('N') {
+            Some(b) => (b, true),
+            None => (body, false),
+        };
         if body.ends_with('M') {
             return Err(self.syntax(format!("BigDecimal literals are not supported yet: {tok}")));
         }
         if body.contains('/') {
             return Err(self.syntax(format!("Ratio literals are not supported yet: {tok}")));
         }
+        // An integer literal: `N` forces a BigInt, and one that does not fit in 64 bits
+        // becomes a BigInt by itself, as in Clojure.
         let int = |digits: &str, radix: u32| -> ReadResult<Value> {
-            if digits.is_empty() {
+            if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
                 return Err(bad());
             }
-            let mag = u64::from_str_radix(digits, radix).map_err(|_| bad())?;
-            let n = if neg {
-                if mag > (i64::MAX as u64) + 1 {
-                    return Err(self.syntax(format!("Integer literal out of range: {tok}")));
-                }
-                (mag as i64).wrapping_neg()
-            } else {
-                i64::try_from(mag)
-                    .map_err(|_| self.syntax(format!("Integer literal out of range: {tok}")))?
-            };
-            Ok(Value::int(n))
+            let big = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix).ok_or_else(bad)?;
+            let big = if neg { -big } else { big };
+            if !force_big && let Some(n) = num_traits::ToPrimitive::to_i64(&big) {
+                return Ok(Value::int(n));
+            }
+            Ok(crate::obj::bigint::new(big))
         };
         if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
             return int(hex, 16);
@@ -882,7 +880,7 @@ impl<'a> Reader<'a> {
             }
             return int(&body[i + 1..], radix);
         }
-        let is_float = body.contains(['.', 'e', 'E']);
+        let is_float = !force_big && body.contains(['.', 'e', 'E']);
         if is_float {
             let d: f64 = body.parse().map_err(|_| bad())?;
             return Ok(Value::double(if neg { -d } else { d }));
@@ -946,8 +944,14 @@ mod tests {
         assert_eq!(rt("+5"), "5");
         assert_eq!(rt("9223372036854775807"), "9223372036854775807");
         assert_eq!(rt("-9223372036854775808"), "-9223372036854775808");
-        assert!(read_str("9223372036854775808").is_err());
-        assert!(read_str("1N").is_err());
+        assert_eq!(rt("9223372036854775808"), "9223372036854775808N");
+        assert_eq!(rt("1N"), "1N");
+        assert_eq!(rt("-0xffN"), "-255N");
+        assert_eq!(
+            rt("123456789012345678901234567890"),
+            "123456789012345678901234567890N"
+        );
+        assert!(read_str("1.5N").is_err());
         assert_eq!(rt("##Inf"), "##Inf");
     }
 

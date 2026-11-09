@@ -120,22 +120,13 @@ pub mod core_fns {
         }
         "int" => fn cf_int(args) [1] {
             if let Some(c) = args[0].as_char() { return Ok(Value::int(c as i64)); }
-            match crate::num::expect_num(&args[0])? {
-                crate::num::Num::I(n) => Ok(Value::int(n)),
-                crate::num::Num::D(d) => Ok(Value::int(d as i64)),
-            }
+            Ok(Value::int(crate::num::to_long(&crate::num::expect_num(&args[0])?)?))
         }
         "long" => fn cf_long(args) [1] {
-            match crate::num::expect_num(&args[0])? {
-                crate::num::Num::I(n) => Ok(Value::int(n)),
-                crate::num::Num::D(d) => Ok(Value::int(d as i64)),
-            }
+            Ok(Value::int(crate::num::to_long(&crate::num::expect_num(&args[0])?)?))
         }
         "double" => fn cf_double(args) [1] {
-            match crate::num::expect_num(&args[0])? {
-                crate::num::Num::I(n) => Ok(Value::double(n as f64)),
-                crate::num::Num::D(d) => Ok(Value::double(d)),
-            }
+            Ok(Value::double(crate::num::f(&crate::num::expect_num(&args[0])?)))
         }
         "chars" => fn cf_chars(args) [1] {
             let s = args::string(&args[0], "s")?;

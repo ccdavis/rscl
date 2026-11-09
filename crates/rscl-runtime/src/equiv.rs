@@ -25,6 +25,7 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
     };
     match (ka, kb) {
         (Kind::Double, Kind::Double) => obj::double::get(a) == obj::double::get(b),
+        (Kind::BigInt, Kind::BigInt) => obj::bigint::get(a) == obj::bigint::get(b),
         (Kind::String, Kind::String) => obj::string::get(a) == obj::string::get(b),
         (Kind::Symbol, Kind::Symbol) => {
             let (x, y) = (obj::symbol::get(a), obj::symbol::get(b));
@@ -210,6 +211,10 @@ pub fn hasheq(v: &Value) -> u64 {
     };
     match kind {
         Kind::Long => unreachable!("handled by as_int"),
+        // A BigInt that fits a long was handled by `as_int`, with the long's hash.
+        Kind::BigInt => {
+            mix64(hash_bytes(&obj::bigint::get(v).to_signed_bytes_le()) ^ 0xb16b_0000_0000_0001)
+        }
         Kind::Double => mix64(obj::double::get(v).to_bits() ^ 0xd0d0),
         Kind::String => mix64(hash_bytes(obj::string::get(v).as_bytes())),
         Kind::Symbol => {

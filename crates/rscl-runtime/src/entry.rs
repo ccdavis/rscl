@@ -15,6 +15,7 @@ static INIT: Once = Once::new();
 /// Create `clojure.core` and `user`, register every builtin as a core var. Idempotent.
 pub fn init() {
     INIT.call_once(|| {
+        crate::heap::configure();
         let core = ns::core();
         for d in crate::core::all() {
             let qualified = format!("{}/{}", d.ns, d.name);

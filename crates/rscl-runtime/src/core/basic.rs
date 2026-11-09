@@ -42,7 +42,7 @@ builtins! {
     "false?" => fn cf_false_p(args) [1] { Ok(Value::bool(args[0].is_false())) }
     "boolean?" => fn cf_boolean_p(args) [1] { Ok(Value::bool(args[0].as_bool().is_some())) }
     "number?" => fn cf_number_p(args) [1] { Ok(Value::bool(crate::num::num(&args[0]).is_some())) }
-    "integer?" => fn cf_integer_p(args) [1] { Ok(Value::bool(args[0].as_int().is_some())) }
+    "integer?" => fn cf_integer_p(args) [1] { Ok(Value::bool(args[0].as_int().is_some() || args[0].is_kind(Kind::BigInt))) }
     "int?" => fn cf_int_p(args) [1] { Ok(Value::bool(args[0].as_int().is_some())) }
     "float?" => fn cf_float_p(args) [1] { Ok(Value::bool(args[0].as_double().is_some())) }
     "double?" => fn cf_double_p(args) [1] { Ok(Value::bool(args[0].as_double().is_some())) }

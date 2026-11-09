@@ -4,6 +4,7 @@
 use crate::value::{ObjHeader, Value};
 
 pub mod atom;
+pub mod bigint;
 pub mod cons;
 pub mod double;
 pub mod exception;
@@ -54,6 +55,8 @@ pub enum Kind {
     SortedSet = 23,
     /// A future, promise or delay (see `pending.rs`).
     Pending = 24,
+    /// Arbitrary-precision integer (`123N`).
+    BigInt = 25,
 }
 
 impl Kind {
@@ -83,6 +86,7 @@ impl Kind {
             Kind::SortedMap => "SortedMap",
             Kind::SortedSet => "SortedSet",
             Kind::Pending => "Pending",
+            Kind::BigInt => "BigInt",
         }
     }
 }
@@ -110,6 +114,7 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
             Kind::SortedMap => drop(Box::from_raw(p as *mut sorted::SortedMapObj)),
             Kind::SortedSet => drop(Box::from_raw(p as *mut sorted::SortedSetObj)),
             Kind::Pending => drop(Box::from_raw(p as *mut pending::PendingObj)),
+            Kind::BigInt => drop(Box::from_raw(p as *mut bigint::BigIntObj)),
             // Sequence cells are dismantled iteratively: a long realised chain would
             // otherwise recurse once per element while dropping.
             Kind::List | Kind::Cons | Kind::LazySeq => {

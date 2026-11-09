@@ -259,6 +259,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Some(Kind::SortedMap) => "PersistentTreeMap",
         Some(Kind::SortedSet) => "PersistentTreeSet",
         Some(Kind::Pending) => obj::pending::get(v).flavor.name(),
+        Some(Kind::BigInt) => "BigInt",
         Some(Kind::Instance) => {
             // SAFETY: type objects are immortal, so their names live for the process.
             unsafe { &*(&*obj::types::inst(v).ty().name as *const str) }

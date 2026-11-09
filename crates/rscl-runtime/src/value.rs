@@ -312,11 +312,14 @@ impl Value {
 
     /// Integer value of a fixnum or boxed long.
     #[inline]
+    /// Integer value of a fixnum, boxed long, or a `BigInt` that fits in 64 bits.
     pub fn as_int(&self) -> Option<i64> {
         if let Some(n) = self.as_fixnum() {
             Some(n)
         } else if self.is_kind(Kind::Long) {
             Some(obj::long::get(self))
+        } else if self.is_kind(Kind::BigInt) {
+            num_traits::ToPrimitive::to_i64(obj::bigint::get(self))
         } else {
             None
         }

@@ -41,6 +41,19 @@ pub struct CompiledFn {
     pub id: FuncId,
     pub name: String,
     pub size: u32,
+    /// Source positions of the calls in the code (for stack traces).
+    pub lines: Vec<LineEntry>,
+}
+
+/// A code range `[start, end)` within a fn that belongs to a call at a source
+/// position.
+#[derive(Clone, Debug)]
+pub struct LineEntry {
+    pub start: u32,
+    pub end: u32,
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
 }
 
 pub struct Compiler<M: Module> {
@@ -95,6 +108,9 @@ struct UnitCtx {
     pending_fns: Vec<(FuncId, Rc<FnNode>)>,
     fn_ids: HashMap<usize, FuncId>,
     fns: Vec<CompiledFn>,
+    /// Source positions referenced by `SourceLoc`s in this unit (index + 1).
+    positions: Vec<(String, u32, u32)>,
+    pos_index: HashMap<u32, u32>,
 }
 
 impl UnitCtx {
@@ -106,6 +122,29 @@ impl UnitCtx {
         self.consts.push(e.clone());
         self.const_index.insert(e, i);
         i
+    }
+
+    /// `SourceLoc` index (+1) for a reader position, resolved to file/line/col now.
+    fn srcloc_index(&mut self, pos: u32) -> Option<u32> {
+        if pos == 0 {
+            return None;
+        }
+        if let Some(&i) = self.pos_index.get(&pos) {
+            return Some(i);
+        }
+        let p = rscl_runtime::pos::get(pos)?;
+        let file = rscl_runtime::pos::file_name(p.file);
+        self.positions.push((file, p.line, p.col));
+        let i = self.positions.len() as u32;
+        self.pos_index.insert(pos, i);
+        Some(i)
+    }
+
+    /// Append raw bytes to the blob; returns the offset.
+    fn blob_bytes(&mut self, bytes: &[u8]) -> i64 {
+        let off = self.blob.len() as i64;
+        self.blob.extend_from_slice(bytes);
+        off
     }
 
     fn blob_str(&mut self, s: &str) -> (i64, i64) {
@@ -270,6 +309,8 @@ impl<M: Module> Compiler<M> {
             pending_fns: Vec::new(),
             fn_ids: HashMap::new(),
             fns: Vec::new(),
+            positions: Vec::new(),
+            pos_index: HashMap::new(),
         })
     }
 
@@ -321,13 +362,26 @@ impl<M: Module> Compiler<M> {
             fc.start(0, &[])?;
             let fail = fc.b.create_block();
             run_step(fc, own_init, fail, false);
-            // Code ranges of every compiled fn, so exceptions carry fn-name traces.
+            // Code ranges of every compiled fn, with the source positions of their
+            // calls, so exceptions carry traces with file and line.
             for f in &fns {
                 let fref = fc.func_ref(f.id);
                 let addr = fc.b.ins().func_addr(types::I64, fref);
                 let size = fc.b.ins().iconst(types::I64, f.size as i64);
                 let (np, nl) = fc.blob_ptr(&f.name);
-                fc.call_rt(RtFn::RegisterCode, &[addr, size, np, nl]);
+                // Entries: start, end, line, col, file offset, file length (u32 each).
+                let mut bytes = Vec::with_capacity(f.lines.len() * 24);
+                for l in &f.lines {
+                    let (fo, fl) = fc.unit.blob_str(&l.file);
+                    for x in [l.start, l.end, l.line, l.col, fo as u32, fl as u32] {
+                        bytes.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+                let off = fc.unit.blob_bytes(&bytes);
+                let entries = fc.b.ins().iadd_imm_s(fc.blob_base, off);
+                let n = fc.b.ins().iconst(types::I64, f.lines.len() as i64);
+                let base = fc.blob_base;
+                fc.call_rt(RtFn::RegisterCode, &[addr, size, np, nl, base, entries, n]);
             }
             for unit in core_units {
                 run_step(fc, unit.init, fail, false);
@@ -441,11 +495,42 @@ impl<M: Module> Compiler<M> {
                 )
             })?;
         if record {
-            let size = ctx.compiled_code().map_or(0, |c| c.code_info().total_size);
+            let (size, lines) = match ctx.compiled_code() {
+                Some(c) => {
+                    let lines = c
+                        .buffer
+                        .get_srclocs_sorted()
+                        .iter()
+                        .filter_map(|l| {
+                            // `compile` has already applied the function's base
+                            // location, but tolerate a relative one.
+                            let loc = if l.loc.is_rel() {
+                                l.loc.relocate(ctx.func.params.base_srcloc())
+                            } else {
+                                l.loc.as_abs()
+                            };
+                            if loc.is_default() {
+                                return None;
+                            }
+                            let (file, line, col) = u.positions.get(loc.bits() as usize - 1)?;
+                            Some(LineEntry {
+                                start: l.start,
+                                end: l.end,
+                                file: file.clone(),
+                                line: *line,
+                                col: *col,
+                            })
+                        })
+                        .collect();
+                    (c.code_info().total_size, lines)
+                }
+                None => (0, Vec::new()),
+            };
             let f = CompiledFn {
                 id: func_id,
                 name: name.to_string(),
                 size,
+                lines,
             };
             u.fns.push(f.clone());
             self.registered_fns.push(f);
@@ -510,7 +595,9 @@ impl<M: Module> Compiler<M> {
             // Stack-depth and interrupt guard. No locals are bound yet, but the
             // arguments the caller handed over must still be released on failure.
             let sp = fc.b.ins().get_stack_pointer(types::I64);
+            fc.srcloc(f.pos);
             let guard = fc.call_rt(RtFn::StackCheck, &[sp]).unwrap();
+            fc.srcloc(0);
             let is_exc =
                 fc.b.ins()
                     .icmp_imm_s(IntCC::Equal, guard, api::consts::EXC as i64);
@@ -716,7 +803,7 @@ fn max_args(node: &Node) -> usize {
             .unwrap_or(0)
             .max(max_args(body)),
         Node::Recur { args, .. } => args.iter().map(max_args).max().unwrap_or(0),
-        Node::Throw(e) => max_args(e),
+        Node::Throw { expr, .. } => max_args(expr),
         Node::Try {
             body,
             catches,
@@ -1043,6 +1130,16 @@ impl<'a, M: Module> FnCtx<'a, M> {
             self.table_base,
             8 * i as i32,
         )
+    }
+
+    /// Attribute the instructions emitted next to the reader position `pos` (0:
+    /// none), so a return address maps back to a file and line.
+    fn srcloc(&mut self, pos: u32) {
+        let loc = match self.unit.srcloc_index(pos) {
+            Some(i) => cranelift_codegen::ir::SourceLoc::new(i),
+            None => cranelift_codegen::ir::SourceLoc::default(),
+        };
+        self.b.set_srcloc(loc);
     }
 
     fn blob_ptr(&mut self, s: &str) -> (Value, Value) {
@@ -1543,8 +1640,8 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 self.compile_recur(*target, args)?;
                 return Ok(self.raw_zero(want));
             }
-            Node::Throw(e) => {
-                self.compile_throw(e)?;
+            Node::Throw { expr, pos } => {
+                self.compile_throw(expr, *pos)?;
                 return Ok(self.raw_zero(want));
             }
             Node::BuiltinCall { desc, args, .. } => {
@@ -1967,20 +2064,25 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 Ok(last)
             }
             Node::Let { bindings, body } => self.compile_let(bindings, body),
-            Node::Loop { id, bindings, body } => self.compile_loop(*id, bindings, body),
+            Node::Loop {
+                id,
+                bindings,
+                body,
+                pos,
+            } => self.compile_loop(*id, bindings, body, *pos),
             Node::Recur { target, args } => self.compile_recur(*target, args),
             Node::Fn(f) => self.compile_fn_value(node as *const Node as usize, f),
-            Node::Call { f, args, .. } => self.compile_call(f, args),
-            Node::BuiltinCall { desc, args, .. } => {
+            Node::Call { f, args, pos } => self.compile_call(f, args, *pos),
+            Node::BuiltinCall { desc, args, pos } => {
                 let ty = self.ty_of(node);
                 if ty != Ty::Val {
                     let raw = self.compile_prim_builtin(desc, args, ty)?;
                     return Ok(self.box_raw(raw, ty));
                 }
-                self.compile_builtin_call(desc, args, false)
+                self.compile_builtin_call(desc, args, false, *pos)
             }
             Node::Coll { kind, items } => self.compile_coll(*kind, items),
-            Node::Throw(e) => self.compile_throw(e),
+            Node::Throw { expr, pos } => self.compile_throw(expr, *pos),
             Node::Try {
                 body,
                 catches,
@@ -1995,10 +2097,12 @@ impl<'a, M: Module> FnCtx<'a, M> {
         }
     }
 
-    fn compile_throw(&mut self, e: &Node) -> CResult<Operand> {
+    fn compile_throw(&mut self, e: &Node, pos: u32) -> CResult<Operand> {
         let op = self.compile(e)?;
         let op = self.make_owned_force(op);
+        self.srcloc(pos);
         let r = self.call_rt(RtFn::Throw, &[op.val]).unwrap();
+        self.srcloc(0);
         self.emit_exc_path(r);
         self.dead_block();
         Ok(self.imm(api::consts::NIL))
@@ -2239,7 +2343,8 @@ impl<'a, M: Module> FnCtx<'a, M> {
             | Kind::Set
             | Kind::Regex
             | Kind::Cons
-            | Kind::LazySeq => ConstEntry::Edn(printer::pr_str(v)),
+            | Kind::LazySeq
+            | Kind::BigInt => ConstEntry::Edn(printer::pr_str(v)),
             k => {
                 return Err(internal(format!(
                     "cannot embed a {} as a constant",
@@ -2252,10 +2357,10 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
     /// An i8 condition for `test`: inline comparisons skip the boolean value.
     fn compile_cond(&mut self, test: &Node) -> CResult<Value> {
-        if let Node::BuiltinCall { desc, args, .. } = test
+        if let Node::BuiltinCall { desc, args, pos } = test
             && (inline_op(desc, args.len()).is_some() || self.ty_of(test) == Ty::Val)
         {
-            return Ok(self.compile_builtin_call(desc, args, true)?.val);
+            return Ok(self.compile_builtin_call(desc, args, true, *pos)?.val);
         }
         let t = self.compile(test)?;
         let c = self.truthy(t.val);
@@ -2334,12 +2439,17 @@ impl<'a, M: Module> FnCtx<'a, M> {
         id: LoopId,
         bindings: &[(LocalId, Node)],
         body: &Node,
+        pos: u32,
     ) -> CResult<Operand> {
         let vars = self.bind_all(bindings, true)?;
         let header = self.b.create_block();
         self.b.ins().jump(header, &[]);
         self.b.switch_to_block(header);
+        // An interrupt (Ctrl-C, cancellation, the heap limit) taken here is reported
+        // at the loop.
+        self.srcloc(pos);
         self.emit_interrupt_check();
+        self.srcloc(0);
         self.loops.insert(
             id,
             LoopCtx {
@@ -2509,6 +2619,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         desc: &'static BuiltinDesc,
         args: &[Node],
         as_cond: bool,
+        pos: u32,
     ) -> CResult<Operand> {
         if let Some(c) = self.prim_cond(desc, args)? {
             return Ok(if as_cond {
@@ -2523,12 +2634,12 @@ impl<'a, M: Module> FnCtx<'a, M> {
         let op = inline_op(desc, args.len());
         let result = match op {
             Some(op) => {
-                let r = self.compile_inline(op, desc, &ops, as_cond)?;
+                let r = self.compile_inline(op, desc, &ops, as_cond, pos)?;
                 self.release_tmps(&ops);
                 r
             }
             None => {
-                let r = self.direct_call(desc, &ops, true)?;
+                let r = self.direct_call(desc, &ops, true, pos)?;
                 self.release_untransferred(&ops);
                 if as_cond {
                     // Only the truth of the result is needed; the value itself goes.
@@ -2551,6 +2662,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         desc: &'static BuiltinDesc,
         ops: &[Operand],
         transfer: bool,
+        pos: u32,
     ) -> CResult<Value> {
         let (argv, argc) = self.store_ops(ops);
         let owned = if transfer {
@@ -2560,7 +2672,9 @@ impl<'a, M: Module> FnCtx<'a, M> {
         };
         let fref = self.builtin_ref(desc)?;
         let this = self.b.ins().iconst(types::I64, 0);
+        self.srcloc(pos);
         let inst = self.b.ins().call(fref, &[this, argc, argv, owned]);
+        self.srcloc(0);
         let r = self.b.inst_results(inst)[0];
         self.check_exc(r);
         Ok(r)
@@ -2575,6 +2689,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         desc: &'static BuiltinDesc,
         ops: &[Operand],
         as_cond: bool,
+        pos: u32,
     ) -> CResult<Operand> {
         let a = ops[0].val;
         let b = ops.get(1).map(|o| o.val);
@@ -2658,7 +2773,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
         self.b.switch_to_block(slow);
         self.b.seal_block(slow);
-        let r = self.direct_call(desc, ops, false)?;
+        let r = self.direct_call(desc, ops, false, pos)?;
         let r = if as_cond {
             let c = self.truthy(r);
             self.emit_release(r);
@@ -2721,7 +2836,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         }
     }
 
-    fn compile_call(&mut self, f: &Node, args: &[Node]) -> CResult<Operand> {
+    fn compile_call(&mut self, f: &Node, args: &[Node], pos: u32) -> CResult<Operand> {
         let fop = self.compile(f)?;
         self.push_tmp(fop);
         let (argv, argc, ops) = self.store_args(args)?;
@@ -2768,18 +2883,22 @@ impl<'a, M: Module> FnCtx<'a, M> {
             proto,
             api::consts::PROTO_OFF_ENTRY,
         );
+        self.srcloc(pos);
         let inst = self
             .b
             .ins()
             .call_indirect(self.call_sig, entry, &[fv, argc, argv, owned]);
+        self.srcloc(0);
         let r1 = self.b.inst_results(inst)[0];
         self.b.ins().jump(merge, &[BlockArg::Value(r1)]);
 
         self.b.switch_to_block(slow);
         self.b.seal_block(slow);
+        self.srcloc(pos);
         let r2 = self
             .call_rt(RtFn::Invoke, &[fv, argc, argv, owned])
             .unwrap();
+        self.srcloc(0);
         self.b.ins().jump(merge, &[BlockArg::Value(r2)]);
 
         self.b.switch_to_block(merge);

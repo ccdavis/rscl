@@ -890,3 +890,47 @@ fn cycles_are_collected() {
         assert_eq!(eval(j, "(do (gc) (fn? @cyc))"), "true");
     });
 }
+
+#[test]
+fn bigints_do_not_leak() {
+    with_jit(|j| {
+        assert_eq!(
+            eval(j, "(+' 9223372036854775807 1)"),
+            "9223372036854775808N"
+        );
+        assert_eq!(
+            eval(j, "(* 2 (+' 9223372036854775807 1))"),
+            "18446744073709551616N"
+        );
+        // BigInts stay BigInts (Clojure does not demote).
+        assert_eq!(
+            eval(j, "(- (+' 9223372036854775807 1) 1)"),
+            "9223372036854775807N"
+        );
+        assert_eq!(eval(j, "(= 1N 1)"), "true");
+        assert_eq!(eval(j, "(get {1N :a} 1)"), ":a");
+        assert_eq!(
+            eval(j, "(str (reduce *' (range 1 26)))"),
+            "\"15511210043330985984000000\""
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(try (+ 9223372036854775807 1) (catch ArithmeticException e (ex-message e)))"
+            ),
+            "\"integer overflow\""
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(loop [i 0 acc 1N] (if (< i 70) (recur (inc i) (* acc 2)) acc))"
+            ),
+            "1180591620717411303424N"
+        );
+        assert_eq!(eval(j, "(long 5N)"), "5");
+        assert_eq!(
+            eval(j, "(bigint \"-12345678901234567890\")"),
+            "-12345678901234567890N"
+        );
+    });
+}

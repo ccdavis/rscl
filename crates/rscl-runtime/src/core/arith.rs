@@ -18,12 +18,22 @@ fn chain(args: &[VRef], ok: fn(Option<Ordering>) -> bool) -> RtResult<Value> {
     let mut prev = expect_num(&args[0])?;
     for a in &args[1..] {
         let cur = expect_num(a)?;
-        if !ok(num::cmp(prev, cur)) {
+        if !ok(num::cmp(&prev, &cur)) {
             return Ok(Value::FALSE);
         }
         prev = cur;
     }
     Ok(Value::TRUE)
+}
+
+fn parity(args: &[VRef], want_even: bool) -> RtResult<Value> {
+    match num::is_even(&expect_num(&args[0])?) {
+        Some(even) => Ok(Value::bool(even == want_even)),
+        None => crate::exc::err(
+            crate::obj::exception::ILLEGAL_ARGUMENT,
+            "Argument must be an integer",
+        ),
+    }
 }
 
 builtins! {
@@ -49,21 +59,40 @@ builtins! {
     "==" => fn cf_num_eq(args) [; 1] { chain(args, |o| o == Some(Ordering::Equal)) }
     "max" => fn cf_max(args) [; 1] {
         let mut best = expect_num(&args[0])?;
-        for a in &args[1..] { let n = expect_num(a)?; if num::cmp(n, best) == Some(Ordering::Greater) { best = n; } }
+        for a in &args[1..] { let n = expect_num(a)?; if num::cmp(&n, &best) == Some(Ordering::Greater) { best = n; } }
         Ok(to_value(best))
     }
     "min" => fn cf_min(args) [; 1] {
         let mut best = expect_num(&args[0])?;
-        for a in &args[1..] { let n = expect_num(a)?; if num::cmp(n, best) == Some(Ordering::Less) { best = n; } }
+        for a in &args[1..] { let n = expect_num(a)?; if num::cmp(&n, &best) == Some(Ordering::Less) { best = n; } }
         Ok(to_value(best))
     }
-    "zero?" => fn cf_zero_p(args) [1] { Ok(Value::bool(num::is_zero(expect_num(&args[0])?))) }
-    "pos?" => fn cf_pos_p(args) [1] { Ok(Value::bool(num::sign(expect_num(&args[0])?) == Ordering::Greater)) }
-    "neg?" => fn cf_neg_p(args) [1] { Ok(Value::bool(num::sign(expect_num(&args[0])?) == Ordering::Less)) }
-    "even?" => fn cf_even_p(args) [1] {
-        match expect_num(&args[0])? { Num::I(n) => Ok(Value::bool(n % 2 == 0)), _ => crate::exc::err(crate::obj::exception::ILLEGAL_ARGUMENT, "Argument must be an integer") }
+    "zero?" => fn cf_zero_p(args) [1] { Ok(Value::bool(num::is_zero(&expect_num(&args[0])?))) }
+    "pos?" => fn cf_pos_p(args) [1] { Ok(Value::bool(num::sign(&expect_num(&args[0])?) == Ordering::Greater)) }
+    "neg?" => fn cf_neg_p(args) [1] { Ok(Value::bool(num::sign(&expect_num(&args[0])?) == Ordering::Less)) }
+    "even?" => fn cf_even_p(args) [1] { parity(args, true) }
+    "odd?" => fn cf_odd_p(args) [1] { parity(args, false) }
+    // Auto-promoting arithmetic: a 64-bit overflow gives a BigInt instead of throwing.
+    "+'" => fn cf_add_p(args) [; 0] { fold(args, Num::I(0), num::add_p) }
+    "*'" => fn cf_mul_p(args) [; 0] { fold(args, Num::I(1), num::mul_p) }
+    "-'" => fn cf_sub_p(args) [; 1] {
+        if args.len() == 1 {
+            let n = expect_num(&args[0])?;
+            return Ok(to_value(num::sub_p(Num::I(0), n)?));
+        }
+        fold(&args[1..], expect_num(&args[0])?, num::sub_p)
     }
-    "odd?" => fn cf_odd_p(args) [1] {
-        match expect_num(&args[0])? { Num::I(n) => Ok(Value::bool(n % 2 != 0)), _ => crate::exc::err(crate::obj::exception::ILLEGAL_ARGUMENT, "Argument must be an integer") }
+    "inc'" => fn cf_inc_p(args) [1] { Ok(to_value(num::inc_p(expect_num(&args[0])?)?)) }
+    "dec'" => fn cf_dec_p(args) [1] { Ok(to_value(num::dec_p(expect_num(&args[0])?)?)) }
+    "bigint" => fn cf_bigint(args) [1] {
+        if let Some(s) = crate::obj::string::as_str(&args[0]) {
+            return match s.trim().parse::<num_bigint::BigInt>() {
+                Ok(b) => Ok(crate::obj::bigint::new(b)),
+                Err(_) => crate::exc::err(crate::obj::exception::ILLEGAL_ARGUMENT, format!("Invalid BigInt: {s:?}")),
+            };
+        }
+        Ok(crate::obj::bigint::new(num::to_big(&expect_num(&args[0])?)?))
     }
+    "biginteger" => fn cf_biginteger(args) [1] { Ok(crate::obj::bigint::new(num::to_big(&expect_num(&args[0])?)?)) }
+    "bigint?" => fn cf_bigint_p(args) [1] { Ok(Value::bool(args[0].is_kind(crate::obj::Kind::BigInt))) }
 }

@@ -13,6 +13,7 @@ pub const INDEX_OUT_OF_BOUNDS: &str = "IndexOutOfBoundsException";
 pub const UNSUPPORTED: &str = "UnsupportedOperationException";
 pub const ILLEGAL_STATE: &str = "IllegalStateException";
 pub const STACK_OVERFLOW: &str = "StackOverflowError";
+pub const OUT_OF_MEMORY: &str = "OutOfMemoryError";
 pub const INTERRUPTED: &str = "InterruptedException";
 pub const CANCELLATION: &str = "CancellationException";
 pub const RUNTIME: &str = "RuntimeException";

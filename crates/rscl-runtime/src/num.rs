@@ -1,23 +1,36 @@
-//! Numeric tower: 64-bit integers (fixnum or boxed) and doubles. Integer overflow
-//! throws `ArithmeticException` like Clojure's unprimed operators. `/` on integers
+//! Numeric tower: 64-bit integers (fixnum or boxed), arbitrary-precision integers
+//! (`BigInt`, printed with an `N` suffix) and doubles. Integer overflow throws
+//! `ArithmeticException` like Clojure's unprimed operators; the primed operators
+//! (`+'`, `-'`, `*'`, `inc'`, `dec'`) promote to `BigInt` instead. A `BigInt` is
+//! contagious: an operation with a `BigInt` operand gives a `BigInt`. `/` on integers
 //! that do not divide exactly yields a double (documented divergence until Ratio).
 use std::cmp::Ordering;
 
+use num_bigint::BigInt;
+use num_integer::Integer;
+use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
+
 use crate::exc::{RtResult, err};
 use crate::obj::exception::{ARITHMETIC, CLASS_CAST};
+use crate::obj::{Kind, bigint, long};
 use crate::value::Value;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Num {
     I(i64),
     D(f64),
+    B(BigInt),
 }
 
 pub fn num(v: &Value) -> Option<Num> {
-    if let Some(n) = v.as_int() {
-        Some(Num::I(n))
-    } else {
-        v.as_double().map(Num::D)
+    if let Some(n) = v.as_fixnum() {
+        return Some(Num::I(n));
+    }
+    match v.kind() {
+        Some(Kind::Long) => Some(Num::I(long::get(v))),
+        Some(Kind::Double) => Some(Num::D(v.as_double()?)),
+        Some(Kind::BigInt) => Some(Num::B(bigint::get(v).clone())),
+        _ => None,
     }
 }
 
@@ -25,6 +38,7 @@ pub fn to_value(n: Num) -> Value {
     match n {
         Num::I(i) => Value::int(i),
         Num::D(d) => Value::double(d),
+        Num::B(b) => bigint::new(b),
     }
 }
 
@@ -42,76 +56,167 @@ fn overflow<T>() -> RtResult<T> {
     err(ARITHMETIC, "integer overflow")
 }
 
+fn big(i: i64) -> BigInt {
+    BigInt::from(i)
+}
+
+/// Both as `BigInt`, when neither is a double.
+fn bigs(a: &Num, b: &Num) -> Option<(BigInt, BigInt)> {
+    let conv = |n: &Num| match n {
+        Num::I(i) => Some(big(*i)),
+        Num::B(b) => Some(b.clone()),
+        Num::D(_) => None,
+    };
+    Some((conv(a)?, conv(b)?))
+}
+
 pub fn add(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (a, b) {
-        (Num::I(x), Num::I(y)) => Num::I(x.checked_add(y).map_or_else(overflow, Ok)?),
-        (x, y) => Num::D(f(x) + f(y)),
+    Ok(match (&a, &b) {
+        (Num::I(x), Num::I(y)) => Num::I(x.checked_add(*y).map_or_else(overflow, Ok)?),
+        (Num::D(_), _) | (_, Num::D(_)) => Num::D(f(&a) + f(&b)),
+        _ => {
+            let (x, y) = bigs(&a, &b).expect("integers");
+            Num::B(x + y)
+        }
     })
 }
 
 pub fn sub(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (a, b) {
-        (Num::I(x), Num::I(y)) => Num::I(x.checked_sub(y).map_or_else(overflow, Ok)?),
-        (x, y) => Num::D(f(x) - f(y)),
+    Ok(match (&a, &b) {
+        (Num::I(x), Num::I(y)) => Num::I(x.checked_sub(*y).map_or_else(overflow, Ok)?),
+        (Num::D(_), _) | (_, Num::D(_)) => Num::D(f(&a) - f(&b)),
+        _ => {
+            let (x, y) = bigs(&a, &b).expect("integers");
+            Num::B(x - y)
+        }
     })
 }
 
 pub fn mul(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (a, b) {
-        (Num::I(x), Num::I(y)) => Num::I(x.checked_mul(y).map_or_else(overflow, Ok)?),
-        (x, y) => Num::D(f(x) * f(y)),
+    Ok(match (&a, &b) {
+        (Num::I(x), Num::I(y)) => Num::I(x.checked_mul(*y).map_or_else(overflow, Ok)?),
+        (Num::D(_), _) | (_, Num::D(_)) => Num::D(f(&a) * f(&b)),
+        _ => {
+            let (x, y) = bigs(&a, &b).expect("integers");
+            Num::B(x * y)
+        }
     })
 }
 
+/// `+'`: like `add`, but a 64-bit overflow promotes to `BigInt`.
+pub fn add_p(a: Num, b: Num) -> RtResult<Num> {
+    match (&a, &b) {
+        (Num::I(x), Num::I(y)) => Ok(match x.checked_add(*y) {
+            Some(n) => Num::I(n),
+            None => Num::B(big(*x) + big(*y)),
+        }),
+        _ => add(a, b),
+    }
+}
+
+pub fn sub_p(a: Num, b: Num) -> RtResult<Num> {
+    match (&a, &b) {
+        (Num::I(x), Num::I(y)) => Ok(match x.checked_sub(*y) {
+            Some(n) => Num::I(n),
+            None => Num::B(big(*x) - big(*y)),
+        }),
+        _ => sub(a, b),
+    }
+}
+
+pub fn mul_p(a: Num, b: Num) -> RtResult<Num> {
+    match (&a, &b) {
+        (Num::I(x), Num::I(y)) => Ok(match x.checked_mul(*y) {
+            Some(n) => Num::I(n),
+            None => Num::B(big(*x) * big(*y)),
+        }),
+        _ => mul(a, b),
+    }
+}
+
 pub fn div(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (a, b) {
+    Ok(match (&a, &b) {
+        (Num::D(_), _) | (_, Num::D(_)) => Num::D(f(&a) / f(&b)),
         (Num::I(_), Num::I(0)) => return err(ARITHMETIC, "Divide by zero"),
-        (Num::I(x), Num::I(y)) => match x.checked_rem(y) {
-            Some(0) => Num::I(x.checked_div(y).map_or_else(overflow, Ok)?),
-            Some(_) => Num::D(x as f64 / y as f64),
+        (Num::I(x), Num::I(y)) => match x.checked_rem(*y) {
+            Some(0) => Num::I(x.checked_div(*y).map_or_else(overflow, Ok)?),
+            Some(_) => Num::D(*x as f64 / *y as f64),
             None => return overflow(),
         },
-        (x, y) => Num::D(f(x) / f(y)),
+        _ => {
+            let (x, y) = bigs(&a, &b).expect("integers");
+            if y.is_zero() {
+                return err(ARITHMETIC, "Divide by zero");
+            }
+            let (q, r) = x.div_rem(&y);
+            if r.is_zero() {
+                Num::B(q)
+            } else {
+                Num::D(f(&a) / f(&b))
+            }
+        }
     })
 }
 
 pub fn quot(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (a, b) {
-        (Num::I(_), Num::I(0)) => return err(ARITHMETIC, "Divide by zero"),
-        (Num::I(x), Num::I(y)) => Num::I(x.checked_div(y).map_or_else(overflow, Ok)?),
-        (x, y) => {
-            let q = f(x) / f(y);
+    Ok(match (&a, &b) {
+        (Num::D(_), _) | (_, Num::D(_)) => {
+            let q = f(&a) / f(&b);
             if q.is_finite() {
                 Num::D(q.trunc())
             } else {
                 return err(ARITHMETIC, "Divide by zero");
             }
         }
+        (Num::I(_), Num::I(0)) => return err(ARITHMETIC, "Divide by zero"),
+        (Num::I(x), Num::I(y)) => Num::I(x.checked_div(*y).map_or_else(overflow, Ok)?),
+        _ => {
+            let (x, y) = bigs(&a, &b).expect("integers");
+            if y.is_zero() {
+                return err(ARITHMETIC, "Divide by zero");
+            }
+            Num::B(x.div_rem(&y).0)
+        }
     })
 }
 
 pub fn rem(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (a, b) {
-        (Num::I(_), Num::I(0)) => return err(ARITHMETIC, "Divide by zero"),
-        (Num::I(x), Num::I(y)) => Num::I(x.checked_rem(y).unwrap_or(0)),
-        (x, y) => {
-            let (x, y) = (f(x), f(y));
+    Ok(match (&a, &b) {
+        (Num::D(_), _) | (_, Num::D(_)) => {
+            let (x, y) = (f(&a), f(&b));
             if y == 0.0 {
                 return err(ARITHMETIC, "Divide by zero");
             } else {
                 Num::D(x % y)
             }
         }
+        (Num::I(_), Num::I(0)) => return err(ARITHMETIC, "Divide by zero"),
+        (Num::I(x), Num::I(y)) => Num::I(x.checked_rem(*y).unwrap_or(0)),
+        _ => {
+            let (x, y) = bigs(&a, &b).expect("integers");
+            if y.is_zero() {
+                return err(ARITHMETIC, "Divide by zero");
+            }
+            Num::B(x.div_rem(&y).1)
+        }
     })
 }
 
 /// Clojure `mod`: result has the sign of the divisor.
 pub fn modulo(a: Num, b: Num) -> RtResult<Num> {
-    let r = rem(a, b)?;
-    Ok(match (r, b) {
-        (Num::I(r), Num::I(y)) if r != 0 && (r < 0) != (y < 0) => Num::I(r + y),
-        (Num::D(r), y) if r != 0.0 && (r < 0.0) != (f(y) < 0.0) => Num::D(r + f(y)),
-        (r, _) => r,
+    if let Some((x, y)) = bigs(&a, &b)
+        && !matches!((&a, &b), (Num::I(_), Num::I(_)))
+    {
+        if y.is_zero() {
+            return err(ARITHMETIC, "Divide by zero");
+        }
+        return Ok(Num::B(x.mod_floor(&y)));
+    }
+    let r = rem(a, b.clone())?;
+    Ok(match (&r, &b) {
+        (Num::I(r), Num::I(y)) if *r != 0 && (*r < 0) != (*y < 0) => Num::I(r + y),
+        (Num::D(r), y) if *r != 0.0 && (*r < 0.0) != (f(y) < 0.0) => Num::D(r + f(y)),
+        _ => r,
     })
 }
 
@@ -119,6 +224,7 @@ pub fn neg(a: Num) -> RtResult<Num> {
     Ok(match a {
         Num::I(x) => Num::I(x.checked_neg().map_or_else(overflow, Ok)?),
         Num::D(d) => Num::D(-d),
+        Num::B(b) => Num::B(-b),
     })
 }
 
@@ -130,38 +236,104 @@ pub fn dec(a: Num) -> RtResult<Num> {
     sub(a, Num::I(1))
 }
 
+pub fn inc_p(a: Num) -> RtResult<Num> {
+    add_p(a, Num::I(1))
+}
+
+pub fn dec_p(a: Num) -> RtResult<Num> {
+    sub_p(a, Num::I(1))
+}
+
 /// Numeric comparison; `None` only when a NaN is involved.
-pub fn cmp(a: Num, b: Num) -> Option<Ordering> {
+pub fn cmp(a: &Num, b: &Num) -> Option<Ordering> {
     match (a, b) {
-        (Num::I(x), Num::I(y)) => Some(x.cmp(&y)),
-        (x, y) => f(x).partial_cmp(&f(y)),
+        (Num::I(x), Num::I(y)) => Some(x.cmp(y)),
+        (Num::D(_), _) | (_, Num::D(_)) => f(a).partial_cmp(&f(b)),
+        _ => {
+            let (x, y) = bigs(a, b).expect("integers");
+            Some(x.cmp(&y))
+        }
     }
 }
 
 /// `==`: numeric equality across categories.
-pub fn equiv(a: Num, b: Num) -> bool {
+pub fn equiv(a: &Num, b: &Num) -> bool {
     cmp(a, b) == Some(Ordering::Equal)
 }
 
-pub fn is_zero(a: Num) -> bool {
+pub fn is_zero(a: &Num) -> bool {
     match a {
-        Num::I(x) => x == 0,
-        Num::D(d) => d == 0.0,
+        Num::I(x) => *x == 0,
+        Num::D(d) => *d == 0.0,
+        Num::B(b) => b.is_zero(),
     }
 }
 
-pub fn sign(a: Num) -> Ordering {
+pub fn sign(a: &Num) -> Ordering {
     match a {
         Num::I(x) => x.cmp(&0),
         Num::D(d) => d.partial_cmp(&0.0).unwrap_or(Ordering::Equal),
+        Num::B(b) => {
+            if b.is_zero() {
+                Ordering::Equal
+            } else if b.is_positive() {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
     }
 }
 
-#[inline]
-fn f(n: Num) -> f64 {
+pub fn is_even(a: &Num) -> Option<bool> {
+    match a {
+        Num::I(x) => Some(x % 2 == 0),
+        Num::B(b) => Some(b.is_even()),
+        Num::D(_) => None,
+    }
+}
+
+/// The value as an `f64` (`BigInt`s beyond the double range become infinite).
+pub fn f(n: &Num) -> f64 {
     match n {
-        Num::I(i) => i as f64,
-        Num::D(d) => d,
+        Num::I(i) => *i as f64,
+        Num::D(d) => *d,
+        Num::B(b) => b.to_f64().unwrap_or(f64::INFINITY),
+    }
+}
+
+/// `(long n)`: integers that fit, doubles truncated; a `BigInt` out of range is an
+/// error.
+pub fn to_long(n: &Num) -> RtResult<i64> {
+    match n {
+        Num::I(i) => Ok(*i),
+        Num::D(d) => Ok(*d as i64),
+        Num::B(b) => b.to_i64().map_or_else(
+            || {
+                err(
+                    crate::obj::exception::ILLEGAL_ARGUMENT,
+                    format!("Value out of range for long: {b}"),
+                )
+            },
+            Ok,
+        ),
+    }
+}
+
+/// `(bigint n)`: integers exactly, doubles truncated.
+pub fn to_big(n: &Num) -> RtResult<BigInt> {
+    match n {
+        Num::I(i) => Ok(big(*i)),
+        Num::B(b) => Ok(b.clone()),
+        Num::D(d) => BigInt::from_f64(d.trunc()).map_or_else(
+            || {
+                err(
+                    crate::obj::exception::ILLEGAL_ARGUMENT,
+                    format!("Cannot convert {d} to a BigInt"),
+                )
+            },
+            Ok,
+        ),
     }
 }
 
@@ -182,7 +354,33 @@ mod tests {
         assert_eq!(modulo(Num::I(-7), Num::I(3)).unwrap(), Num::I(2));
         assert_eq!(rem(Num::I(-7), Num::I(3)).unwrap(), Num::I(-1));
         assert_eq!(quot(Num::I(-7), Num::I(2)).unwrap(), Num::I(-3));
-        assert!(equiv(Num::I(1), Num::D(1.0)));
-        assert_eq!(cmp(Num::I(2), Num::D(1.5)), Some(Ordering::Greater));
+        assert!(equiv(&Num::I(1), &Num::D(1.0)));
+        assert_eq!(cmp(&Num::I(2), &Num::D(1.5)), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn bigints() {
+        let max = Num::I(i64::MAX);
+        let promoted = add_p(max.clone(), Num::I(1)).unwrap();
+        assert_eq!(promoted, Num::B(big(i64::MAX) + big(1)));
+        // Contagious, even when the result would fit.
+        assert_eq!(
+            sub(promoted.clone(), Num::I(1)).unwrap(),
+            Num::B(big(i64::MAX))
+        );
+        assert_eq!(mul(Num::B(big(2)), Num::I(3)).unwrap(), Num::B(big(6)));
+        assert_eq!(div(Num::B(big(6)), Num::I(3)).unwrap(), Num::B(big(2)));
+        assert_eq!(div(Num::B(big(7)), Num::I(2)).unwrap(), Num::D(3.5));
+        assert_eq!(modulo(Num::B(big(-7)), Num::I(3)).unwrap(), Num::B(big(2)));
+        assert_eq!(rem(Num::B(big(-7)), Num::I(3)).unwrap(), Num::B(big(-1)));
+        assert_eq!(quot(Num::B(big(-7)), Num::I(2)).unwrap(), Num::B(big(-3)));
+        assert_eq!(cmp(&Num::B(big(5)), &Num::I(5)), Some(Ordering::Equal));
+        assert_eq!(cmp(&promoted, &Num::D(1e30)), Some(Ordering::Less));
+        assert!(equiv(&Num::B(big(2)), &Num::D(2.0)));
+        assert_eq!(to_long(&Num::B(big(42))).unwrap(), 42);
+        assert!(to_long(&promoted).is_err());
+        crate::exc::take();
+        assert_eq!(is_even(&Num::B(big(10))), Some(true));
+        assert_eq!(sign(&Num::B(big(-3))), Ordering::Less);
     }
 }

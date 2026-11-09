@@ -58,12 +58,8 @@ unsafe extern "C" fn api_int_new(n: i64) -> u64 {
 }
 unsafe extern "C" fn api_double_get(v: u64, out: *mut f64) -> i32 {
     match crate::num::num(&borrowed(v)) {
-        Some(crate::num::Num::I(n)) => {
-            unsafe { *out = n as f64 };
-            1
-        }
-        Some(crate::num::Num::D(d)) => {
-            unsafe { *out = d };
+        Some(n) => {
+            unsafe { *out = crate::num::f(&n) };
             1
         }
         None => 0,

@@ -13,6 +13,9 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 imbl = { workspace = true }
 mimalloc = { version = "0.1", default-features = false, optional = true }
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
 regex = "1"
 rscl-abi = { path = "../rscl-abi" }
 

@@ -113,7 +113,18 @@ impl Jit {
             .map_err(|e| CompileError::new(format!("finalize: {e}"), 0))?;
         for f in &ids.fns {
             let start = self.compiler.module.get_finalized_function(f.id) as usize;
-            rscl_runtime::trace::register_code(start, f.size as usize, &f.name);
+            let lines = f
+                .lines
+                .iter()
+                .map(|l| rscl_runtime::trace::Line {
+                    start: l.start,
+                    end: l.end,
+                    file: l.file.clone(),
+                    line: l.line,
+                    col: l.col,
+                })
+                .collect();
+            rscl_runtime::trace::register_code(start, f.size as usize, &f.name, lines);
         }
         let init = self.compiler.module.get_finalized_function(ids.init);
         let body = self.compiler.module.get_finalized_function(ids.body);

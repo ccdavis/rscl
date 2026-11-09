@@ -8,7 +8,14 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 - `nil` and `false` are the only falsy values.
 - Integers are 64-bit. Fixnums cover ±2^62; larger values are boxed transparently.
   Arithmetic that overflows 64 bits throws `ArithmeticException` (Clojure's unprimed
-  operators). BigInt (`N` literals, `+'`) is not supported yet.
+  operators `+ - * inc dec`); the primed operators `+' -' *' inc' dec'` promote to a
+  BigInt instead. BigInts are written `123N` (an integer literal too large for 64
+  bits is read as a BigInt too) and print as `123N` with `pr`/`prn` and as `123` with
+  `str`. They are contagious in arithmetic and comparisons, come back down to a long
+  only through `long`/`int` (which throw when the value does not fit), and are equal
+  to and hash like the long of the same value (`(= 1N 1)`, `(get {1N :a} 1)`).
+  `bigint`, `biginteger`, `bigint?` exist; `integer?` is true for them. There is no
+  BigDecimal (`M` literals are rejected).
 - `/` on integers that divide exactly gives an integer; otherwise it gives a double
   (**divergence**: Clojure gives a Ratio). Ratio literals are rejected by the reader.
 - `(= 1 1.0)` is false; `(== 1 1.0)` is true. `=` on collections is structural;
@@ -40,14 +47,18 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 
 - Thrown values propagate as an `EXC` sentinel return checked after every call; the
   runtime never unwinds across generated code. Uncaught exceptions print
-  `Uncaught exception: Class: message` on stderr, followed by one `    at ns/fn` line per
-  rscl fn on the stack when the exception was first thrown (found by walking frame
-  pointers; Rust frames in between are omitted), and exit with status 1.
+  `Uncaught exception: Class: message` on stderr, followed by one
+  `    at ns/fn (file:line)` line per rscl fn on the stack when the exception was first
+  thrown (found by walking frame pointers; Rust frames in between are omitted), and
+  exit with status 1. The line is that of the call or `throw` the fn was executing;
+  the file is `<repl>` or `<expr>` for code typed at the REPL or given with `-e`.
+  Built binaries carry the same table, so traces are identical in both modes.
 - Exception classes are a small built-in taxonomy standing in for JVM classes:
   `ExceptionInfo`, `ArithmeticException`, `ClassCastException`, `ArityException`,
   `IllegalArgumentException`, `IllegalStateException`, `IndexOutOfBoundsException`,
-  `UnsupportedOperationException`, `StackOverflowError`, `InterruptedException`,
-  `RuntimeException`. `Throwable`, `Exception` and `Error` catch everything.
+  `UnsupportedOperationException`, `StackOverflowError`, `OutOfMemoryError`,
+  `InterruptedException`, `RuntimeException`. `Throwable`, `Exception` and `Error`
+  catch everything.
 
 ## Macros and sequences
 
@@ -267,6 +278,16 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   one reference is treated as holding its contents from outside. Cycles through a
   native object's payload are not seen. A thread stuck in a long native call delays
   a collection; `(gc)` throws if the others cannot be stopped within 200 ms.
+- The heap has a soft limit: `RSCL_MAX_HEAP_MB` (`0` for none), by default half of
+  the physical memory or of the cgroup limit, whichever is smaller. The allocator
+  keeps count of the bytes in use; the thread whose allocation crosses the limit
+  gets an `OutOfMemoryError` at its next fn entry, loop iteration or blocking wait,
+  after one cycle collection has had the chance to free enough. The error is
+  ordinary and catchable; the memory it unwinds is released, and the REPL carries
+  on. A program that catches it and keeps allocating gets another error every
+  sixteenth of the limit. The count is of bytes requested, so the process's resident
+  size runs somewhat higher. If the allocator itself fails (no limit, or memory
+  exhausted below it), the process aborts with a message, as any Rust program does.
 
 ## Programs
 

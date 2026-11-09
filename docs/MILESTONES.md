@@ -271,3 +271,22 @@ collected (`(let [a (atom nil)] (reset! a (fn [] @a)))` two hundred thousand tim
 runs in flat memory); keywords are interned weakly; `RSCL_HASH_SEED=random` protects
 maps keyed by untrusted input.
 
+## After the plan — BigInt, source lines, heap limit (done)
+
+```
+user=> [(+' 9223372036854775807 1) (reduce *' (range 1 31)) (= 1N 1) (long 5N)]
+[9223372036854775808N 265252859812191058636308480000000N true 5]
+user=> (+ 9223372036854775807 1)
+Execution error: ArithmeticException: integer overflow
+$ rscl run tests/corpus/error_trace.clj
+start
+Uncaught exception: ArithmeticException: Divide by zero
+    at user/inner (tests/corpus/error_trace.clj:2)
+    at user/middle (tests/corpus/error_trace.clj:3)
+    at user/outer (tests/corpus/error_trace.clj:4)
+$ RSCL_MAX_HEAP_MB=64 rscl -e '(loop [v []] (recur (conj v (str "x"))))'
+Uncaught exception: OutOfMemoryError: heap limit exceeded: 64 MB in use, limit 64 MB (RSCL_MAX_HEAP_MB)
+```
+
+The same traces and the same `OutOfMemoryError` come out of built binaries.
+

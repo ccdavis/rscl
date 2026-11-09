@@ -793,7 +793,7 @@ pub fn compare(a: &Value, b: &Value) -> RtResult<Ordering> {
         return Ok(Ordering::Greater);
     }
     if let (Some(x), Some(y)) = (crate::num::num(a), crate::num::num(b)) {
-        return Ok(crate::num::cmp(x, y).unwrap_or(Ordering::Equal));
+        return Ok(crate::num::cmp(&x, &y).unwrap_or(Ordering::Equal));
     }
     if let (Some(x), Some(y)) = (a.as_bool(), b.as_bool()) {
         return Ok(x.cmp(&y));

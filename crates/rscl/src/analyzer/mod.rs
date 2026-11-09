@@ -67,6 +67,8 @@ pub enum Node {
         id: LoopId,
         bindings: Vec<(LocalId, Node)>,
         body: Box<Node>,
+        /// Position of the `loop*` form (for the interrupt check at its header).
+        pos: u32,
     },
     Recur {
         target: RecurTarget,
@@ -91,7 +93,10 @@ pub enum Node {
         kind: CollKind,
         items: Vec<Node>,
     },
-    Throw(Box<Node>),
+    Throw {
+        expr: Box<Node>,
+        pos: u32,
+    },
     Try {
         body: Box<Node>,
         catches: Vec<CatchClause>,
@@ -159,6 +164,8 @@ pub struct FnNode {
     pub captures: Vec<LocalId>,
     /// The local bound to the fn object itself for `(fn name [..] ..)`.
     pub self_local: Option<LocalId>,
+    /// Position of the `fn*` form (for the stack and interrupt check at entry).
+    pub pos: u32,
 }
 
 #[derive(Debug)]
@@ -224,7 +231,7 @@ fn hint_of(form: &Value) -> Option<Ty> {
 
 /// `recur` or `throw` never produce a value, so they take the type of the other branch.
 fn is_bottom(n: &Node) -> bool {
-    matches!(n, Node::Recur { .. } | Node::Throw(_))
+    matches!(n, Node::Recur { .. } | Node::Throw { .. })
 }
 
 /// Memo of expression types keyed by node address (the tree is not mutated while a
@@ -247,7 +254,8 @@ pub fn ty_of_memo(node: &Node, locals: &[LocalInfo], cache: &mut TyCache) -> Ty 
     }
     let t = match node {
         Node::Const(v) => {
-            if v.as_int().is_some() {
+            // A BigInt constant is a value even when it fits: it stays a BigInt.
+            if v.as_fixnum().is_some() || v.is_kind(Kind::Long) {
                 Ty::Long
             } else if v.as_double().is_some() {
                 Ty::Double
@@ -799,7 +807,10 @@ impl Analyzer {
                 if items.len() != 2 {
                     return fail(form, "Wrong number of args to throw");
                 }
-                Ok(Node::Throw(Box::new(self.analyze(&items[1], false)?)))
+                Ok(Node::Throw {
+                    expr: Box::new(self.analyze(&items[1], false)?),
+                    pos: pos::pos_id(form),
+                })
             }
             "try" => self.analyze_try(items),
             "native-call*" => self.analyze_native_call(form, items),
@@ -1014,6 +1025,7 @@ impl Analyzer {
                 id: loop_id,
                 bindings,
                 body: Box::new(body),
+                pos: pos::pos_id(form),
             }
         } else {
             Node::Let {
@@ -1089,6 +1101,13 @@ impl Analyzer {
             try_depth: 0,
         });
         let self_local = name.as_deref().map(|n| self.declare_local(n));
+        // A macro-generated `fn*` form (`defn`) carries no position: fall back to the
+        // first parameter vector or body form that does.
+        let pos = std::iter::once(form)
+            .chain(arity_forms.iter().flatten())
+            .map(pos::pos_id)
+            .find(|&p| p != 0)
+            .unwrap_or(0);
         let result = self.analyze_arities(form, &arity_forms);
         let frame = self.frames.pop().unwrap();
         let arities = result?;
@@ -1097,6 +1116,7 @@ impl Analyzer {
             arities,
             captures: frame.captures,
             self_local,
+            pos,
         })))
     }
 
@@ -1349,7 +1369,7 @@ pub fn seq_items(v: &Value) -> Option<Vec<Value>> {
 pub fn is_constant(v: &Value) -> bool {
     match v.kind() {
         None => true,
-        Some(Kind::Long | Kind::Double | Kind::String | Kind::Keyword) => true,
+        Some(Kind::Long | Kind::Double | Kind::BigInt | Kind::String | Kind::Keyword) => true,
         Some(Kind::Vector) => vector::get(v).v.iter().all(is_constant),
         Some(Kind::Map) => map::get(v)
             .m
