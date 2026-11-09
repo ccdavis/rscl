@@ -173,6 +173,14 @@ builtins! {
             Some(Kind::Vector) => { let c = vector::new(vector::get(v).v.clone()); obj::set_meta_unshared(&c, args[1].owned()); c }
             Some(Kind::Map) => { let c = obj::map::new(obj::map::get(v).m.clone()); obj::set_meta_unshared(&c, args[1].owned()); c }
             Some(Kind::Set) => { let c = obj::set::new(obj::set::get(v).s.clone()); obj::set_meta_unshared(&c, args[1].owned()); c }
+            Some(Kind::SortedMap) => { let c = obj::sorted::map_new(obj::sorted::map_get(v).m.clone()); obj::set_meta_unshared(&c, args[1].owned()); c }
+            Some(Kind::SortedSet) => { let c = obj::sorted::set_new(obj::sorted::set_get(v).s.clone()); obj::set_meta_unshared(&c, args[1].owned()); c }
+            Some(Kind::Instance) => {
+                let i = obj::types::inst(v);
+                let c = obj::types::with(v, i.fields.clone(), i.ext.clone());
+                obj::set_meta_unshared(&c, args[1].owned());
+                c
+            }
             _ => return err(CLASS_CAST, format!("{} cannot be cast to IObj", crate::core::type_name(v))),
         };
         Ok(copy)

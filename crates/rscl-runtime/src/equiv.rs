@@ -35,9 +35,81 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
             Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq,
         ) => seq_equiv(a, b),
         (Kind::Map, Kind::Map) => obj::map::get(a).m == obj::map::get(b).m,
+        (Kind::Map | Kind::SortedMap, Kind::Map | Kind::SortedMap) => map_equiv(a, b),
         (Kind::Set, Kind::Set) => obj::set::get(a).s == obj::set::get(b).s,
+        (Kind::Set | Kind::SortedSet, Kind::Set | Kind::SortedSet) => set_equiv(a, b),
         (Kind::Regex, Kind::Regex) => obj::regex::get(a).source == obj::regex::get(b).source,
+        (Kind::Instance, Kind::Instance) => {
+            let (x, y) = (obj::types::inst(a), obj::types::inst(b));
+            // Records of the same type compare by value; deftype instances by identity.
+            std::ptr::eq(x.ty, y.ty)
+                && x.ty().is_record
+                && x.fields
+                    .iter()
+                    .zip(y.fields.iter())
+                    .all(|(p, q)| equiv(p, q))
+                && equiv(&x.ext, &y.ext)
+        }
         _ => false,
+    }
+}
+
+/// Entry-wise comparison of a hash map and/or a sorted map.
+fn map_equiv(a: &Value, b: &Value) -> bool {
+    let ea = map_entries(a);
+    let eb = map_entries(b);
+    if ea.len() != eb.len() {
+        return false;
+    }
+    ea.iter().all(
+        |(k, v)| match crate::coll::get(b, k, Some(&Value::UNBOUND)) {
+            Ok(w) => !w.is_unbound() && equiv(v, &w),
+            Err(_) => {
+                crate::exc::take();
+                false
+            }
+        },
+    )
+}
+
+fn map_entries(v: &Value) -> Vec<(Value, Value)> {
+    match v.kind() {
+        Some(Kind::Map) => obj::map::get(v)
+            .m
+            .iter()
+            .map(|(k, x)| (k.clone(), x.clone()))
+            .collect(),
+        Some(Kind::SortedMap) => obj::sorted::map_get(v)
+            .m
+            .iter()
+            .map(|(k, x)| (k.0.clone(), x.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn set_equiv(a: &Value, b: &Value) -> bool {
+    let ea = set_items(a);
+    let eb = set_items(b);
+    ea.len() == eb.len()
+        && ea.iter().all(|k| match crate::coll::contains(b, k) {
+            Ok(x) => x,
+            Err(_) => {
+                crate::exc::take();
+                false
+            }
+        })
+}
+
+fn set_items(v: &Value) -> Vec<Value> {
+    match v.kind() {
+        Some(Kind::Set) => obj::set::get(v).s.iter().cloned().collect(),
+        Some(Kind::SortedSet) => obj::sorted::set_get(v)
+            .s
+            .iter()
+            .map(|k| k.0.clone())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -112,6 +184,22 @@ const SEQ_SEED: u64 = 0x5eed_5eed_0000_0001;
 const MAP_SEED: u64 = 0x5eed_5eed_0000_0002;
 const SET_SEED: u64 = 0x5eed_5eed_0000_0003;
 
+fn hash_map_entries<'a>(entries: impl Iterator<Item = (&'a Value, &'a Value)>) -> u64 {
+    let mut h = MAP_SEED;
+    for (k, val) in entries {
+        h = h.wrapping_add(mix64(hasheq(k).wrapping_mul(31).wrapping_add(hasheq(val))));
+    }
+    mix64(h)
+}
+
+fn hash_set_items<'a>(items: impl Iterator<Item = &'a Value>) -> u64 {
+    let mut h = SET_SEED;
+    for x in items {
+        h = h.wrapping_add(mix64(hasheq(x)));
+    }
+    mix64(h)
+}
+
 pub fn hasheq(v: &Value) -> u64 {
     if let Some(n) = v.as_int() {
         return mix64(n as u64);
@@ -143,24 +231,35 @@ pub fn hasheq(v: &Value) -> u64 {
             mix64(h)
         }
         Kind::Regex => mix64(hash_bytes(obj::regex::get(v).source.as_bytes()) ^ 0x5e5e),
-        Kind::Map => {
-            let mut h = MAP_SEED;
-            for (k, val) in obj::map::get(v).m.iter() {
-                h = h.wrapping_add(mix64(hasheq(k).wrapping_mul(31).wrapping_add(hasheq(val))));
-            }
-            mix64(h)
+        // Sorted and hashed collections with the same contents must hash alike.
+        Kind::Map => hash_map_entries(obj::map::get(v).m.iter()),
+        Kind::SortedMap => {
+            hash_map_entries(obj::sorted::map_get(v).m.iter().map(|(k, val)| (&k.0, val)))
         }
-        Kind::Set => {
-            let mut h = SET_SEED;
-            for x in obj::set::get(v).s.iter() {
-                h = h.wrapping_add(mix64(hasheq(x)));
+        Kind::Set => hash_set_items(obj::set::get(v).s.iter()),
+        Kind::SortedSet => hash_set_items(obj::sorted::set_get(v).s.iter().map(|k| &k.0)),
+        Kind::Instance => {
+            let i = obj::types::inst(v);
+            if !i.ty().is_record {
+                return mix64(v.bits());
+            }
+            let mut h = MAP_SEED ^ i.ty().id;
+            for (k, val) in i.entries() {
+                h = h.wrapping_add(mix64(
+                    hasheq(&k).wrapping_mul(31).wrapping_add(hasheq(&val)),
+                ));
             }
             mix64(h)
         }
         // Identity-hashed kinds.
-        Kind::Fn | Kind::Var | Kind::Exception | Kind::Atom | Kind::Namespace | Kind::Native => {
-            mix64(v.bits())
-        }
+        Kind::Fn
+        | Kind::Var
+        | Kind::Exception
+        | Kind::Atom
+        | Kind::Namespace
+        | Kind::Native
+        | Kind::Type
+        | Kind::Protocol => mix64(v.bits()),
     }
 }
 

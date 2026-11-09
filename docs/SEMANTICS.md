@@ -121,6 +121,66 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 - A compiled program loads bridge libraries at start-up through the same
   `load-native` call; static linking of bridge libraries is not supported yet.
 
+## Types, protocols and multimethods
+
+- `(deftype Name [fields] Protocol (method [this ...] ...) ...)` defines a type whose
+  instances compare by identity and print as `#object[ns.Name 0x...]`. Fields are
+  read with `(.-field x)`; inside a method body the fields are locals (a parameter of
+  the same name shadows a field). `(Name. args)` and `(->Name args)` construct.
+- `(defrecord Name [fields] ...)` instances are maps: keyword lookup, `get`, `assoc`,
+  `dissoc`, `keys`, `vals`, `seq`, `count`, `into`, `=` and `hash` by value (two
+  records are equal only when they have the same type, fields and extra keys; a
+  record never equals a plain map). Extra keys live beside the declared fields;
+  `dissoc` of a declared field yields a plain map. Records are not callable. They
+  print as `#ns.Name{:field value, ...}`. `map->Name` builds from a map.
+- `(type x)` / `(class x)` return a type object (`Long`, `String`, `user.Point`,
+  ...); `(type nil)` is `nil`. Built-in types are vars in `clojure.core`: `Object`
+  `Boolean` `Character` `Long` `Double` `String` `Symbol` `Keyword` `PersistentList`
+  `PersistentVector` `PersistentHashMap` `PersistentHashSet` `PersistentTreeMap`
+  `PersistentTreeSet` `Fn` `Var` `Atom` `LazySeq` `Cons` `Pattern` `Exception`
+  `Namespace` `Native` `Type` `Protocol`. There is no class hierarchy: `instance?`
+  is exact, except that every non-nil value is an `Object`.
+- `defprotocol` creates a protocol and one dispatching fn per method; dispatch is on
+  the type of the first argument. `extend-type`, `extend-protocol` and `extend` add
+  implementations for any type, including `nil` and `Object` (the fallback for
+  types without their own implementation). A missing implementation throws
+  `IllegalArgumentException`. Implementations are looked up at call time, so a later
+  `extend-type` affects existing fns and instances.
+- `Printable` is the printing hook: a type that extends it (`(-pr this readably?)`
+  returns a string) controls how `pr`, `prn`, `print`, `println` and `str` render its
+  instances. There is no `print-method` multimethod.
+- `defmulti` builds a multimethod from a dispatch fn and an optional `:default`
+  dispatch value (`:default` by default); `defmethod` adds a method, `remove-method`,
+  `remove-all-methods`, `methods` and `get-method` work as in Clojure. Dispatch values
+  compare with `=`. There are no hierarchies (`derive`, `isa?`). As in Clojure, a
+  second `defmulti` for an existing multimethod is ignored.
+- Redefining a type at the REPL creates a fresh type; existing instances keep the old
+  one, and protocol/multimethod implementations registered for the old type stay with
+  it.
+
+## Metadata and dynamic vars
+
+- `def` metadata comes from the symbol's metadata (`^:dynamic`, `^:private`,
+  `^{:doc ...}`) and the docstring; it is literal data, not evaluated. `defn` and
+  `defmacro` add `:doc`, `:arglists` and the attr map. `(doc name)` prints it.
+- `with-meta`/`vary-meta` work on symbols, lists, vectors, maps, sets, sorted
+  collections and record/type instances; `alter-meta!`/`reset-meta!` on vars and atoms.
+- A var declared `^:dynamic` can be rebound with `binding` on the current thread for
+  the dynamic extent of the body (also across calls into other fns); `set!` replaces
+  the innermost binding. Binding a non-dynamic var, or `set!` outside a binding,
+  throws `IllegalStateException`. A lazy seq realised after the `binding` form exits
+  sees the root value, as in Clojure. Bindings are per thread and not inherited by
+  threads started inside the body.
+
+## Sorted collections
+
+- `sorted-map` and `sorted-set` order keys with `compare`; the key types in one
+  collection must be mutually comparable (`ClassCastException` otherwise). They
+  behave as maps/sets for `get`, `assoc`, `dissoc`, `conj`, `disj`, `contains?`,
+  `seq`, `keys`, `vals`, `rseq`, `subseq`, `=` and `hash` (equal to the unsorted
+  collection with the same contents) and are callable. `sorted-map-by` and
+  `sorted-set-by` (custom comparators) are not supported yet.
+
 ## Memory
 
 - Heap objects are reference counted (atomic). Compile-time constants are immortal.

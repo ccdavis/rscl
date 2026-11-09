@@ -130,5 +130,4 @@ builtins! {
     "ex-cause" => fn cf_ex_cause(args) [1] {
         Ok(obj::exception::as_exc(&args[0]).map_or(Value::NIL, |e| e.cause.clone()))
     }
-    "type" => fn cf_type(args) [1] { Ok(obj::symbol::new(None, crate::core::type_name(&args[0]))) }
 }

@@ -169,7 +169,9 @@ pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
             let r = unsafe { (proto.entry)(f.ptr() as *const FnObj, args.len() as i64, argv) };
             exc::check(r)
         }
-        Some(Kind::Keyword) | Some(Kind::Map) | Some(Kind::Set) => lookup_call(f, args),
+        Some(Kind::Keyword | Kind::Map | Kind::Set | Kind::SortedMap | Kind::SortedSet) => {
+            lookup_call(f, args)
+        }
         Some(Kind::Vector) => {
             if args.len() != 1 {
                 return Err(exc::Exc_from(crate::core::arity_error(

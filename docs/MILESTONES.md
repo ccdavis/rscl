@@ -155,3 +155,52 @@ demo                                          ; vars now point at the new code
 ```
 
 A built binary that calls `load-native` loads the same `.so` at start-up.
+
+## Phase 7 — Types, protocols, multimethods, dynamic vars, sorted collections (done)
+
+```
+user=> (defprotocol Shape (area [this]) (scale [this k]))
+Shape
+user=> (defrecord Rect [w h] Shape (area [this] (* w h)) (scale [this k] (->Rect (* w k) (* h k))))
+user.Rect
+user=> (def r (->Rect 2 3))  (area r)  (scale r 2)  (:w r)  (assoc r :tag :big)
+#'user/r
+6
+#user.Rect{:w 4, :h 6}
+2
+#user.Rect{:w 2, :h 3, :tag :big}
+user=> (deftype Circle [r] Shape (area [this] (* 3 r r)) (scale [this k] (Circle. (* r k))))  (.-r (scale (Circle. 2) 5))
+user.Circle
+10
+user=> (extend-protocol Shape nil (area [_] 0) (scale [_ k] nil) String (area [s] (count s)) (scale [s k] (apply str (repeat k s))))
+nil
+user=> [(area nil) (area "abc") (scale "ab" 3) (satisfies? Shape 1)]
+[0 3 "ababab" false]
+user=> (area :kw)
+Execution error: IllegalArgumentException: No implementation of method: :area of protocol: #'user/Shape found for class: Keyword
+user=> (defrecord Named [n] Printable (-pr [this readably?] (str "<" n ">")))  (prn [(->Named "x")])
+user.Named
+[<x>]
+user=> (defmulti speak (fn [a & _] (:kind a)))  (defmethod speak :dog [a] "woof")  (defmethod speak :default [a] "...")
+#'user/speak
+#object[user/speak 0x...]
+#object[user/speak 0x...]
+user=> [(speak {:kind :dog}) (speak {:kind :fish})]
+["woof" "..."]
+user=> (def ^:dynamic *depth* 0)  (defn show [] *depth*)  [(show) (binding [*depth* 1] (show)) (show)]
+#'user/*depth*
+#'user/show
+[0 1 0]
+user=> (sorted-map :b 2 :a 1)  (into (sorted-set) [3 1 2])  (subseq (sorted-set 1 2 3 4) > 2)
+{:a 1, :b 2}
+#{1 2 3}
+(3 4)
+user=> (defn documented "Adds things." [a b] (+ a b))  (doc documented)
+#'user/documented
+-------------------------
+user/documented
+([a b])
+  Adds things.
+nil
+```
+

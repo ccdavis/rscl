@@ -2,6 +2,8 @@
 //! Generated code never touches the root directly; it calls `rt_var_root`, which
 //! returns a +1 reference taken under the lock, so a concurrent `def` cannot free a
 //! function while it is running.
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -51,13 +53,67 @@ pub fn as_var(v: &Value) -> Option<&VarObj> {
     }
 }
 
+thread_local! {
+    /// `binding` frames: var address → value, innermost last.
+    static BINDINGS: RefCell<Vec<HashMap<usize, Value>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `push-thread-bindings`: establish a frame of dynamic bindings on this thread.
+pub fn push_bindings(frame: Vec<(&VarObj, Value)>) {
+    let map: HashMap<usize, Value> = frame
+        .into_iter()
+        .map(|(v, x)| (v as *const VarObj as usize, x))
+        .collect();
+    BINDINGS.with(|b| b.borrow_mut().push(map));
+}
+
+/// `pop-thread-bindings`; false if there was no frame.
+pub fn pop_bindings() -> bool {
+    BINDINGS.with(|b| b.borrow_mut().pop().is_some())
+}
+
+fn thread_binding(var: &VarObj) -> Option<Value> {
+    let key = var as *const VarObj as usize;
+    BINDINGS.with(|b| {
+        b.borrow()
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(&key).cloned())
+    })
+}
+
+/// `set!` on a dynamic var: replace the innermost thread binding; false if none.
+pub fn set_binding(var: &VarObj, v: Value) -> bool {
+    let key = var as *const VarObj as usize;
+    BINDINGS.with(|b| {
+        for frame in b.borrow_mut().iter_mut().rev() {
+            if let Some(slot) = frame.get_mut(&key) {
+                *slot = v;
+                return true;
+            }
+        }
+        false
+    })
+}
+
+pub fn thread_bound(var: &VarObj) -> bool {
+    thread_binding(var).is_some()
+}
+
 impl VarObj {
-    /// The root value, +1, or `UNBOUND`.
+    /// The current value, +1: the innermost thread binding for a dynamic var, else
+    /// the root (`UNBOUND` if none).
     pub fn root(&self) -> Value {
+        if self.has_flag(FLAG_DYNAMIC)
+            && let Some(v) = thread_binding(self)
+        {
+            return v;
+        }
         self.root.lock().unwrap().clone()
     }
+    /// Bound by a root or (for a dynamic var) by a thread binding.
     pub fn is_bound(&self) -> bool {
-        !self.root.lock().unwrap().is_unbound()
+        !self.root().is_unbound()
     }
     /// Replace the root. The old value is released after the lock is dropped.
     pub fn bind_root(&self, v: Value) {
@@ -83,7 +139,23 @@ impl VarObj {
     pub fn meta(&self) -> Value {
         self.meta.lock().unwrap().clone()
     }
+    /// Replace the metadata. The `:dynamic`, `:private` and `:macro` flags follow it: a
+    /// key that is absent or falsy clears the flag, so `(defn f ...)` after
+    /// `(defn- f ...)` makes `f` public again.
     pub fn set_meta(&self, m: Value) {
+        if let Some(map) = super::map::as_map(&m) {
+            for (kw, flag) in [
+                ("dynamic", FLAG_DYNAMIC),
+                ("private", FLAG_PRIVATE),
+                ("macro", FLAG_MACRO),
+            ] {
+                let on = map
+                    .m
+                    .get(&super::keyword::intern(None, kw))
+                    .is_some_and(Value::truthy);
+                self.set_flag(flag, on);
+            }
+        }
         *self.meta.lock().unwrap() = m;
     }
     pub fn qualified(&self) -> String {

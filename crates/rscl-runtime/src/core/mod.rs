@@ -13,6 +13,7 @@ pub mod lazy;
 pub mod nsfns;
 pub mod re;
 pub mod string;
+pub mod types;
 
 pub struct BuiltinDesc {
     pub ns: &'static str,
@@ -35,6 +36,7 @@ pub fn all() -> impl Iterator<Item = &'static BuiltinDesc> {
         .chain(lazy::TABLE.iter())
         .chain(nsfns::TABLE.iter())
         .chain(re::TABLE.iter())
+        .chain(types::TABLE.iter())
 }
 
 pub fn find(ns: &str, name: &str) -> Option<&'static BuiltinDesc> {
@@ -164,6 +166,14 @@ pub fn type_name(v: &Value) -> &'static str {
         Some(Kind::Cons) => "Cons",
         Some(Kind::Regex) => "Pattern",
         Some(Kind::Native) => "Native",
+        Some(Kind::Type) => "Type",
+        Some(Kind::Protocol) => "Protocol",
+        Some(Kind::SortedMap) => "PersistentTreeMap",
+        Some(Kind::SortedSet) => "PersistentTreeSet",
+        Some(Kind::Instance) => {
+            // SAFETY: type objects are immortal, so their names live for the process.
+            unsafe { &*(&*obj::types::inst(v).ty().name as *const str) }
+        }
         None => "Object",
     }
 }

@@ -415,3 +415,198 @@ fn macros_and_lazy_seqs() {
         assert_eq!(eval(j, "(case (str \"a\") \"a\" :a :other)"), ":a");
     });
 }
+
+#[test]
+fn types_protocols_multimethods() {
+    with_jit(|j| {
+        def(j, "(defprotocol Shape (area [this]) (scale [this k]))");
+        def(
+            j,
+            "(defrecord Rect [w h] Shape (area [this] (* w h)) (scale [this k] (->Rect (* w k) (* h k))))",
+        );
+        def(
+            j,
+            "(deftype Circle [r] Shape (area [this] (* 3 r r)) (scale [this k] (Circle. (* r k))))",
+        );
+        assert_eq!(eval(j, "(area (->Rect 2 3))"), "6");
+        assert_eq!(eval(j, "(area (scale (->Rect 2 3) 2))"), "24");
+        assert_eq!(
+            eval(j, "(scale (->Rect (str \"a\") 1) 1)"),
+            "EXC ClassCastException: String cannot be cast to Number"
+        );
+        assert_eq!(eval(j, "(area (Circle. 2))"), "12");
+        assert_eq!(eval(j, "(.-r (scale (Circle. 2) 5))"), "10");
+        assert_eq!(eval(j, "(:w (assoc (->Rect 1 2) :w (str \"x\")))"), "\"x\"");
+        assert_eq!(eval(j, "(:z (assoc (->Rect 1 2) :z (str \"z\")))"), "\"z\"");
+        assert_eq!(
+            eval(j, "(dissoc (assoc (->Rect 1 2) :z 3) :w)"),
+            "{:h 2, :z 3}"
+        );
+        assert_eq!(
+            eval(j, "(pr-str (map->Rect {:w 1 :h (str \"h\")}))"),
+            "\"#user.Rect{:w 1, :h \\\"h\\\"}\""
+        );
+        assert_eq!(eval(j, "(= (->Rect 1 2) (->Rect 1 2))"), "true");
+        assert_eq!(eval(j, "(into {} (->Rect 1 2))"), "{:h 2, :w 1}");
+        assert_eq!(
+            eval(j, "(meta (with-meta (->Rect 1 2) {:m (str \"m\")}))"),
+            "{:m \"m\"}"
+        );
+        assert_eq!(eval(j, "(type (->Rect 1 2))"), "user.Rect");
+        assert_eq!(
+            eval(
+                j,
+                "[(type 1) (type \"s\") (type nil) (type :k) (instance? String (str \"s\"))]"
+            ),
+            "[Long String nil Keyword true]"
+        );
+        assert_eq!(
+            eval(j, "(area :kw)"),
+            "EXC IllegalArgumentException: No implementation of method: :area of protocol: #'user/Shape found for class: Keyword"
+        );
+        def(
+            j,
+            "(extend-protocol Shape nil (area [_] 0) (scale [_ k] nil) String (area [s] (count s)) (scale [s k] (apply str (repeat k s))))",
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[(area nil) (area (str \"abc\")) (scale (str \"ab\") 2) (satisfies? Shape 1) (satisfies? Shape nil)]"
+            ),
+            "[0 3 \"abab\" false true]"
+        );
+        def(
+            j,
+            "(defrecord Named [n] Printable (-pr [this r?] (str \"<\" n \">\")))",
+        );
+        assert_eq!(eval(j, "(pr-str [(->Named (str \"x\"))])"), "\"[<x>]\"");
+        assert_eq!(
+            eval(
+                j,
+                "(try (.-nope (->Rect 1 2)) (catch Exception e (ex-message e)))"
+            ),
+            "\"No matching field found: nope for class user.Rect\""
+        );
+
+        def(j, "(defmulti speak (fn [a & _] (:kind a)))");
+        def(j, "(defmethod speak :dog [a] (str (:name a) \" woofs\"))");
+        def(
+            j,
+            "(defmethod speak :default [a] (str (:name a) \" is silent\"))",
+        );
+        assert_eq!(
+            eval(j, "(speak {:kind :dog :name (str \"Rex\")})"),
+            "\"Rex woofs\""
+        );
+        assert_eq!(
+            eval(j, "(speak {:kind :cat :name (str \"Tom\")})"),
+            "\"Tom is silent\""
+        );
+        def(j, "(defmulti strict identity)");
+        assert_eq!(
+            eval(j, "(strict (str \"x\"))"),
+            "EXC IllegalArgumentException: No method in multimethod 'user/strict' for dispatch value: \"x\""
+        );
+        def(j, "(defmethod strict \"x\" [x] (str x x))");
+        assert_eq!(eval(j, "(strict (str \"x\"))"), "\"xx\"");
+        // Removing the method frees it (it lived in the method table), so no leak check.
+        def(j, "(remove-method strict \"x\")");
+        assert_eq!(eval(j, "(count (methods strict))"), "0");
+        def(j, "(defmulti by-type type)");
+        def(j, "(defmethod by-type Rect [r] :rect)");
+        def(j, "(defmethod by-type String [s] :string)");
+        assert_eq!(
+            eval(j, "[(by-type (->Rect 1 2)) (by-type (str \"s\"))]"),
+            "[:rect :string]"
+        );
+    });
+}
+
+#[test]
+fn dynamic_vars_and_sorted_colls() {
+    with_jit(|j| {
+        def(j, "(def ^:dynamic *d* (str \"root\"))");
+        def(j, "(defn show [] *d*)");
+        assert_eq!(
+            eval(j, "(binding [*d* (str \"bound\")] (show))"),
+            "\"bound\""
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[(show) (binding [*d* 1] (binding [*d* (inc *d*)] (show))) (show)]"
+            ),
+            "[\"root\" 2 \"root\"]"
+        );
+        assert_eq!(
+            eval(j, "(binding [*d* 1] (set! *d* (str \"set\")) (show))"),
+            "\"set\""
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(try (binding [*d* (str \"b\")] (throw (ex-info (str \"boom\") {}))) (catch Exception e [(ex-message e) (show)]))"
+            ),
+            "[\"boom\" \"root\"]"
+        );
+        assert_eq!(
+            eval(j, "(set! *d* 1)"),
+            "EXC IllegalStateException: Can't change/establish root binding of: user/*d* with set"
+        );
+        assert_eq!(
+            eval(j, "(binding [show 1] 2)"),
+            "EXC IllegalStateException: Can't dynamically bind non-dynamic var: user/show"
+        );
+        assert_eq!(
+            eval(j, "(binding [*d* (str \"x\")] (thread-bound? (var *d*)))"),
+            "true"
+        );
+        assert_eq!(eval(j, "(thread-bound? (var *d*))"), "false");
+        def(j, "(defn documented \"Doc.\" [a] a)");
+        assert_eq!(
+            eval(
+                j,
+                "[(:doc (meta (var documented))) (:arglists (meta (var documented)))]"
+            ),
+            "[\"Doc.\" ([a])]"
+        );
+
+        assert_eq!(
+            eval(j, "(sorted-map :b (str \"2\") :a 1)"),
+            "{:a 1, :b \"2\"}"
+        );
+        assert_eq!(
+            eval(j, "(assoc (sorted-map 2 :b) 1 (str \"a\"))"),
+            "{1 \"a\", 2 :b}"
+        );
+        assert_eq!(
+            eval(j, "(dissoc (sorted-map 1 (str \"a\") 2 :b) 1)"),
+            "{2 :b}"
+        );
+        assert_eq!(
+            eval(j, "(conj (sorted-set 3 1) (str \"x\"))"),
+            "EXC ClassCastException: String cannot be compared with Long"
+        );
+        assert_eq!(
+            eval(j, "(into (sorted-set) [(str \"b\") (str \"a\")])"),
+            "#{\"a\" \"b\"}"
+        );
+        assert_eq!(
+            eval(j, "(= (sorted-map :a (str \"v\")) {:a \"v\"})"),
+            "true"
+        );
+        assert_eq!(
+            eval(j, "(rseq (sorted-map 1 (str \"a\") 2 (str \"b\")))"),
+            "([2 \"b\"] [1 \"a\"])"
+        );
+        assert_eq!(eval(j, "(subseq (sorted-set 1 2 3) > 1)"), "(2 3)");
+        assert_eq!(eval(j, "(get (sorted-map (str \"k\") 1) (str \"k\"))"), "1");
+        assert_eq!(
+            eval(
+                j,
+                "(keys (into (sorted-map) (map (fn [i] [i (str i)]) (range 5))))"
+            ),
+            "(0 1 2 3 4)"
+        );
+    });
+}

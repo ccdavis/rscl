@@ -24,6 +24,11 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "letfn*",
     "case*",
     "native-call*",
+    // Not forms of their own, but special symbols (Clojure lists them too) so
+    // syntax-quote leaves them unqualified: `(try ~@body (finally ...))`.
+    "catch",
+    "finally",
+    "&",
 ];
 
 pub fn is_special(name: &str) -> bool {

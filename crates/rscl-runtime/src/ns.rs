@@ -240,6 +240,31 @@ pub unsafe extern "C" fn rt_var_bind_root(v: *const VarObj, val: Value) -> Value
     var.as_value()
 }
 
+/// `set!` on a var: replaces the thread binding of a dynamic var. Returns the value
+/// (+1) or `EXC`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_var_set(v: *const VarObj, val: Value) -> Value {
+    let var = unsafe { &*v };
+    if var.has_flag(var::FLAG_DYNAMIC) && var::set_binding(var, val.clone()) {
+        return val;
+    }
+    drop(val);
+    crate::exc::throw_new(
+        crate::obj::exception::ILLEGAL_STATE,
+        format!(
+            "Can't change/establish root binding of: {} with set",
+            var.qualified()
+        ),
+    );
+    Value::EXC
+}
+
+/// `def` metadata (also applies `:dynamic`/`:private` flags).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_var_set_meta(v: *const VarObj, meta: Value) {
+    unsafe { (*v).set_meta(meta) }
+}
+
 /// Set or clear a var flag (`FLAG_MACRO`, ...).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_var_set_flag(v: *const VarObj, flag: i64, on: i64) {

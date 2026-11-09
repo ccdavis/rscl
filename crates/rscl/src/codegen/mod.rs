@@ -653,6 +653,7 @@ fn max_args(node: &Node) -> usize {
         | Node::Fn(_)
         | Node::CurrentNs => 0,
         Node::Def { init, .. } => init.as_ref().map_or(0, |n| max_args(n)),
+        Node::VarSet { value, .. } => max_args(value),
         Node::If { test, then, else_ } => max_args(test).max(max_args(then)).max(max_args(else_)),
         Node::Do(nodes) => nodes.iter().map(max_args).max().unwrap_or(0),
         Node::Let { bindings, body } | Node::Loop { bindings, body, .. } => bindings
@@ -1100,18 +1101,32 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 let ns = self.call_rt(RtFn::CurrentNs, &[]).unwrap();
                 Ok(Operand::borrowed(ns))
             }
-            Node::Def { var, init } => {
+            Node::Def { var, init, meta } => {
                 let vo = var.get();
                 let p = self.const_slot(ConstEntry::Var(vo.ns.to_string(), vo.name.to_string()));
-                match init {
-                    None => Ok(Operand::borrowed(p)),
+                let result = match init {
+                    None => p,
                     Some(init) => {
                         let op = self.compile(init)?;
                         let op = self.make_owned_force(op);
-                        let r = self.call_rt(RtFn::VarBindRoot, &[p, op.val]).unwrap();
-                        Ok(Operand::borrowed(r))
+                        self.call_rt(RtFn::VarBindRoot, &[p, op.val]).unwrap()
                     }
+                };
+                if let Some(m) = meta {
+                    let mv = self.compile_const(m)?;
+                    let mv = self.make_owned_force(mv);
+                    self.call_rt(RtFn::VarSetMeta, &[p, mv.val]);
                 }
+                Ok(Operand::borrowed(result))
+            }
+            Node::VarSet { var, value } => {
+                let vo = var.get();
+                let p = self.const_slot(ConstEntry::Var(vo.ns.to_string(), vo.name.to_string()));
+                let op = self.compile(value)?;
+                let op = self.make_owned_force(op);
+                let r = self.call_rt(RtFn::VarSet, &[p, op.val]).unwrap();
+                self.check_exc(r);
+                Ok(Operand::owned(r))
             }
             Node::If { test, then, else_ } => self.compile_if(test, then, else_),
             Node::Do(nodes) => {

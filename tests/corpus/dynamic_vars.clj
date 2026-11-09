@@ -1,0 +1,45 @@
+;; dynamic vars, binding, set!, var metadata and doc.
+(def ^:dynamic *depth* 0)
+(defn show [] *depth*)
+(println (show) (binding [*depth* 1] (show)) (binding [*depth* 1] (binding [*depth* (inc *depth*)] [(show) *depth*])) (show))
+(println (binding [*depth* 5] (set! *depth* 6) (show)) (thread-bound? (var *depth*)) (binding [*depth* 1] (thread-bound? (var *depth*))))
+(def ^{:dynamic true :doc "a doc"} *y* :root)
+(println (binding [*y* :bound] *y*) *y* (:doc (meta (var *y*))) (dynamic? (var *y*)) (dynamic? (var show)))
+(println (try (binding [show 1] 2) (catch Exception e (ex-message e))))
+(println (try (set! *depth* 9) (catch Exception e (ex-message e))))
+(println (try (binding [*depth* 1] (throw (ex-info "boom" {}))) (catch Exception e [(ex-message e) *depth*])))
+(println (try (set! show 1) (catch Exception e (ex-message e))))
+(println (binding [*depth* 10 *y* :both] [*depth* *y*]) (with-bindings {(var *depth*) 3} (show)))
+
+;; the binding is visible to functions called within the dynamic extent, lazily
+;; realised seqs that escape it see the root again
+(defn depths [n] (map (fn [_] *depth*) (range n)))
+(println (binding [*depth* 7] (doall (depths 2))) (binding [*depth* 7] (vec (depths 2))))
+(println (loop [i 0 acc []] (if (< i 3) (recur (inc i) (conj acc (binding [*depth* i] (show)))) acc)))
+
+;; var metadata: docstrings, arglists, attr maps, private
+(defn documented "Adds things." {:added "1.0"} ([a] a) ([a b] (+ a b)))
+(doc documented)
+(doc binding)
+(doc *y*)
+(doc no-such-thing)
+(println (:arglists (meta (var documented))) (:added (meta (var documented))) (:doc (meta (var documented))))
+(defn- hidden [] 1)
+(println (:private (meta (var hidden))) (hidden) (:macro (meta (var binding))) (:arglists (meta (var binding))) (:macro (meta (var inc))))
+(alter-meta! (var hidden) assoc :extra 1)
+(println (:extra (meta (var hidden))) (:private (meta (var hidden))))
+(reset-meta! (var hidden) {:fresh true})
+(println (meta (var hidden)))
+(def a (atom 1))
+(alter-meta! a assoc :tag :counter)
+(println (meta a))
+(println (try (alter-meta! 1 assoc :x 1) (catch Exception e (ex-message e))))
+
+;; redefinition updates the flags: a private or macro var becomes an ordinary fn
+(defn- was-private [] 1)
+(defn was-private [] 2)
+(defmacro was-macro [] 1)
+(defn was-macro [] 2)
+(println (:private (meta (var was-private))) (macro? (var was-macro)) (was-macro))
+(def ^:dynamic *unbound*)
+(println (binding [*unbound* 1] [(bound? (var *unbound*)) (var-get (var *unbound*))]) (bound? (var *unbound*)))

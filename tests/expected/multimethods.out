@@ -1,0 +1,11 @@
+Rex says woof!! Tom says meow Nemo is silent
+:empty :one :many (0 1 :big) true true false
+:many
+No method in multimethod 'user/strict' for dispatch value: 1
+:one size class
+true true false Fn is not a multimethod
+:run-away :eat :fight :ignore
+20 100 7 :no-temp
+3628800 (1 1 2 6 24 120)
+R2 beeps 100
+No method in multimethod 'user/fact' for dispatch value: :step

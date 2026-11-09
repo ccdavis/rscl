@@ -16,8 +16,10 @@ pub mod map;
 pub mod native;
 pub mod regex;
 pub mod set;
+pub mod sorted;
 pub mod string;
 pub mod symbol;
+pub mod types;
 pub mod var;
 pub mod vector;
 
@@ -44,6 +46,11 @@ pub enum Kind {
     Cons = 16,
     Regex = 17,
     Native = 18,
+    Type = 19,
+    Instance = 20,
+    Protocol = 21,
+    SortedMap = 22,
+    SortedSet = 23,
 }
 
 impl Kind {
@@ -67,6 +74,11 @@ impl Kind {
             Kind::Cons => "Cons",
             Kind::Regex => "Regex",
             Kind::Native => "Native",
+            Kind::Type => "Type",
+            Kind::Instance => "Instance",
+            Kind::Protocol => "Protocol",
+            Kind::SortedMap => "SortedMap",
+            Kind::SortedSet => "SortedSet",
         }
     }
 }
@@ -90,6 +102,9 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
             Kind::Atom => drop(Box::from_raw(p as *mut atom::AtomObj)),
             Kind::Regex => drop(Box::from_raw(p as *mut regex::RegexObj)),
             Kind::Native => drop(Box::from_raw(p as *mut native::NativeObj)),
+            Kind::Instance => drop(Box::from_raw(p as *mut types::InstanceObj)),
+            Kind::SortedMap => drop(Box::from_raw(p as *mut sorted::SortedMapObj)),
+            Kind::SortedSet => drop(Box::from_raw(p as *mut sorted::SortedSetObj)),
             // Sequence cells are dismantled iteratively: a long realised chain would
             // otherwise recurse once per element while dropping.
             Kind::List | Kind::Cons | Kind::LazySeq => {
@@ -97,7 +112,7 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
                 free_tail(tail);
             }
             // Immortal kinds never reach a zero refcount.
-            Kind::Keyword | Kind::Var | Kind::Namespace => {
+            Kind::Keyword | Kind::Var | Kind::Namespace | Kind::Type | Kind::Protocol => {
                 unreachable!("attempt to free an immortal object kind")
             }
         }
@@ -173,9 +188,12 @@ pub fn meta(v: &Value) -> Option<Value> {
         Kind::Vector => vector::get(v).meta.clone(),
         Kind::Map => map::get(v).meta.clone(),
         Kind::Set => set::get(v).meta.clone(),
-        Kind::Atom => atom::get(v).meta.clone(),
+        Kind::Atom => atom::get(v).meta(),
         Kind::Var => var::get(v).meta(),
         Kind::Fn => func::get(v).proto().meta.clone(),
+        Kind::Instance => types::inst(v).meta.clone(),
+        Kind::SortedMap => sorted::map_get(v).meta.clone(),
+        Kind::SortedSet => sorted::set_get(v).meta.clone(),
         _ => return None,
     })
 }
@@ -191,6 +209,9 @@ pub fn set_meta_unshared(v: &Value, meta_: Value) {
             Some(Kind::Vector) => (*(p as *mut vector::VecObj)).meta = meta_,
             Some(Kind::Map) => (*(p as *mut map::MapObj)).meta = meta_,
             Some(Kind::Set) => (*(p as *mut set::SetObj)).meta = meta_,
+            Some(Kind::Instance) => (*(p as *mut types::InstanceObj)).meta = meta_,
+            Some(Kind::SortedMap) => (*(p as *mut sorted::SortedMapObj)).meta = meta_,
+            Some(Kind::SortedSet) => (*(p as *mut sorted::SortedSetObj)).meta = meta_,
             _ => {}
         }
     }

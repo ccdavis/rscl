@@ -57,6 +57,8 @@ runtime_fns! {
     VarRoot       = "rt_var_root"       => crate::ns::rt_var_root : (I64) -> I64;
     VarBindRoot   = "rt_var_bind_root"  => crate::ns::rt_var_bind_root : (I64, I64) -> I64;
     VarSetFlag    = "rt_var_set_flag"   => crate::ns::rt_var_set_flag : (I64, I64, I64);
+    VarSet        = "rt_var_set"        => crate::ns::rt_var_set : (I64, I64) -> I64;
+    VarSetMeta    = "rt_var_set_meta"   => crate::ns::rt_var_set_meta : (I64, I64);
     BoxDouble     = "rt_box_double"     => crate::ffi::rt_box_double : (F64) -> I64;
     BoxLong       = "rt_box_long"       => crate::ffi::rt_box_long : (I64) -> I64;
     StringNew     = "rt_string_new"     => crate::ffi::rt_string_new : (I64, I64) -> I64;

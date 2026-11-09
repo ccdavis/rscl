@@ -1,0 +1,31 @@
+0 1 [2 2] 0
+6 false true
+:bound :root a doc true false
+Can't dynamically bind non-dynamic var: user/show
+Can't change/establish root binding of: user/*depth* with set
+[boom 0]
+Can't change/establish root binding of: user/show with set
+[10 :both] 3
+(7 7) [7 7]
+[0 1 2]
+-------------------------
+user/documented
+([a] [a b])
+  Adds things.
+-------------------------
+clojure.core/binding
+([bindings & body])
+Macro
+  Evaluates body with the dynamic vars bound to the given values on this thread.
+-------------------------
+user/*y*
+  a doc
+Unable to resolve var: no-such-thing
+([a] [a b]) 1.0 Adds things.
+true 1 true ([bindings & body]) nil
+1 true
+{:fresh true}
+{:tag :counter}
+Long cannot be cast to IReference
+nil false 2
+[true 1] false

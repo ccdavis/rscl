@@ -43,6 +43,13 @@ pub enum Node {
     Def {
         var: VarPtr,
         init: Option<Box<Node>>,
+        /// Metadata for the var (`^:dynamic`, `:doc`, ...), applied after binding.
+        meta: Option<Value>,
+    },
+    /// `(set! var value)` on a dynamic var.
+    VarSet {
+        var: VarPtr,
+        value: Box<Node>,
     },
     If {
         test: Box<Node>,
@@ -305,6 +312,33 @@ impl Analyzer {
                     .collect::<Vec<_>>();
                 self.analyze_coll(form, CollKind::Set, &items)
             }
+            // Sorted collections only come from macro expansions (there is no literal
+            // syntax); compile them as a constructor call so sortedness survives.
+            Some(Kind::SortedMap) => {
+                let mut items = vec![symbol::new(Some("clojure.core"), "sorted-map")];
+                for (k, v) in rscl_runtime::obj::sorted::map_get(form).m.iter() {
+                    items.push(k.0.clone());
+                    items.push(v.clone());
+                }
+                self.analyze_list(&list::from_iter(items), tail)
+            }
+            Some(Kind::SortedSet) => {
+                let mut items = vec![symbol::new(Some("clojure.core"), "sorted-set")];
+                items.extend(
+                    rscl_runtime::obj::sorted::set_get(form)
+                        .s
+                        .iter()
+                        .map(|k| k.0.clone()),
+                );
+                self.analyze_list(&list::from_iter(items), tail)
+            }
+            Some(Kind::Instance | Kind::Type | Kind::Protocol) => fail(
+                form,
+                format!(
+                    "a {} value cannot be embedded in compiled code; return a form that constructs it (a macro expansion may not contain one)",
+                    rscl_runtime::core::type_name(form)
+                ),
+            ),
             _ => Ok(Node::Const(form.clone())),
         }
     }
@@ -360,6 +394,31 @@ impl Analyzer {
         if let Some(sym) = symbol::as_sym(head) {
             if sym.ns().is_none() && is_special(sym.name()) {
                 return self.analyze_special(sym.name(), form, &items, tail);
+            }
+            // Interop-style sugar: `(.-x obj)` reads a field, `(Point. 1 2)` constructs.
+            if sym.ns().is_none() && !self.is_local(sym.name()) {
+                let name = sym.name();
+                if let Some(field) = name.strip_prefix(".-")
+                    && !field.is_empty()
+                    && items.len() == 2
+                {
+                    let expanded = list::from_slice(&[
+                        symbol::new(Some("clojure.core"), "field*"),
+                        items[1].clone(),
+                        list::from_slice(&[symbol::new(None, "quote"), symbol::new(None, field)]),
+                    ]);
+                    self.stamp_expansion(form, &expanded);
+                    return self.analyze(&expanded, tail);
+                }
+                if let Some(tname) = name.strip_suffix('.')
+                    && !tname.is_empty()
+                {
+                    let mut v = vec![symbol::new(None, &format!("->{tname}"))];
+                    v.extend_from_slice(&items[1..]);
+                    let expanded = list::from_slice(&v);
+                    self.stamp_expansion(form, &expanded);
+                    return self.analyze(&expanded, tail);
+                }
             }
             let shadowed = sym.ns().is_none() && self.is_local(sym.name());
             if !shadowed {
@@ -493,6 +552,39 @@ impl Analyzer {
             }
             "try" => self.analyze_try(items),
             "native-call*" => self.analyze_native_call(form, items),
+            "set!" => {
+                if items.len() != 3 {
+                    return fail(form, "Wrong number of args to set!");
+                }
+                let Some(target) = symbol::as_sym(&items[1]) else {
+                    return fail(
+                        &items[1],
+                        "set! target must be a var (fields are immutable)",
+                    );
+                };
+                if target.ns().is_none() && self.lookup_local(target.name()).is_some() {
+                    return fail(
+                        &items[1],
+                        format!("Cannot assign to non-mutable: {}", target.name()),
+                    );
+                }
+                let Some(var) = self.resolve_var(target.ns(), target.name()) else {
+                    return fail(
+                        &items[1],
+                        format!(
+                            "Unable to resolve var: {} in this context",
+                            target.qualified()
+                        ),
+                    );
+                };
+                let value = self.analyze(&items[2], false)?;
+                Ok(Node::VarSet {
+                    var,
+                    value: Box::new(value),
+                })
+            }
+            "catch" | "finally" => fail(form, format!("{name} must appear inside try")),
+            "&" => fail(form, "& is only valid in a parameter or binding vector"),
             _ => fail(form, format!("special form {name} is not supported yet")),
         }
     }
@@ -526,22 +618,35 @@ impl Analyzer {
             return fail(form, "Can't create defs outside of current ns");
         }
         // Interned before the init is analyzed so a fn body can refer to its own name.
-        let var = VarPtr(self.ns.intern(sym.name()) as *const VarObj);
-        let init = match items.len() {
-            2 => None,
-            3 => Some(&items[2]),
+        let var_obj = self.ns.intern(sym.name());
+        let var = VarPtr(var_obj as *const VarObj);
+        let (doc, init) = match items.len() {
+            2 => (None, None),
+            3 => (None, Some(&items[2])),
             _ => {
                 if !items[2].is_kind(Kind::String) {
                     return fail(form, "Too many arguments to def");
                 }
-                Some(&items[3])
+                (Some(items[2].clone()), Some(&items[3]))
             }
         };
+        // Symbol metadata (`^:dynamic`, `^{:doc ..}`) plus a docstring become var meta.
+        let mut meta = rscl_runtime::obj::map::as_map(&sym.meta).map(|m| m.m.clone());
+        if let Some(d) = doc {
+            let mut m = meta.unwrap_or_else(rscl_runtime::obj::map::empty_map);
+            m.insert(rscl_runtime::obj::keyword::intern(None, "doc"), d);
+            meta = Some(m);
+        }
+        let meta = meta.map(rscl_runtime::obj::map::new);
+        if let Some(m) = &meta {
+            // Flags matter at compile time too (a `binding` in the same file).
+            var_obj.set_meta(m.clone());
+        }
         let init = match init {
             Some(f) => Some(Box::new(self.analyze(f, false)?)),
             None => None,
         };
-        Ok(Node::Def { var, init })
+        Ok(Node::Def { var, init, meta })
     }
 
     fn analyze_let(

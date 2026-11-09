@@ -23,6 +23,16 @@ pub fn init() {
             ns::find_or_create(d.ns).intern(d.name).bind_root(f);
         }
         core.intern("*command-line-args*").bind_root(Value::NIL);
+        // Built-in types as vars (`String`, `Long`, `Object`, ...) for `instance?`,
+        // `extend-type` and friends.
+        for key in crate::obj::types::builtin_keys() {
+            if key == crate::obj::types::KEY_NIL {
+                continue;
+            }
+            let name = crate::obj::types::builtin_name(key);
+            core.intern(name)
+                .bind_root(crate::obj::types::builtin_type(key));
+        }
         let user = ns::find_or_create(ns::USER);
         ns::set_current(user);
         // Namespaces that exist at start-up are provided by the runtime: `require`

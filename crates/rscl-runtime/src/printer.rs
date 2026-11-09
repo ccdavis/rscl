@@ -76,20 +76,7 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
             write_items(out, obj::vector::get(v).v.iter(), readably, depth);
             out.push(']');
         }
-        Kind::Map => {
-            out.push('{');
-            let mut first = true;
-            for (k, val) in obj::map::get(v).m.iter() {
-                if !first {
-                    out.push_str(", ");
-                }
-                first = false;
-                write(out, k, readably, depth + 1);
-                out.push(' ');
-                write(out, val, readably, depth + 1);
-            }
-            out.push('}');
-        }
+        Kind::Map => write_entries(out, obj::map::get(v).m.iter(), readably, depth),
         Kind::Set => {
             out.push_str("#{");
             write_items(out, obj::set::get(v).s.iter(), readably, depth);
@@ -166,7 +153,93 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
             out.push_str(&crate::ns::get(v).name);
             out.push(']');
         }
+        Kind::Type => out.push_str(&obj::types::get(v).name),
+        Kind::Protocol => {
+            out.push_str("#protocol[");
+            out.push_str(&obj::types::proto(v).name);
+            out.push(']');
+        }
+        Kind::Instance => write_instance(out, v, readably, depth),
+        Kind::SortedMap => write_entries(
+            out,
+            obj::sorted::map_get(v).m.iter().map(|(k, val)| (&k.0, val)),
+            readably,
+            depth,
+        ),
+        Kind::SortedSet => {
+            out.push_str("#{");
+            write_items(
+                out,
+                obj::sorted::set_get(v).s.iter().map(|k| &k.0),
+                readably,
+                depth,
+            );
+            out.push('}');
+        }
     }
+}
+
+/// The protocol consulted before printing an instance (core's `Printable`), or `nil`.
+static PRINT_PROTOCOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Register the protocol whose single method (`-pr`, called with the value and a
+/// `readably?` flag) renders instances of types that extend it.
+pub fn set_print_protocol(p: &Value) {
+    PRINT_PROTOCOL.store(p.bits(), std::sync::atomic::Ordering::Release);
+}
+
+fn print_protocol() -> Option<Value> {
+    let bits = PRINT_PROTOCOL.load(std::sync::atomic::Ordering::Acquire);
+    // SAFETY: protocols are immortal; the stored bits stay valid for the process.
+    (bits != 0).then(|| unsafe { Value::from_raw(bits) })
+}
+
+fn write_instance(out: &mut String, v: &Value, readably: bool, depth: usize) {
+    let i = obj::types::inst(v);
+    if let Some(p) = print_protocol()
+        && let Some(f) = obj::types::proto(&p).find(i.ty().id, "-pr")
+    {
+        match f.call(&[v.clone(), Value::bool(readably)]) {
+            Ok(s) => {
+                out.push_str(&print_str(&s));
+                return;
+            }
+            Err(_) => {
+                crate::exc::take();
+                out.push_str("#<error printing>");
+                return;
+            }
+        }
+    }
+    if i.ty().is_record {
+        out.push('#');
+        out.push_str(&i.ty().name);
+        let entries = i.entries();
+        write_entries(out, entries.iter().map(|(k, v)| (k, v)), readably, depth);
+    } else {
+        out.push_str(&format!("#object[{} 0x{:x}]", i.ty().name, v.bits()));
+    }
+}
+
+/// `{k v, k v}` for any map-like sequence of entries.
+fn write_entries<'a>(
+    out: &mut String,
+    entries: impl Iterator<Item = (&'a Value, &'a Value)>,
+    readably: bool,
+    depth: usize,
+) {
+    out.push('{');
+    let mut first = true;
+    for (k, val) in entries {
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        write(out, k, readably, depth + 1);
+        out.push(' ');
+        write(out, val, readably, depth + 1);
+    }
+    out.push('}');
 }
 
 fn write_items<'a>(

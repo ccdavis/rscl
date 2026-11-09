@@ -510,20 +510,32 @@
       (cons 'fn* (cons name new-sigs))
       (cons 'fn* new-sigs))))
 
+(defn def-meta
+  "Var metadata for defn/defmacro: the name's own meta, the attr map, :doc and :arglists."
+  [name doc attrs sigs extra]
+  (merge (meta name) attrs (if doc {:doc doc} nil) {:arglists (map first sigs)} extra))
+
 (defmacro defn [name & fdecl]
-  (let [fdecl (if (string? (first fdecl)) (next fdecl) fdecl)
-        fdecl (if (map? (first fdecl)) (next fdecl) fdecl)]
-    (list 'def name (cons 'clojure.core/fn (cons name fdecl)))))
+  (let [doc (if (string? (first fdecl)) (first fdecl) nil)
+        fdecl (if doc (next fdecl) fdecl)
+        attrs (if (map? (first fdecl)) (first fdecl) nil)
+        fdecl (if attrs (next fdecl) fdecl)
+        sigs (if (vector? (first fdecl)) (list fdecl) fdecl)]
+    (list 'def (with-meta name (def-meta name doc attrs sigs nil))
+          (cons 'clojure.core/fn (cons name fdecl)))))
 
 (defmacro defn- [name & fdecl]
-  (cons 'clojure.core/defn (cons name fdecl)))
+  (cons 'clojure.core/defn (cons (vary-meta name assoc :private true) fdecl)))
 
 (defmacro defmacro [name & body]
-  (let [body (if (string? (first body)) (next body) body)
-        body (if (map? (first body)) (next body) body)
+  (let [doc (if (string? (first body)) (first body) nil)
+        body (if doc (next body) body)
+        attrs (if (map? (first body)) (first body) nil)
+        body (if attrs (next body) body)
         sigs (if (vector? (first body)) (list body) body)
         add-implicit (fn [sig] (cons (vec (concat ['&form '&env] (first sig))) (next sig)))]
-    `(do (def ~name (fn ~name ~@(map add-implicit sigs)))
+    `(do (def ~(with-meta name (def-meta name doc attrs sigs {:macro true}))
+           (fn ~name ~@(map add-implicit sigs)))
          (set-macro! (var ~name))
          (var ~name))))
 
@@ -685,3 +697,192 @@
         (let [ret (apply f args)]
           (swap! mem assoc args ret)
           ret)))))
+
+;;; ---- more map helpers -----------------------------------------------------------------
+
+(defn select-keys [m ks]
+  (reduce (fn [acc k] (let [e (find m k)] (if e (conj acc e) acc))) {} ks))
+
+(defn merge-with [f & maps]
+  (when (some identity maps)
+    (reduce (fn [acc m]
+              (reduce (fn [a e]
+                        (let [k (key e) v (val e)]
+                          (if (contains? a k) (assoc a k (f (get a k) v)) (assoc a k v))))
+                      acc (seq m)))
+            (first maps) (rest maps))))
+
+;;; ---- dynamic binding ------------------------------------------------------------------
+
+(defmacro binding
+  "Evaluates body with the dynamic vars bound to the given values on this thread."
+  [bindings & body]
+  (when-not (and (vector? bindings) (even? (count bindings)))
+    (throw (ex-info "binding requires a vector of an even number of forms" {})))
+  (let [m (into {} (map (fn [p] [(list 'var (first p)) (second p)]) (partition 2 bindings)))]
+    `(do (push-thread-bindings ~m)
+         (try ~@body (finally (pop-thread-bindings))))))
+
+(defmacro with-bindings
+  "Like binding, but takes a map of vars to values."
+  [binding-map & body]
+  `(do (push-thread-bindings ~binding-map)
+       (try ~@body (finally (pop-thread-bindings)))))
+
+;;; ---- protocols, types and records -----------------------------------------------------
+
+(defmacro defprotocol
+  "(defprotocol Name \"doc\"? (method [this args*] \"doc\"?)*)
+   Defines the protocol and one dispatching fn per method."
+  [pname & sigs]
+  (let [doc (if (string? (first sigs)) (first sigs) nil)
+        sigs (filter seq? (if doc (next sigs) sigs))
+        qname (symbol (str (ns-name *ns*)) (str pname))
+        method-def (fn [sig]
+                     (let [mname (first sig)
+                           arglists (filter vector? (rest sig))
+                           mdoc (first (filter string? (rest sig)))]
+                       (when (empty? arglists)
+                         (throw (ex-info (str "Protocol method " mname " needs at least one arglist") {})))
+                       (list 'def (with-meta mname (merge (if mdoc {:doc mdoc} nil) {:arglists arglists}))
+                             (list 'clojure.core/protocol-fn* pname (list 'quote mname)))))]
+    `(do (def ~(with-meta pname (if doc {:doc doc} nil))
+           (protocol* '~qname '~(vec (map first sigs))))
+         ~@(map method-def sigs)
+         '~pname)))
+
+(defn- group-specs
+  "Split (Name (m ...) (m2 ...) Name2 (m ...)) into ([Name (methods...)] ...)."
+  [specs]
+  (loop [specs (seq specs) groups []]
+    (if specs
+      (let [head (first specs)]
+        (when (seq? head)
+          (throw (ex-info (str "Expected a type or protocol name, got: " (pr-str head)) {})))
+        (recur (seq (drop-while seq? (next specs)))
+               (conj groups [head (take-while seq? (next specs))])))
+      groups)))
+
+(defn- symbols-in
+  "Every symbol occurring anywhere in form (an over-approximation of what it references)."
+  [form]
+  (cond (symbol? form) (list form)
+        (or (seq? form) (vector? form) (set? form)) (mapcat symbols-in form)
+        (map? form) (mapcat symbols-in (concat (keys form) (vals form)))
+        :else nil))
+
+(defn- method-fn
+  "(m [params] body...) or (m ([params] body...) ...) -> a fn form. Each body sees the
+   type's fields it mentions (those not shadowed by a parameter) as locals read from
+   `this` by index."
+  [fields m]
+  (let [arities (if (vector? (second m)) (list (rest m)) (rest m))
+        index (zipmap fields (range (count fields)))
+        wrap (fn [arity]
+               (let [params (first arity)
+                     body (rest arity)
+                     this (first params)
+                     used (set (symbols-in body))
+                     fs (filter used (remove (set params) fields))]
+                 (if (and (symbol? this) (seq fs))
+                   (list params
+                         (list* 'clojure.core/let
+                                (vec (mapcat (fn [f] [f (list 'clojure.core/field-at* this (index f))]) fs))
+                                body))
+                   (cons params body))))]
+    (cons 'clojure.core/fn (map wrap arities))))
+
+(defn- method-map [fields methods]
+  (into {} (map (fn [m] [(keyword (name (first m))) (method-fn fields m)]) methods)))
+
+(defmacro extend-type
+  "(extend-type Type Protocol (method [this ...] ...)* ...*)"
+  [atype & specs]
+  (cons 'do (map (fn [g] (list 'clojure.core/extend* (first g) atype (method-map [] (second g))))
+                 (group-specs specs))))
+
+(defmacro extend-protocol
+  "(extend-protocol Protocol Type (method [this ...] ...)* ...*); nil is a valid type."
+  [proto & specs]
+  (cons 'do (map (fn [g] (list 'clojure.core/extend* proto (first g) (method-map [] (second g))))
+                 (group-specs specs))))
+
+(defn extend
+  "(extend Type Protocol {:method (fn ...)} ...)"
+  [atype & proto+mmaps]
+  (reduce (fn [_ p] (extend* (first p) atype (second p))) nil (partition 2 proto+mmaps)))
+
+(defn- type-specs [tname fields specs]
+  (map (fn [g] (list 'clojure.core/extend* (first g) tname (method-map fields (second g))))
+       (group-specs specs)))
+
+(defmacro deftype
+  "(deftype Name [field*] Protocol (method [this ...] ...)* ...*)
+   Fields are read with (.-field x). Instances compare by identity."
+  [tname fields & specs]
+  (let [qname (symbol (str (ns-name *ns*) "." tname))
+        ctor (symbol (str "->" tname))]
+    `(do (def ~tname (create-type* '~qname '~fields false))
+         (defn ~ctor ~fields (instance* ~tname ~@fields))
+         ~@(type-specs tname fields specs)
+         ~tname)))
+
+(defmacro defrecord
+  "(defrecord Name [field*] Protocol (method [this ...] ...)* ...*)
+   Records are maps: keyword lookup, assoc, dissoc, seq, = and hash by value."
+  [tname fields & specs]
+  (let [qname (symbol (str (ns-name *ns*) "." tname))
+        ctor (symbol (str "->" tname))
+        mctor (symbol (str "map->" tname))]
+    `(do (def ~tname (create-type* '~qname '~fields true))
+         (defn ~ctor ~fields (instance* ~tname ~@fields))
+         (defn ~mctor [m#] (map->instance* ~tname m#))
+         ~@(type-specs tname fields specs)
+         ~tname)))
+
+(defprotocol Printable
+  "Types extending Printable control how pr, prn and str render their instances."
+  (-pr [this readably?] "Return the string to print; readably? is true for pr/prn."))
+
+(set-print-protocol! Printable)
+
+;;; ---- multimethods ---------------------------------------------------------------------
+
+(defmacro defmulti
+  "(defmulti name docstring? attr-map? dispatch-fn & {:default v})
+   Like Clojure, an existing multimethod is left unchanged (remove it with ns-unmap)."
+  [mm-name & options]
+  (let [doc (if (string? (first options)) (first options) nil)
+        options (if doc (next options) options)
+        attrs (if (map? (first options)) (first options) nil)
+        options (if attrs (next options) options)
+        dispatch-fn (first options)
+        opts (apply hash-map (next options))
+        default (get opts :default :default)
+        qname (symbol (str (ns-name *ns*)) (str mm-name))
+        m (merge (meta mm-name) attrs (if doc {:doc doc} nil))]
+    `(let [v# (def ~(with-meta mm-name m))]
+       (if (and (bound? v#) (multi? (var-get v#)))
+         v#
+         (def ~mm-name (multi* '~qname ~dispatch-fn ~default))))))
+
+(defmacro defmethod
+  "(defmethod name dispatch-val [params] body...)"
+  [mm-name dispatch-val & fn-tail]
+  `(add-method* ~mm-name ~dispatch-val (fn ~@fn-tail)))
+
+;;; ---- documentation --------------------------------------------------------------------
+
+(defmacro doc
+  "Prints the documentation of the var named by sym."
+  [sym]
+  `(let [v# (resolve '~sym)]
+     (if v#
+       (let [m# (meta v#)]
+         (println "-------------------------")
+         (println (subs (pr-str v#) 2))
+         (when (:arglists m#) (println (:arglists m#)))
+         (when (:macro m#) (println "Macro"))
+         (when (:doc m#) (println " " (:doc m#)))
+         nil)
+       (println "Unable to resolve var:" '~sym))))
