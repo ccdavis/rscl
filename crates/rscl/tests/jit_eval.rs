@@ -39,6 +39,9 @@ fn eval(jit: &mut Jit, src: &str) -> String {
         }
         Err(e) => format!("ERR {e}"),
     };
+    // Atoms and pending values written by the expression sit in the collector's
+    // candidate buffer (with a reference) until a collection looks at them.
+    let _ = jit.eval_str("(gc)");
     let after = live_objects();
     assert_eq!(
         before, after,
@@ -686,5 +689,204 @@ fn primitives_do_not_leak() {
         );
         assert_eq!(eval(j, "(if (next (list 1 2)) :more :done)"), ":more");
         assert_eq!(eval(j, "(cond (< 2 1) :a (> 2 1) :b)"), ":b");
+    });
+}
+
+#[test]
+fn locals_clearing_and_argument_ownership() {
+    with_jit(|j| {
+        // Consumers stream: the head of a lazy seq is not held by the caller.
+        assert_eq!(eval(j, "(reduce + (range 100000))"), "4999950000");
+        assert_eq!(eval(j, "(count (filter even? (range 100000)))"), "50000");
+        assert_eq!(eval(j, "(last (map inc (range 1000)))"), "1000");
+        // A borrowed operand pending while a later argument transfers the local.
+        assert_eq!(
+            eval(j, "(let [r (map inc (range 3))] (cons r (list (count r))))"),
+            "((1 2 3) 3)"
+        );
+        assert_eq!(
+            eval(j, "(let [s (str \"v\") y s] [y (count y)])"),
+            "[\"v\" 1]"
+        );
+        assert_eq!(
+            eval(j, "(let [s (str \"v\")] (vector (do s) (count s)))"),
+            "[\"v\" 1]"
+        );
+        assert!(eval(j, "(let [f (fn [x] x)] (f (do f)))").starts_with("#object[user/fn__"));
+        // The callee operand stays alive across its own arguments.
+        def(j, "(defn self-arg [f] (f (count [f])))");
+        assert_eq!(eval(j, "(self-arg (fn [n] (* n 10)))"), "10");
+        // Parameters: borrowed from a caller that keeps them, or handed over.
+        def(
+            j,
+            "(defn walk [s n] (if (seq s) (recur (next s) (inc n)) n))",
+        );
+        def(j, "(def shared (doall (map inc (range 10))))");
+        assert_eq!(
+            eval(
+                j,
+                "[(walk shared 0) (walk shared 0) (walk (range 5) 0) (count shared)]"
+            ),
+            "[10 10 5 10]"
+        );
+        def(j, "(defn pack [& xs] (vec xs))");
+        assert_eq!(
+            eval(
+                j,
+                "[(pack (str \"a\") (str \"b\")) (apply pack (map str (range 2))) (pack)]"
+            ),
+            "[[\"a\" \"b\"] [\"0\" \"1\"] []]"
+        );
+        // Exceptions thrown after a transfer release everything exactly once.
+        assert_eq!(
+            eval(
+                j,
+                "(try (let [s (str \"x\")] (count s) (throw (ex-info s {}))) (catch Exception e (ex-message e)))"
+            ),
+            "\"x\""
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [v (vector (str \"a\"))] (try (nth v 5) (catch Exception e (count v))))"
+            ),
+            "1"
+        );
+        // Closures capture at creation; the outer local can still be used after.
+        assert_eq!(
+            eval(j, "(let [n (str \"n\") f (fn [] n)] [(f) n (f)])"),
+            "[\"n\" \"n\" \"n\"]"
+        );
+        // A loop local cleared inside the body and rebound by recur.
+        assert_eq!(
+            eval(
+                j,
+                "(loop [xs (map str (range 3)) acc []] (if (seq xs) (recur (rest xs) (conj acc (first xs))) acc))"
+            ),
+            "[\"0\" \"1\" \"2\"]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [m (hash-map :a (str \"v\"))] [(:a m) (m :a) (get m :a)])"
+            ),
+            "[\"v\" \"v\" \"v\"]"
+        );
+    });
+}
+
+#[test]
+fn dynamic_keywords_are_collected() {
+    with_jit(|j| {
+        // Keywords made at run time die with their last reference (no table growth);
+        // a later keyword of the same name is the same keyword as a literal.
+        assert_eq!(
+            eval(j, "(count (map keyword (map str (range 500))))"),
+            "500"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [k (keyword (str \"dy\" \"n\"))] [(= k :dyn) (identical? k :dyn) (name k)])"
+            ),
+            "[true true \"dyn\"]"
+        );
+        assert_eq!(eval(j, "(get (hash-map (keyword (str \"k\")) 1) :k)"), "1");
+    });
+}
+
+#[test]
+fn futures_promises_delays_do_not_leak() {
+    with_jit(|j| {
+        assert_eq!(eval(j, "@(future (str \"a\" \"b\"))"), "\"ab\"");
+        assert_eq!(
+            eval(
+                j,
+                "(let [p (promise)] (deliver p (str \"v\")) [@p (realized? p)])"
+            ),
+            "[\"v\" true]"
+        );
+        assert_eq!(
+            eval(j, "(let [d (delay (str \"d\"))] [(realized? d) @d @d])"),
+            "[false \"d\" \"d\"]"
+        );
+        // The future outlives the timed-out deref; wait for it so nothing is in flight
+        // when the live count is compared.
+        assert_eq!(
+            eval(
+                j,
+                "(let [f (future (sleep 100) 1)] [(deref f 10 (str \"late\")) @f])"
+            ),
+            "[\"late\" 1]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(try @(future (throw (ex-info (str \"boom\") {}))) (catch Exception e (ex-message e)))"
+            ),
+            "\"boom\""
+        );
+        // A cancelled future's thread stops at its next sleep slice; give it time to
+        // exit (and drop its reference to the future) before the count is compared.
+        assert_eq!(
+            eval(
+                j,
+                "(let [f (future (sleep 2000) 1) r [(future-cancel f) (try @f (catch Exception e (ex-message e)))]] (sleep 150) r)"
+            ),
+            "[true \"future was cancelled\"]"
+        );
+        assert_eq!(
+            eval(j, "(vec (pmap (fn [i] (str i)) (range 20)))"),
+            "[\"0\" \"1\" \"2\" \"3\" \"4\" \"5\" \"6\" \"7\" \"8\" \"9\" \"10\" \"11\" \"12\" \"13\" \"14\" \"15\" \"16\" \"17\" \"18\" \"19\"]"
+        );
+        def(j, "(def ^:dynamic *d* (str \"root\"))");
+        assert_eq!(
+            eval(j, "(binding [*d* (str \"bound\")] @(future *d*))"),
+            "\"bound\""
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [l (atom 0) r (atom [])] (doseq [f (doall (map (fn [i] (future (locking l (swap! r conj (str i))))) (range 4)))] @f) (count @r))"
+            ),
+            "4"
+        );
+    });
+}
+
+#[test]
+fn cycles_are_collected() {
+    with_jit(|j| {
+        // Each cycle is unreachable after its form; `(gc)` frees it, so the
+        // live-object count returns to its baseline.
+        let cycles = [
+            "(let [a (atom nil)] (reset! a (fn [] @a)) nil)",
+            "(let [a (atom {})] (swap! a assoc :f (fn [] @a) :s (str \"s\")) nil)",
+            "(let [a (atom nil) p (promise)] (deliver p (fn [] [@a @p])) (reset! a p) nil)",
+            "(let [a (atom nil)] (reset! a (lazy-seq (cons (str \"x\") @a))) nil)",
+            "(let [a (atom nil)] (reset! a (vector (fn [] @a) (hash-map :k (fn [] @a)))) nil)",
+            // The closure is still referenced when the first collection looks.
+            "(let [a (atom nil) f (fn [] @a)] (reset! a f) (gc) (f) nil)",
+        ];
+        for src in cycles {
+            let base = live_objects();
+            def(j, src);
+            assert!(live_objects() > base, "{src}: no cycle built");
+            let freed: i64 = def(j, "(gc)").parse().unwrap();
+            assert!(freed > 0, "{src}: nothing freed");
+            assert_eq!(live_objects(), base, "{src}: cycle not fully collected");
+        }
+        // Live structure reached from a candidate survives, shared nodes included.
+        def(j, "(def keep (atom {}))");
+        assert_eq!(
+            eval(
+                j,
+                "(let [m (assoc @keep :f (fn [] (str \"f\")) :xs (vec (map str (range 5)))) snap m] (reset! keep m) (gc) (reset! keep {}) [((:f snap)) (:xs snap)])"
+            ),
+            "[\"f\" [\"0\" \"1\" \"2\" \"3\" \"4\"]]"
+        );
+        // An atom that is not garbage is not touched by a collection.
+        def(j, "(def cyc (let [a (atom nil)] (reset! a (fn [] @a)) a))");
+        assert_eq!(eval(j, "(do (gc) (fn? @cyc))"), "true");
     });
 }

@@ -1,0 +1,16 @@
+3 3 true true true false false
+:timeout :fast
+false true nil 42 42 true
+computing once
+false true :done :done true 5
+[bad delay again: bad delay]
+[in future {:a 1}]
+Divide by zero
+:bound :root :inner
+(1 2 3 4 5 6 7 8 9 10) (11 22 33) (2 6) (:a :b)
+1313400 1000
+8000 Cannot lock an immediate value :reentrant
+true true false [future was cancelled true]
+:done false false
+:nested false true
+Pending Pending Pending :future :promise :delay nil

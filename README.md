@@ -7,7 +7,7 @@ Where Clojure on the JVM calls Java, rscl calls Rust: the core library is Rust
 functions exposed as first-class fns, and later phases add a typed C-ABI FFI and a
 bridge for exposing whole Rust crates.
 
-Status: Phases 1–8 of the plan are done (see `docs/MILESTONES.md`): a working REPL
+Status: Phases 1–9 of the plan are done (see `docs/MILESTONES.md`): a working REPL
 with per-form incremental compilation and redefinition, `rscl run`, `rscl build`
 producing native binaries, `defmacro` with syntax-quote, lazy sequences, destructuring,
 atoms, regular expressions, a `core.clj` written from scratch on top of the Rust
@@ -17,9 +17,10 @@ exceptions, `try`/`catch`/`finally`, a typed C FFI (`defnative`), stack-overflow
 Ctrl-C guards, a bridge for exposing Rust crates as rscl namespaces, `deftype`,
 `defrecord`, protocols, multimethods, dynamic vars with `binding`, var metadata and
 `doc`, sorted maps and sets, unboxed `long`/`double` locals with `^long`/`^double`
-hints and inline arithmetic, direct calls to Rust builtins, and a differential test
-corpus that runs every program under both the JIT and the AOT compiler. Next:
-concurrency (Phase 9).
+hints and inline arithmetic, direct calls to Rust builtins, futures, promises,
+delays, `pmap` and `locking`, locals clearing so lazy sequences stream in constant
+memory, a cycle collector, weakly interned keywords, and a differential test corpus that runs every
+program under both the JIT and the AOT compiler.
 
 ## Build and run
 

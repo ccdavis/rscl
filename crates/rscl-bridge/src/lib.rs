@@ -502,8 +502,29 @@ pub unsafe fn register(api: *const RtApi, ns: &str, exports: &[Export]) -> i32 {
     0
 }
 
-/// Body of every generated wrapper: arity check, conversion, panic safety.
-pub fn wrap(
+/// Body of every generated wrapper: arity check, conversion, panic safety, and the
+/// release of arguments the caller handed over (wrappers only borrow them).
+///
+/// # Safety
+/// `argv` must point at `argc` values that stay valid for the call.
+pub unsafe fn wrap(
+    name: &str,
+    argc: i64,
+    argv: *const u64,
+    owned: u64,
+    arity: i64,
+    f: impl FnOnce(&[Val]) -> Result<Val>,
+) -> u64 {
+    let r = wrap_borrowed(name, argc, argv, arity, f);
+    for i in 0..argc.min(64) {
+        if owned >> i & 1 == 1 {
+            unsafe { (api().release)(*argv.add(i as usize)) };
+        }
+    }
+    r
+}
+
+fn wrap_borrowed(
     name: &str,
     argc: i64,
     argv: *const u64,
@@ -578,9 +599,9 @@ macro_rules! exports {
         pub mod __rscl_exports {
             use super::*;
             $(
-                pub unsafe extern "C" fn $name(_f: *const ::std::ffi::c_void, argc: i64, argv: *const u64) -> u64 {
+                pub unsafe extern "C" fn $name(_f: *const ::std::ffi::c_void, argc: i64, argv: *const u64, owned: u64) -> u64 {
                     const ARITY: i64 = $crate::__count!($($arg)*);
-                    $crate::wrap(stringify!($name), argc, argv, ARITY, |args| {
+                    unsafe { $crate::wrap(stringify!($name), argc, argv, owned, ARITY, |args| {
                         #[allow(unused_variables, unused_mut)]
                         let mut i = 0usize;
                         $(
@@ -589,7 +610,7 @@ macro_rules! exports {
                         )*
                         let r = super::$name($($arg),*);
                         $crate::IntoVal::into_val(r)
-                    })
+                    }) }
                 }
             )*
             pub static EXPORTS: &[$crate::Export] = &[

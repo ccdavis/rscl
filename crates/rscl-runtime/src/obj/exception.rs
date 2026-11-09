@@ -14,6 +14,7 @@ pub const UNSUPPORTED: &str = "UnsupportedOperationException";
 pub const ILLEGAL_STATE: &str = "IllegalStateException";
 pub const STACK_OVERFLOW: &str = "StackOverflowError";
 pub const INTERRUPTED: &str = "InterruptedException";
+pub const CANCELLATION: &str = "CancellationException";
 pub const RUNTIME: &str = "RuntimeException";
 pub const COMPILER: &str = "CompilerException";
 

@@ -14,6 +14,7 @@ pub mod list;
 pub mod long;
 pub mod map;
 pub mod native;
+pub mod pending;
 pub mod regex;
 pub mod set;
 pub mod sorted;
@@ -51,6 +52,8 @@ pub enum Kind {
     Protocol = 21,
     SortedMap = 22,
     SortedSet = 23,
+    /// A future, promise or delay (see `pending.rs`).
+    Pending = 24,
 }
 
 impl Kind {
@@ -79,6 +82,7 @@ impl Kind {
             Kind::Protocol => "Protocol",
             Kind::SortedMap => "SortedMap",
             Kind::SortedSet => "SortedSet",
+            Kind::Pending => "Pending",
         }
     }
 }
@@ -105,14 +109,16 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
             Kind::Instance => drop(Box::from_raw(p as *mut types::InstanceObj)),
             Kind::SortedMap => drop(Box::from_raw(p as *mut sorted::SortedMapObj)),
             Kind::SortedSet => drop(Box::from_raw(p as *mut sorted::SortedSetObj)),
+            Kind::Pending => drop(Box::from_raw(p as *mut pending::PendingObj)),
             // Sequence cells are dismantled iteratively: a long realised chain would
             // otherwise recurse once per element while dropping.
             Kind::List | Kind::Cons | Kind::LazySeq => {
                 let tail = dismantle(p);
                 free_tail(tail);
             }
+            Kind::Keyword => keyword::free(p as *mut keyword::KwObj),
             // Immortal kinds never reach a zero refcount.
-            Kind::Keyword | Kind::Var | Kind::Namespace | Kind::Type | Kind::Protocol => {
+            Kind::Var | Kind::Namespace | Kind::Type | Kind::Protocol => {
                 unreachable!("attempt to free an immortal object kind")
             }
         }
@@ -161,7 +167,7 @@ fn free_tail(mut tail: Value) {
             return;
         }
         fence(Ordering::Acquire);
-        crate::value::note_freed();
+        crate::value::note_freed(h.kind);
         let p = tail.ptr() as *mut ObjHeader;
         std::mem::forget(tail);
         tail = unsafe { dismantle(p) };

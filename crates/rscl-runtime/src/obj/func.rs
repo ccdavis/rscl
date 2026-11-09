@@ -8,8 +8,12 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use super::{Kind, cast};
 use crate::value::{ObjHeader, Value};
 
-/// The uniform calling convention every rscl function and every builtin uses.
-pub type Entry = unsafe extern "C" fn(f: *const FnObj, argc: i64, argv: *const Value) -> Value;
+/// The uniform calling convention every rscl function and every builtin uses. Bit `i`
+/// of `owned` set means the callee owns `argv[i]`: it releases that reference, or
+/// moves it out (the slot is read, never written); a clear bit means the argument is
+/// borrowed from the caller. Callers that keep their arguments pass 0.
+pub type Entry =
+    unsafe extern "C" fn(f: *const FnObj, argc: i64, argv: *const Value, owned: u64) -> Value;
 
 #[repr(C)]
 pub struct FnProto {
@@ -82,7 +86,20 @@ pub fn capture(f: &Value, i: usize) -> &Value {
 unsafe fn capture_ptr(f: &Value, i: usize) -> *mut Value {
     debug_assert!(f.is_kind(Kind::Fn));
     debug_assert!((i as i64) < get(f).ncaptures);
-    unsafe { f.ptr().add(OFF_CAPTURES as usize).cast::<Value>().add(i) }
+    unsafe { capture_ptr_raw(f.ptr() as *const FnObj, i) }
+}
+
+/// Address of capture `i` of a fn object (for the collector).
+///
+/// # Safety
+/// `f` must be a live fn object with more than `i` captures.
+pub(crate) unsafe fn capture_ptr_raw(f: *const FnObj, i: usize) -> *mut Value {
+    unsafe {
+        (f as *mut u8)
+            .add(OFF_CAPTURES as usize)
+            .cast::<Value>()
+            .add(i)
+    }
 }
 
 pub fn get(v: &Value) -> &FnObj {

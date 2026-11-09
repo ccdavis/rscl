@@ -2,9 +2,9 @@
 //! guard. Symbols are searched in the libraries opened by `load-native` (newest
 //! first), then process-wide: the host binary (built with `-rdynamic`), libc/libm,
 //! and plain C libraries, which `load-native` promotes to `RTLD_GLOBAL`.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CString, c_char, c_int, c_void};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crate::exc::{RtResult, err};
 use crate::obj::exception::{INTERRUPTED, RUNTIME, STACK_OVERFLOW};
@@ -126,16 +126,170 @@ pub fn lookup(name: &str) -> *const u8 {
 
 // ---- interrupt flag and stack guard ---------------------------------------------------
 
-/// Set by the SIGINT handler; checked at loop headers and fn entries by generated code.
+/// Checked at loop headers and fn entries by generated code: non-zero when some
+/// thread has something to do at its next safepoint (Ctrl-C for the main thread,
+/// `future-cancel` for a worker, a collection for everyone). Threads that hit the
+/// slow path and find nothing for them continue.
 #[unsafe(no_mangle)]
 pub static rscl_interrupt_flag: AtomicU8 = AtomicU8::new(0);
 
+static CTRL_C: AtomicBool = AtomicBool::new(false);
+/// Cancellations raised for threads running compiled code and not yet consumed.
+static PENDING_CANCELS: AtomicUsize = AtomicUsize::new(0);
+static GC_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn anything_pending() -> bool {
+    CTRL_C.load(Ordering::Acquire)
+        || PENDING_CANCELS.load(Ordering::Acquire) > 0
+        || GC_PENDING.load(Ordering::Acquire)
+}
+
+/// Recompute the fast-path flag. Lock-free: every request sets its own atomic before
+/// raising the flag, so re-checking after the store cannot lose a request.
+fn refresh_flag() {
+    let pending = anything_pending();
+    rscl_interrupt_flag.store(u8::from(pending), Ordering::Release);
+    if !pending && anything_pending() {
+        rscl_interrupt_flag.store(1, Ordering::Release);
+    }
+}
+
+/// Ctrl-C: interrupt the main thread's evaluation. Called from the signal handler,
+/// so only atomics.
 pub fn request_interrupt() {
+    CTRL_C.store(true, Ordering::Release);
     rscl_interrupt_flag.store(1, Ordering::Release);
+}
+
+pub fn ctrl_c_pending() -> bool {
+    CTRL_C.load(Ordering::Acquire)
+}
+
+/// `future-cancel` of a worker running compiled code: make every thread check.
+pub fn request_cancel() {
+    PENDING_CANCELS.fetch_add(1, Ordering::AcqRel);
+    rscl_interrupt_flag.store(1, Ordering::Release);
+}
+
+/// A counted cancellation request was consumed.
+pub fn cancel_consumed() {
+    PENDING_CANCELS.fetch_sub(1, Ordering::AcqRel);
+    refresh_flag();
+}
+
+/// The collector wants every thread at a safepoint.
+pub fn request_safepoint() {
+    GC_PENDING.store(true, Ordering::Release);
+    rscl_interrupt_flag.store(1, Ordering::Release);
+}
+
+pub fn safepoint_done() {
+    GC_PENDING.store(false, Ordering::Release);
+    refresh_flag();
 }
 
 pub fn interrupt_flag_addr() -> *const u8 {
     &rscl_interrupt_flag as *const AtomicU8 as *const u8
+}
+
+static NEXT_THREAD: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static THREAD_ID: Cell<u64> = const { Cell::new(0) };
+    static IS_MAIN: Cell<bool> = const { Cell::new(false) };
+    /// The future this worker thread is computing (for cancellation).
+    static CURRENT_FUTURE: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// Inside a blocking runtime operation: idle for the collector, and cancellation
+    /// is noticed on the way out instead of through the global flag.
+    static BLOCKED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A small per-thread id (lazy seq ownership, locks, delays).
+pub fn thread_id() -> u64 {
+    THREAD_ID.with(|t| {
+        if t.get() == 0 {
+            t.set(NEXT_THREAD.fetch_add(1, Ordering::Relaxed));
+        }
+        t.get()
+    })
+}
+
+/// Mark the calling thread as the one Ctrl-C interrupts.
+pub fn set_main_thread() {
+    IS_MAIN.with(|m| m.set(true));
+}
+
+pub fn set_current_future(f: Option<Value>) {
+    CURRENT_FUTURE.with(|c| *c.borrow_mut() = f);
+}
+
+fn with_current_future<R>(f: impl FnOnce(&crate::obj::pending::PendingObj) -> R) -> Option<R> {
+    CURRENT_FUTURE.with(|c| c.borrow().as_ref().map(|v| f(crate::obj::pending::get(v))))
+}
+
+/// Entering a blocking runtime operation (`sleep`, a blocking `deref`, `locking`,
+/// `read-line`): the thread counts as stopped for the collector, and a cancellation
+/// targets it directly.
+pub fn enter_blocking() {
+    BLOCKED.with(|b| b.set(true));
+    with_current_future(|p| p.worker_blocked.store(true, Ordering::Release));
+    crate::gc::enter_idle();
+}
+
+/// Leaving a blocking operation (waits for a collection in progress first). A
+/// cancellation that arrived while blocked is raised now, so the next safepoint
+/// delivers it.
+pub fn leave_blocking() {
+    crate::gc::leave_idle();
+    with_current_future(|p| {
+        p.worker_blocked.store(false, Ordering::SeqCst);
+        if p.cancel.load(Ordering::SeqCst) {
+            p.raise_cancel();
+        }
+    });
+    BLOCKED.with(|b| b.set(false));
+}
+
+pub fn is_blocked() -> bool {
+    BLOCKED.with(|b| b.get())
+}
+
+/// Deliver a pending interrupt to this thread, if there is one for it: Ctrl-C on the
+/// main thread, or the cancellation of the future it is computing. A pending
+/// collection is joined first (unless the thread is inside a blocking operation,
+/// where it already counts as stopped).
+fn take_interrupt() -> Option<&'static str> {
+    if !is_blocked() && (GC_PENDING.load(Ordering::Acquire) || crate::gc::stopping()) {
+        crate::gc::safepoint();
+    }
+    if IS_MAIN.with(|m| m.get()) && CTRL_C.swap(false, Ordering::AcqRel) {
+        refresh_flag();
+        return Some("interrupted");
+    }
+    let cancelled = with_current_future(|p| {
+        if p.cancel.swap(false, Ordering::AcqRel) {
+            if p.cancel_counted.swap(false, Ordering::AcqRel) {
+                cancel_consumed();
+            }
+            true
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false);
+    if cancelled {
+        return Some("future cancelled");
+    }
+    None
+}
+
+/// For blocking runtime operations: throw if an interrupt is pending for this
+/// thread (checked directly; the global flag may not be raised for a blocked thread).
+pub fn check_interrupt() -> crate::exc::RtResult<()> {
+    if let Some(msg) = take_interrupt() {
+        return crate::exc::err(INTERRUPTED, msg);
+    }
+    Ok(())
 }
 
 thread_local! {
@@ -184,12 +338,18 @@ pub unsafe extern "C" fn rt_stack_check(sp: usize) -> Value {
     Value::NIL
 }
 
-/// Loop-header slow path: the flag was set. Clears it and throws.
+/// Loop-header slow path: the flag was set. Throws `InterruptedException` if the
+/// interrupt is for this thread; otherwise returns `nil` and the thread goes on
+/// (after taking part in a collection, if one is pending).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_interrupted() -> Value {
-    rscl_interrupt_flag.store(0, Ordering::Release);
-    crate::exc::throw_new(INTERRUPTED, "interrupted");
-    Value::EXC
+    match take_interrupt() {
+        Some(msg) => {
+            crate::exc::throw_new(INTERRUPTED, msg);
+            Value::EXC
+        }
+        None => Value::NIL,
+    }
 }
 
 /// Resolve a native symbol for the typed FFI at unit initialisation; null if missing.

@@ -87,6 +87,7 @@ builtins! {
     "realized?" => fn cf_realized_p(args) [1] {
         match args[0].kind() {
             Some(Kind::LazySeq) => Ok(Value::bool(lazyseq::is_realized(&args[0]))),
+            Some(Kind::Pending) => Ok(Value::bool(crate::obj::pending::get(&args[0]).is_realized())),
             _ => Ok(Value::TRUE),
         }
     }
@@ -95,15 +96,31 @@ builtins! {
         for x in coll::seq_iter(s) { x?; }
         Ok(s.owned())
     }
-    "dorun" => fn cf_dorun(args) [1, 2] {
-        for x in coll::seq_iter(&args[args.len() - 1]) { x?; }
+    "dorun" => fn cf_dorun(args; owned = taker) [1, 2] {
+        for x in coll::iter_owned(taker.take(args.len() - 1))? { x?; }
         Ok(Value::NIL)
     }
     "atom" => fn cf_atom(args) [; 1] { Ok(atom::new(args[0].owned())) }
     "atom?" => fn cf_atom_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Atom))) }
-    "deref" => fn cf_deref(args) [1] {
+    "deref" => fn cf_deref(args) [1, 3] {
+        if args.len() == 3
+            && !crate::obj::pending::as_pending(&args[0])
+                .is_some_and(|p| p.flavor != crate::obj::pending::Flavor::Delay)
+        {
+            return err(ILLEGAL_ARGUMENT, "deref with a timeout requires a future or promise");
+        }
         match args[0].kind() {
             Some(Kind::Atom) => Ok(atom::get(&args[0]).deref()),
+            Some(Kind::Pending) => {
+                let p = crate::obj::pending::get(&args[0]);
+                if args.len() == 3 {
+                    let ms = args::int(&args[1], "timeout-ms")?.max(0) as u64;
+                    let timeout = std::time::Duration::from_millis(ms);
+                    Ok(p.deref(Some(timeout))?.unwrap_or_else(|| args[2].owned()))
+                } else {
+                    Ok(p.deref(None)?.unwrap_or(Value::NIL))
+                }
+            }
             Some(Kind::Var) => {
                 let r = var::get(&args[0]).root();
                 if r.is_unbound() { std::mem::forget(r); return err(crate::obj::exception::ILLEGAL_STATE, format!("Var {} is unbound", var::get(&args[0]).qualified())); }

@@ -72,11 +72,12 @@ runtime_fns! {
     FnNew         = "rt_fn_new"         => crate::ffi::rt_fn_new : (I64, I64) -> I64;
     FnSetCapture  = "rt_fn_set_capture" => crate::ffi::rt_fn_set_capture : (I64, I64, I64);
     ThrowArity    = "rt_throw_arity"    => crate::ffi::rt_throw_arity : (I64, I64) -> I64;
-    Invoke        = "rt_invoke"         => crate::ffi::rt_invoke : (I64, I64, I64) -> I64;
-    ListFromSlice = "rt_list_from_slice" => crate::ffi::rt_list_from_slice : (I64, I64) -> I64;
-    VectorFromSlice = "rt_vector_from_slice" => crate::ffi::rt_vector_from_slice : (I64, I64) -> I64;
-    MapFromSlice  = "rt_map_from_slice" => crate::ffi::rt_map_from_slice : (I64, I64) -> I64;
-    SetFromSlice  = "rt_set_from_slice" => crate::ffi::rt_set_from_slice : (I64, I64) -> I64;
+    ReleaseArgs   = "rt_release_args"   => crate::ffi::rt_release_args : (I64, I64, I64);
+    Invoke        = "rt_invoke"         => crate::ffi::rt_invoke : (I64, I64, I64, I64) -> I64;
+    ListFromSlice = "rt_list_from_slice" => crate::ffi::rt_list_from_slice : (I64, I64, I64) -> I64;
+    VectorFromSlice = "rt_vector_from_slice" => crate::ffi::rt_vector_from_slice : (I64, I64, I64) -> I64;
+    MapFromSlice  = "rt_map_from_slice" => crate::ffi::rt_map_from_slice : (I64, I64, I64) -> I64;
+    SetFromSlice  = "rt_set_from_slice" => crate::ffi::rt_set_from_slice : (I64, I64, I64) -> I64;
     MakeImmortal  = "rt_make_immortal"  => crate::ffi::rt_make_immortal : (I64);
     PrStr         = "rt_pr_str"         => crate::ffi::rt_pr_str : (I64) -> I64;
     Prn           = "rt_prn"            => crate::ffi::rt_prn : (I64);

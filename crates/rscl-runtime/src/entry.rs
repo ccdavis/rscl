@@ -102,7 +102,15 @@ pub fn run_on_main_thread<F: FnOnce() -> i32 + Send + 'static>(f: F) -> i32 {
         .stack_size(MAIN_STACK_SIZE)
         .spawn(move || {
             crate::native::set_stack_limit_here(MAIN_STACK_SIZE);
-            f()
+            crate::native::set_main_thread();
+            crate::gc::register_thread();
+            let code = f();
+            // Like non-daemon JVM threads, running futures keep the process alive.
+            crate::native::enter_blocking();
+            crate::core::conc::join_all();
+            crate::native::leave_blocking();
+            crate::gc::unregister_thread();
+            code
         });
     match handle.map(|h| h.join()) {
         Ok(Ok(code)) => code,

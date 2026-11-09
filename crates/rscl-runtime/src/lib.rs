@@ -17,6 +17,7 @@ pub mod entry;
 pub mod equiv;
 pub mod exc;
 pub mod ffi;
+pub mod gc;
 pub mod native;
 pub mod ns;
 pub mod num;

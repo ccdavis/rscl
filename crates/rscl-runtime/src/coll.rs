@@ -79,9 +79,93 @@ pub struct SeqIter {
 }
 
 pub fn seq_iter(v: &Value) -> SeqIter {
+    seq_iter_owned(v.clone())
+}
+
+/// Walk a sequence the caller hands over: as the iterator advances, nothing else
+/// references the cells behind it, so a lazy sequence is freed as it is consumed.
+pub fn seq_iter_owned(v: Value) -> SeqIter {
     SeqIter {
-        cur: v.clone(),
+        cur: v,
         done: false,
+    }
+}
+
+/// A cons or lazy seq: walked cell by cell; everything else is a materialised
+/// collection with its own fast paths.
+pub fn is_lazy_kind(v: &Value) -> bool {
+    matches!(v.kind(), Some(Kind::Cons | Kind::LazySeq))
+}
+
+/// Elements of a value the caller hands over: a lazy sequence streams (its cells are
+/// freed as it is walked), any other collection is materialised once.
+pub enum OwnedIter {
+    Seq(SeqIter),
+    Vec(std::vec::IntoIter<Value>),
+}
+
+impl Iterator for OwnedIter {
+    type Item = RtResult<Value>;
+    fn next(&mut self) -> Option<RtResult<Value>> {
+        match self {
+            OwnedIter::Seq(it) => it.next(),
+            OwnedIter::Vec(it) => it.next().map(Ok),
+        }
+    }
+}
+
+pub fn iter_owned(v: Value) -> RtResult<OwnedIter> {
+    Ok(if is_lazy_kind(&v) {
+        OwnedIter::Seq(seq_iter_owned(v))
+    } else {
+        OwnedIter::Vec(to_vec(&v)?.into_iter())
+    })
+}
+
+/// `count` of a value the caller hands over (streams lazy sequences).
+pub fn count_owned(v: Value) -> RtResult<i64> {
+    if !is_lazy_kind(&v) {
+        return count(&v);
+    }
+    let mut n = 0;
+    for x in seq_iter_owned(v) {
+        x?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// `last` of a value the caller hands over (streams lazy sequences).
+pub fn last_owned(v: Value) -> RtResult<Value> {
+    if v.is_kind(Kind::Vector) {
+        return Ok(vector::get(&v).v.back().cloned().unwrap_or(Value::NIL));
+    }
+    let mut last = Value::NIL;
+    for x in iter_owned(v)? {
+        last = x?;
+    }
+    Ok(last)
+}
+
+/// `nth` of a value the caller hands over (streams lazy sequences).
+pub fn nth_owned(coll: Value, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
+    if !is_lazy_kind(&coll) || i < 0 {
+        return nth(&coll, i, not_found);
+    }
+    let mut n = 0i64;
+    for x in seq_iter_owned(coll) {
+        let x = x?;
+        if n == i {
+            return Ok(x);
+        }
+        n += 1;
+    }
+    match not_found {
+        Some(v) => Ok(v.clone()),
+        None => err(
+            INDEX_OUT_OF_BOUNDS,
+            format!("index {i} out of bounds for length {n}"),
+        ),
     }
 }
 
@@ -125,14 +209,7 @@ pub fn count(v: &Value) -> RtResult<i64> {
         Some(Kind::SortedMap) => sorted::map_get(v).m.len() as i64,
         Some(Kind::SortedSet) => sorted::set_get(v).s.len() as i64,
         Some(Kind::Instance) if types::is_record(v) => types::inst(v).count() as i64,
-        Some(Kind::Cons | Kind::LazySeq) => {
-            let mut n = 0;
-            for x in seq_iter(v) {
-                x?;
-                n += 1;
-            }
-            n
-        }
+        Some(Kind::Cons | Kind::LazySeq) => count_owned(v.clone())?,
         _ => {
             return err(
                 UNSUPPORTED,
@@ -234,10 +311,7 @@ pub fn second(v: &Value) -> RtResult<Value> {
 }
 
 pub fn last(v: &Value) -> RtResult<Value> {
-    Ok(match v.kind() {
-        Some(Kind::Vector) => vector::get(v).v.back().cloned().unwrap_or(Value::NIL),
-        _ => to_vec(v)?.pop().unwrap_or(Value::NIL),
-    })
+    last_owned(v.clone())
 }
 
 /// `cons`: onto `nil` or a list gives a list; onto anything else a cons cell whose
@@ -420,17 +494,7 @@ pub fn nth(coll: &Value, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
                 None => oob(l.count as usize),
             }
         }
-        Some(Kind::Cons | Kind::LazySeq) => {
-            let mut n = 0usize;
-            for x in seq_iter(coll) {
-                let x = x?;
-                if n == i as usize {
-                    return Ok(x);
-                }
-                n += 1;
-            }
-            oob(n)
-        }
+        Some(Kind::Cons | Kind::LazySeq) => nth_owned(coll.clone(), i, not_found),
         _ => err(
             UNSUPPORTED,
             format!("nth not supported on this type: {}", type_name(coll)),

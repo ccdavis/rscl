@@ -178,6 +178,13 @@ pub unsafe extern "C" fn rt_fn_set_capture(f: VRef, i: i64, v: Value) {
     unsafe { func::set_capture(&f, i as usize, v) }
 }
 
+/// Release handed-over arguments on a prologue failure (arity mismatch, stack
+/// overflow, interrupt), before any parameter was bound.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_release_args(argv: *const Value, argc: i64, owned: u64) {
+    unsafe { crate::core::release_owned(argv, argc, owned) }
+}
+
 /// Arity failure for a compiled function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_throw_arity(f: VRef, argc: i64) -> Value {
@@ -188,14 +195,17 @@ pub unsafe extern "C" fn rt_throw_arity(f: VRef, argc: i64) -> Value {
 }
 
 /// The general call path: anything callable that is not a plain fn object (keywords,
-/// maps, vectors, sets, vars), plus the "not a function" error.
+/// maps, vectors, sets, vars), plus the "not a function" error. Owned arguments are
+/// released here, after the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_invoke(f: VRef, argc: i64, argv: *const Value) -> Value {
+pub unsafe extern "C" fn rt_invoke(f: VRef, argc: i64, argv: *const Value, owned: u64) -> Value {
     let args = unsafe { args_slice(argv, argc) };
-    match invoke(&f, args) {
+    let r = match invoke(&f, args) {
         Ok(v) => v,
         Err(_) => Value::EXC,
-    }
+    };
+    unsafe { crate::core::release_owned(argv, argc, owned) };
+    r
 }
 
 /// Invoke any callable from Rust.
@@ -215,7 +225,7 @@ pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
             } else {
                 args.as_ptr() as *const Value
             };
-            let r = unsafe { (proto.entry)(f.ptr() as *const FnObj, args.len() as i64, argv) };
+            let r = unsafe { (proto.entry)(f.ptr() as *const FnObj, args.len() as i64, argv, 0) };
             exc::check(r)
         }
         Some(Kind::Keyword | Kind::Map | Kind::Set | Kind::SortedMap | Kind::SortedSet) => {
@@ -284,40 +294,43 @@ impl Value {
 
 // ---- collections -------------------------------------------------------------------
 
+/// Move the values out of `items` (owned slots are taken, borrowed ones retained).
+unsafe fn take_slice(items: *const Value, n: i64, owned: u64) -> Vec<Value> {
+    let t = crate::core::Taker::new(items, n, owned);
+    (0..n.max(0) as usize).map(|i| t.take(i)).collect()
+}
+
 /// Build the rest-argument list of a variadic call: `nil` when there are no extra
 /// arguments (Clojure semantics), otherwise a list.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_list_from_slice(items: *const Value, n: i64) -> Value {
+pub unsafe extern "C" fn rt_list_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
     if n <= 0 {
         return Value::NIL;
     }
-    let items = unsafe { args_slice(items, n) };
-    list::from_iter(items.iter().map(|x| x.owned()))
+    list::from_iter(unsafe { take_slice(items, n, owned) })
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_vector_from_slice(items: *const Value, n: i64) -> Value {
-    let items = unsafe { args_slice(items, n) };
-    vector::from_iter(items.iter().map(|x| x.owned()))
+pub unsafe extern "C" fn rt_vector_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
+    vector::from_iter(unsafe { take_slice(items, n, owned) })
 }
 
 /// Alternating keys and values.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_map_from_slice(items: *const Value, n: i64) -> Value {
-    let items = unsafe { args_slice(items, n) };
+pub unsafe extern "C" fn rt_map_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
     let mut m = map::empty_map();
-    for kv in items.chunks(2) {
-        m.insert(kv[0].owned(), kv[1].owned());
+    let mut it = unsafe { take_slice(items, n, owned) }.into_iter();
+    while let (Some(k), Some(v)) = (it.next(), it.next()) {
+        m.insert(k, v);
     }
     map::new(m)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_set_from_slice(items: *const Value, n: i64) -> Value {
-    let items = unsafe { args_slice(items, n) };
+pub unsafe extern "C" fn rt_set_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
     let mut s = set::empty_set();
-    for x in items {
-        s.insert(x.owned());
+    for x in unsafe { take_slice(items, n, owned) } {
+        s.insert(x);
     }
     set::new(s)
 }
@@ -336,7 +349,7 @@ pub fn make_immortal(v: &Value) {
         return;
     }
     h.rc.store(crate::value::IMMORTAL, std::sync::atomic::Ordering::Relaxed);
-    crate::value::note_freed();
+    crate::value::note_freed(h.kind);
     crate::value::register_immortal(v.bits() as usize);
     match v.kind() {
         Some(Kind::List) => {
@@ -354,7 +367,7 @@ pub fn make_immortal(v: &Value) {
                     break;
                 }
                 h.rc.store(crate::value::IMMORTAL, std::sync::atomic::Ordering::Relaxed);
-                crate::value::note_freed();
+                crate::value::note_freed(h.kind);
                 crate::value::register_immortal(cell.rest.bits() as usize);
                 cell = next;
             }

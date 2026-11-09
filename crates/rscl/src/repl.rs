@@ -73,7 +73,10 @@ pub fn run(paths: &[String]) -> i32 {
         } else {
             "  #_=> ".to_string()
         };
-        match rl.readline(&prompt) {
+        rscl_runtime::gc::enter_idle();
+        let line = rl.readline(&prompt);
+        rscl_runtime::gc::leave_idle();
+        match line {
             Ok(line) => {
                 buffer.push_str(&line);
                 buffer.push('\n');

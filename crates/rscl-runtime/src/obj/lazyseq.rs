@@ -1,9 +1,7 @@
 //! Lazy sequences: a thunk that is run at most once, on first `seq`, and replaced by
 //! its result. Thread-safe; a thread that re-enters its own realisation gets an
 //! `IllegalStateException` instead of a deadlock.
-use std::cell::Cell;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Kind, alloc, cast};
 use crate::exc::{RtResult, err};
@@ -23,18 +21,8 @@ pub struct LazySeqObj {
     state: Mutex<State>,
 }
 
-static NEXT_THREAD: AtomicU64 = AtomicU64::new(1);
-thread_local! {
-    static THREAD_ID: Cell<u64> = const { Cell::new(0) };
-}
-
 fn thread_id() -> u64 {
-    THREAD_ID.with(|t| {
-        if t.get() == 0 {
-            t.set(NEXT_THREAD.fetch_add(1, Ordering::Relaxed));
-        }
-        t.get()
-    })
+    crate::native::thread_id()
 }
 
 /// Wrap a zero-argument fn.
@@ -43,6 +31,27 @@ pub fn new(thunk: Value) -> Value {
         hdr: ObjHeader::new(Kind::LazySeq),
         state: Mutex::new(State::Unrealized(thunk)),
     })
+}
+
+/// Slots the collector walks (the world is stopped).
+///
+/// # Safety
+/// `p` is a live lazy seq and no other thread runs.
+pub(crate) unsafe fn gc_slots(p: *mut LazySeqObj) -> Vec<*const Value> {
+    let o = unsafe { &mut *p };
+    match o.state.get_mut().unwrap_or_else(|e| e.into_inner()) {
+        State::Unrealized(v) | State::Realized(v) => vec![v as *const Value],
+        State::Realizing(_) => Vec::new(),
+    }
+}
+
+/// Drop every reference a garbage lazy seq holds.
+///
+/// # Safety
+/// `p` is an unreachable lazy seq and no other thread runs.
+pub(crate) unsafe fn gc_unlink(p: *mut LazySeqObj) {
+    let o = unsafe { &mut *p };
+    *o.state.get_mut().unwrap_or_else(|e| e.into_inner()) = State::Realized(Value::NIL);
 }
 
 pub fn get(v: &Value) -> &LazySeqObj {
@@ -73,8 +82,14 @@ pub fn realize(v: &Value) -> RtResult<Value> {
                 );
             }
             State::Realizing(_) => {
+                // Another thread is realising it: wait as a blocking operation (idle
+                // for the collector, interruptible).
                 drop(g);
-                std::thread::yield_now();
+                crate::native::enter_blocking();
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                let check = crate::native::check_interrupt();
+                crate::native::leave_blocking();
+                check?;
                 continue;
             }
             State::Unrealized(_) => {

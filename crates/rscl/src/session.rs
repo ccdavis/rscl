@@ -189,6 +189,12 @@ pub fn eval_source(src: &str, file: &str) -> Result<Value, EvalError> {
 /// The runtime's hook for `require` / `load-file`: locate the source, compile and run
 /// it (and, when building, collect its units into a loader fn for the binary).
 fn dynamic_loader(key: &str) -> rscl_runtime::RtResult<()> {
+    if !is_active() {
+        return exc::err(
+            rscl_runtime::obj::exception::ILLEGAL_STATE,
+            format!("cannot load {key}: code is compiled on the main thread only"),
+        );
+    }
     let paths = with(|s| s.paths.clone());
     let (path, display) = match key.strip_prefix("file:") {
         Some(p) => (PathBuf::from(p), p.to_string()),

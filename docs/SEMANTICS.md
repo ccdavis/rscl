@@ -15,7 +15,10 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   lists and vectors are equal when their elements are. Fns, vars and atoms compare by
   identity.
 - Strings count Unicode scalar values, not UTF-16 units. `(str nil)` is `""`.
-- Keywords are interned and immortal (the table only grows). Symbols are not interned.
+- Keywords are interned, so `=` is identity, but the table holds them weakly: a
+  keyword created at run time (`(keyword s)`) is freed with its last reference, so
+  untrusted input cannot grow it without bound. Keywords in compiled code stay
+  interned for the process. Symbols are not interned.
 - Doubles print like Java (`1.0`, `1.0E7`, `1.5E-7`, `##Inf`, `##NaN`).
 
 ## Functions and evaluation
@@ -212,11 +215,58 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 - `rscl build --opt` compiles with Cranelift's `speed` level and drops unreferenced
   functions at link time. The JIT uses the fast single-pass register allocator.
 
+## Concurrency
+
+- `future` runs its body on a new thread (a 64 MB stack); `deref`/`@` blocks for the
+  result, rethrows an exception the body threw, and `(deref f ms timeout-val)` gives
+  up after `ms`. The creating thread's dynamic bindings are conveyed to the future's
+  thread, as in Clojure. `future-cancel` interrupts a running future at its next
+  safepoint (fn entry, loop header, `sleep`, a blocking `deref` or `locking`) with
+  `InterruptedException`; dereferencing a cancelled future throws
+  `CancellationException`. A program waits for its running futures before exiting,
+  like non-daemon JVM threads.
+- `promise`/`deliver` (first delivery wins), `delay`/`force` (the body runs once, on
+  the dereferencing thread; a thrown exception is rethrown by later derefs),
+  `pmap`, `pcalls`, `pvalues` (semi-lazy, `available-processors` + 2 ahead),
+  `locking` (a reentrant lock per object identity; immediates cannot be locked),
+  `(sleep ms)`, `thread-id`.
+- Everything in the runtime is safe to share between threads: refcounts are atomic,
+  collections are persistent, vars lock their roots, atoms are compare-and-swap,
+  lazy sequences realise under a lock, keyword interning is locked. Code is loaded
+  and compiled on the main thread only: `require`, `load-file` and `eval` from a
+  future throw `IllegalStateException`. Ctrl-C interrupts the main thread's
+  evaluation only. There are no agents, refs or STM.
+
 ## Memory
 
 - Heap objects are reference counted (atomic). Compile-time constants are immortal.
-- Cycles leak. The known sources are `letfn` (mutually recursive closures) and an
-  atom that holds a closure referring back to the atom.
+- Hash maps and sets use a deterministic hash by default (iteration order is the
+  same in every run and in JIT and AOT, as in Clojure). `RSCL_HASH_SEED=random`
+  (or `0`) mixes keys with a per-process secret so attacker-chosen keys cannot be
+  made to collide, and a non-zero number is a fixed secret; iteration order then
+  differs from the default. Any other value is reported on stderr and ignored.
+- Locals are cleared at their last use (as Clojure does): the value moves out of the
+  variable into the expression that uses it, so a function that passes a sequence on
+  stops holding its head. Arguments a caller no longer needs are handed over to the
+  callee (fns receive an ownership mask beside `argc`/`argv`), and the consuming core
+  fns (`reduce`, `count`, `nth`, `last`, `dorun`, `into`, `frequencies`) take them
+  over and walk them cell by cell. `(reduce + (range n))` therefore runs in constant
+  memory; a sequence held by a var or by a local used again later is kept, as in
+  Clojure.
+- Reference cycles are collected. Everything except atoms and pending values
+  (futures, promises, delays) is immutable once shared, so a cycle must pass through
+  one of them. An atom or pending value becomes a candidate when it is written or
+  when it loses a reference without dying; once enough new candidates have
+  accumulated (1024, more after a collection that walked much live data), or on
+  `(gc)` (which returns the number of objects freed; `(gc-count)` counts
+  collections), trial deletion runs from the candidates with every other thread
+  stopped at a safepoint. Candidates found live stay under watch for a few
+  collections, then drop out until they change again. A persistent collection on
+  the way is counted through only when it is the sole owner of its node tree (the
+  collector rebuilds it, which can unshare structure); a collection with more than
+  one reference is treated as holding its contents from outside. Cycles through a
+  native object's payload are not seen. A thread stuck in a long native call delays
+  a collection; `(gc)` throws if the others cannot be stopped within 200 ms.
 
 ## Programs
 

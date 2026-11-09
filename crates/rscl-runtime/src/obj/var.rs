@@ -83,6 +83,30 @@ pub fn pop_bindings() -> bool {
     BINDINGS.with(|b| b.borrow_mut().pop().is_some())
 }
 
+/// The thread's current bindings flattened (innermost wins), for conveying them to a
+/// future's thread.
+pub fn snapshot_bindings() -> Vec<(usize, Value)> {
+    BINDINGS.with(|b| {
+        let mut flat: HashMap<usize, Value> = HashMap::new();
+        for frame in b.borrow().iter() {
+            for (k, v) in frame {
+                flat.insert(*k, v.clone());
+            }
+        }
+        flat.into_iter().collect()
+    })
+}
+
+/// Install a snapshot as this thread's single binding frame; true if a frame was
+/// pushed (to be popped when the thread finishes).
+pub fn install_bindings(bindings: Vec<(usize, Value)>) -> bool {
+    if bindings.is_empty() {
+        return false;
+    }
+    BINDINGS.with(|b| b.borrow_mut().push(bindings.into_iter().collect()));
+    true
+}
+
 fn thread_binding(var: &VarObj) -> Option<Value> {
     let key = var as *const VarObj as usize;
     BINDINGS.with(|b| {

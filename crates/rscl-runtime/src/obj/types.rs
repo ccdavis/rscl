@@ -118,6 +118,7 @@ pub fn builtin_name(key: u64) -> &'static str {
             Some(Kind::Native) => "Native",
             Some(Kind::Type) => "Type",
             Some(Kind::Protocol) => "Protocol",
+            Some(Kind::Pending) => "Pending",
             _ => "Object",
         },
     }
@@ -152,6 +153,7 @@ const ALL_KINDS: &[Kind] = &[
     Kind::Protocol,
     Kind::SortedMap,
     Kind::SortedSet,
+    Kind::Pending,
 ];
 
 /// The dispatch key of any value.

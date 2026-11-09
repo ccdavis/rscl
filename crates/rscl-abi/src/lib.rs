@@ -4,19 +4,24 @@
 //! The runtime calls it with a pointer to its `RtApi` table; the library keeps the
 //! pointer and talks to the runtime only through it, so the process has exactly one
 //! runtime (one interning table, one refcount implementation). Values cross the
-//! boundary as raw 64-bit words: arguments are borrowed, results are owned (+1).
+//! boundary as raw 64-bit words: results are owned (+1); an argument is owned by the
+//! callee when its bit in the `owned` mask is set (the callee must release it) and
+//! borrowed otherwise.
 #![no_std]
 
 use core::ffi::c_void;
 
 /// Bump when `RtApi` changes incompatibly.
-pub const API_VERSION: u32 = 2;
+pub const API_VERSION: u32 = 3;
 
 /// The symbol every bridge library exports.
 pub const REGISTER_SYMBOL: &str = "rscl_module_register";
 
-/// The uniform calling convention of every rscl fn (compiled or native).
-pub type Entry = unsafe extern "C" fn(f: *const c_void, argc: i64, argv: *const u64) -> u64;
+/// The uniform calling convention of every rscl fn (compiled or native). Bit `i` of
+/// `owned` set means the callee owns `argv[i]` (it releases that reference, or moves
+/// it out; the slot is never written).
+pub type Entry =
+    unsafe extern "C" fn(f: *const c_void, argc: i64, argv: *const u64, owned: u64) -> u64;
 
 /// Destructor for a native object's payload.
 pub type DropFn = unsafe extern "C" fn(data: *mut c_void);

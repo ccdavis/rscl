@@ -8,6 +8,24 @@ use crate::obj::exception::{ILLEGAL_ARGUMENT, RUNTIME};
 use crate::obj::string;
 use crate::value::Value;
 
+fn read_line_blocking() -> crate::exc::RtResult<Value> {
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(0) => Ok(Value::NIL),
+        Ok(_) => {
+            if line.ends_with('\n') {
+                line.pop();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+            }
+            Ok(string::from_string(line))
+        }
+        Err(e) => err(RUNTIME, format!("read-line: {e}")),
+    }
+}
+
 builtins! {
     "slurp" => fn cf_slurp(args) [1] {
         let path = args::string(&args[0], "path")?;
@@ -26,16 +44,10 @@ builtins! {
     }
     "read-line" => fn cf_read_line(args) [0] {
         let _ = args;
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        match std::io::stdin().lock().read_line(&mut line) {
-            Ok(0) => Ok(Value::NIL),
-            Ok(_) => {
-                if line.ends_with('\n') { line.pop(); if line.ends_with('\r') { line.pop(); } }
-                Ok(string::from_string(line))
-            }
-            Err(e) => err(RUNTIME, format!("read-line: {e}")),
-        }
+        crate::native::enter_blocking();
+        let r = read_line_blocking();
+        crate::native::leave_blocking();
+        r
     }
     "read-string" => fn cf_read_string(args) [1] {
         let s = args::string(&args[0], "s")?;

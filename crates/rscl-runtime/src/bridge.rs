@@ -175,7 +175,7 @@ unsafe extern "C" fn api_map_entries(m: u64) -> u64 {
     }
 }
 unsafe extern "C" fn api_invoke(f: u64, argc: i64, argv: *const u64) -> u64 {
-    unsafe { crate::ffi::rt_invoke(borrowed(f), argc, argv as *const Value) }.into_raw()
+    unsafe { crate::ffi::rt_invoke(borrowed(f), argc, argv as *const Value, 0) }.into_raw()
 }
 unsafe extern "C" fn api_throw(
     class: *const u8,

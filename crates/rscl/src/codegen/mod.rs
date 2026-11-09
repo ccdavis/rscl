@@ -7,6 +7,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod liveness;
+use liveness::Liveness;
+
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
@@ -143,11 +146,12 @@ fn internal(e: impl std::fmt::Display) -> CompileError {
 }
 
 /// The uniform calling convention: `(f, argc, argv) -> value`.
+/// `entry(f, argc, argv, owned) -> Value`: see `rscl_runtime::obj::func::Entry`.
 pub fn fn_signature<M: Module>(module: &M) -> Signature {
     let mut sig = module.make_signature();
-    sig.params.push(AbiParam::new(types::I64));
-    sig.params.push(AbiParam::new(types::I64));
-    sig.params.push(AbiParam::new(types::I64));
+    for _ in 0..4 {
+        sig.params.push(AbiParam::new(types::I64));
+    }
     sig.returns.push(AbiParam::new(types::I64));
     sig
 }
@@ -468,6 +472,7 @@ impl<M: Module> Compiler<M> {
             fc.b.switch_to_block(entry);
             fc.b.seal_block(entry);
             fc.start(argv_cap, locals)?;
+            fc.liveness = liveness::last_uses(node);
             let op = fc.compile(node)?;
             let op = fc.make_owned(op);
             fc.b.ins().return_(&[op.val]);
@@ -497,13 +502,27 @@ impl<M: Module> Compiler<M> {
             fc.b.switch_to_block(entry);
             fc.b.seal_block(entry);
             let params = fc.b.block_params(entry).to_vec();
-            let (fv, argc, argv) = (params[0], params[1], params[2]);
+            let (fv, argc, argv, owned) = (params[0], params[1], params[2], params[3]);
             fc.start(argv_cap, locals)?;
-            // Stack-depth and interrupt guard. Nothing is live yet, so the exception
-            // path simply returns EXC.
+            for a in &f.arities {
+                fc.liveness.extend(liveness::last_uses(&a.body));
+            }
+            // Stack-depth and interrupt guard. No locals are bound yet, but the
+            // arguments the caller handed over must still be released on failure.
             let sp = fc.b.ins().get_stack_pointer(types::I64);
             let guard = fc.call_rt(RtFn::StackCheck, &[sp]).unwrap();
-            fc.check_exc(guard);
+            let is_exc =
+                fc.b.ins()
+                    .icmp_imm_s(IntCC::Equal, guard, api::consts::EXC as i64);
+            let fail = fc.b.create_block();
+            let ok = fc.b.create_block();
+            fc.b.ins().brif(is_exc, fail, &[], ok, &[]);
+            fc.b.switch_to_block(fail);
+            fc.b.seal_block(fail);
+            fc.call_rt(RtFn::ReleaseArgs, &[argv, argc, owned]);
+            fc.b.ins().return_(&[guard]);
+            fc.b.switch_to_block(ok);
+            fc.b.seal_block(ok);
 
             // Captures live in the fn object; the fn object is alive for the whole call.
             for (i, id) in f.captures.iter().enumerate() {
@@ -535,12 +554,13 @@ impl<M: Module> Compiler<M> {
                 fc.b.seal_block(next);
             }
             let r = fc.call_rt(RtFn::ThrowArity, &[fv, argc]).unwrap();
+            fc.call_rt(RtFn::ReleaseArgs, &[argv, argc, owned]);
             fc.b.ins().return_(&[r]);
 
             for (i, a) in f.arities.iter().enumerate() {
                 fc.b.switch_to_block(blocks[i]);
                 fc.b.seal_block(blocks[i]);
-                fc.compile_arity(a, argv, argc)?;
+                fc.compile_arity(a, argv, argc, owned)?;
             }
             Ok(())
         })
@@ -638,6 +658,7 @@ impl<M: Module> Compiler<M> {
                 if matches!(
                     c,
                     ConstEntry::Str(_)
+                        | ConstEntry::Keyword(..)
                         | ConstEntry::Symbol(..)
                         | ConstEntry::Double(_)
                         | ConstEntry::Long(_)
@@ -732,6 +753,10 @@ enum Own {
     Borrowed,
     /// A +1 reference the holder must release or hand over.
     Owned,
+    /// A parameter passed on at its last use: owned exactly when the caller handed
+    /// it over, which the runtime flag (non-zero: owned) records. Flows into the
+    /// callee's mask unchanged, so pass-through of a borrowed argument costs nothing.
+    Cond(Value),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -762,13 +787,38 @@ impl Operand {
 enum Cleanup {
     Val(Value),
     Var(Variable),
+    /// A parameter: owned only when its bit is set in the function's ownership mask.
+    Param(Variable, u64),
+    /// An already-read parameter value with its mask bit.
+    ValIf(Value, u64),
+    /// A temporary owned when the flag value is non-zero (`Own::Cond`).
+    ValIfFlag(Value, Value),
+}
+
+/// How a value slot owns its contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owning {
+    /// Borrowed from elsewhere (a capture, the fn object itself).
+    No,
+    /// A +1 reference released at the end of the scope.
+    Yes,
+    /// A parameter: owned when its bit is set in the function's ownership mask.
+    Param(u64),
+}
+
+#[derive(Clone, Copy)]
+struct LoopVar {
+    var: Variable,
+    /// Primitive loop variables hold raw bits.
+    ty: Ty,
+    /// For fn parameters: the bit in the ownership mask (set once `recur` rebinds).
+    param_bit: Option<u64>,
 }
 
 #[derive(Clone)]
 struct LoopCtx {
     header: Block,
-    /// Loop variables with their static types (primitive ones hold raw bits).
-    vars: Vec<(Variable, Ty)>,
+    vars: Vec<LoopVar>,
     /// `cleanup.len()` right after the loop variables were bound: everything above it
     /// was bound or produced inside the body and must be released before `recur`.
     depth: usize,
@@ -779,6 +829,7 @@ struct Slot {
     var: Variable,
     /// `Val`: a tagged value. `Long`/`Double`: raw `i64`/`f64` in the variable.
     ty: Ty,
+    owning: Owning,
 }
 
 fn raw_type(ty: Ty) -> cranelift_codegen::ir::Type {
@@ -808,6 +859,11 @@ struct FnCtx<'a, M: Module> {
     /// The analyzer's locals table (names for diagnostics, types for inference).
     local_infos: Vec<LocalInfo>,
     ty_cache: TyCache,
+    /// Last uses of locals (see `liveness`): the value is transferred out and the
+    /// variable cleared.
+    liveness: Liveness,
+    /// The `owned` argument mask, as a variable so `recur` can set bits.
+    owned_mask: Option<Variable>,
     /// Active `try` handlers, innermost last.
     handlers: Vec<Handler>,
     flag_id: DataId,
@@ -854,6 +910,8 @@ impl<'a, M: Module> FnCtx<'a, M> {
             call_sig,
             local_infos: Vec::new(),
             ty_cache: TyCache::new(),
+            liveness: Liveness::default(),
+            owned_mask: None,
             handlers: Vec::new(),
             flag_id,
             flag_addr: None,
@@ -1011,8 +1069,10 @@ impl<'a, M: Module> FnCtx<'a, M> {
     // ---- ownership helpers --------------------------------------------------------
 
     fn release(&mut self, op: Operand) {
-        if op.own == Own::Owned {
-            self.emit_release(op.val);
+        match op.own {
+            Own::Owned => self.emit_release(op.val),
+            Own::Cond(flag) => self.emit_release_if(flag, op.val),
+            _ => {}
         }
     }
 
@@ -1021,6 +1081,10 @@ impl<'a, M: Module> FnCtx<'a, M> {
         match op.own {
             Own::Borrowed => {
                 self.emit_retain(op.val);
+                Operand::owned(op.val)
+            }
+            Own::Cond(flag) => {
+                self.emit_retain_if_not(flag, op.val);
                 Operand::owned(op.val)
             }
             _ => op,
@@ -1082,16 +1146,18 @@ impl<'a, M: Module> FnCtx<'a, M> {
     }
 
     fn push_tmp(&mut self, op: Operand) {
-        if op.own == Own::Owned {
-            self.cleanup.push(Cleanup::Val(op.val));
+        match op.own {
+            Own::Owned => self.cleanup.push(Cleanup::Val(op.val)),
+            Own::Cond(flag) => self.cleanup.push(Cleanup::ValIfFlag(op.val, flag)),
+            _ => {}
         }
     }
 
     fn pop_tmp(&mut self, op: Operand) {
-        if op.own == Own::Owned {
+        if matches!(op.own, Own::Owned | Own::Cond(_)) {
             let top = self.cleanup.pop();
             debug_assert!(
-                matches!(top, Some(Cleanup::Val(v)) if v == op.val),
+                matches!(top, Some(Cleanup::Val(v) | Cleanup::ValIfFlag(v, _)) if v == op.val),
                 "owned-temporary stack mismatch"
             );
         }
@@ -1100,19 +1166,138 @@ impl<'a, M: Module> FnCtx<'a, M> {
     fn bind_local(&mut self, id: LocalId, val: Value, owned: bool) -> Variable {
         let var = self.b.declare_var(types::I64);
         self.b.def_var(var, val);
-        self.locals.insert(id, Slot { var, ty: Ty::Val });
+        let owning = if owned { Owning::Yes } else { Owning::No };
+        self.locals.insert(
+            id,
+            Slot {
+                var,
+                ty: Ty::Val,
+                owning,
+            },
+        );
         if owned {
             self.cleanup.push(Cleanup::Var(var));
         }
         var
     }
 
+    /// Bind parameter `j`, owned when bit `j` of the function's mask is set.
+    fn bind_param(&mut self, id: LocalId, val: Value, j: usize) -> Variable {
+        let var = self.b.declare_var(types::I64);
+        self.b.def_var(var, val);
+        let bit = 1u64 << j;
+        self.locals.insert(
+            id,
+            Slot {
+                var,
+                ty: Ty::Val,
+                owning: Owning::Param(bit),
+            },
+        );
+        self.cleanup.push(Cleanup::Param(var, bit));
+        var
+    }
+
+    /// `mask & bit != 0` for the function's ownership mask.
+    fn owned_bit(&mut self, bit: u64) -> Value {
+        let mask = self.owned_mask.expect("ownership mask");
+        let m = self.b.use_var(mask);
+        self.b.ins().band_imm_s(m, bit as i64)
+    }
+
     /// Bind a primitive local holding raw bits (no refcounting).
     fn bind_typed(&mut self, id: LocalId, raw: Value, ty: Ty) -> Variable {
         let var = self.b.declare_var(raw_type(ty));
         self.b.def_var(var, raw);
-        self.locals.insert(id, Slot { var, ty });
+        self.locals.insert(
+            id,
+            Slot {
+                var,
+                ty,
+                owning: Owning::No,
+            },
+        );
         var
+    }
+
+    /// Release the value held by a cleanup entry.
+    fn release_cleanup(&mut self, c: Cleanup) {
+        match c {
+            Cleanup::Val(v) => self.emit_release(v),
+            Cleanup::Var(var) => {
+                let v = self.b.use_var(var);
+                self.emit_release(v);
+            }
+            Cleanup::Param(var, bit) => {
+                let v = self.b.use_var(var);
+                let f = self.owned_bit(bit);
+                self.emit_release_if(f, v);
+            }
+            Cleanup::ValIf(v, bit) => {
+                let f = self.owned_bit(bit);
+                self.emit_release_if(f, v);
+            }
+            Cleanup::ValIfFlag(v, flag) => self.emit_release_if(flag, v),
+        }
+    }
+
+    /// Release a run of cleanup entries (newest first). Parameters are all borrowed
+    /// in the common case, so their conditional releases sit behind one test of the
+    /// whole mask.
+    fn release_cleanups(&mut self, items: &[Cleanup]) {
+        let mut i = 0;
+        while i < items.len() {
+            if let Cleanup::Param(..) | Cleanup::ValIf(..) = items[i] {
+                let mut j = i;
+                while j < items.len() && matches!(items[j], Cleanup::Param(..) | Cleanup::ValIf(..))
+                {
+                    j += 1;
+                }
+                let mask = self.owned_mask.expect("ownership mask");
+                let m = self.b.use_var(mask);
+                let do_b = self.b.create_block();
+                let cont = self.b.create_block();
+                self.b.ins().brif(m, do_b, &[], cont, &[]);
+                self.b.switch_to_block(do_b);
+                self.b.seal_block(do_b);
+                for c in &items[i..j] {
+                    self.release_cleanup(*c);
+                }
+                self.b.ins().jump(cont, &[]);
+                self.b.switch_to_block(cont);
+                self.b.seal_block(cont);
+                i = j;
+            } else {
+                self.release_cleanup(items[i]);
+                i += 1;
+            }
+        }
+    }
+
+    /// `emit_release(v)` when `flag` is non-zero.
+    fn emit_release_if(&mut self, flag: Value, v: Value) {
+        let do_b = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.ins().brif(flag, do_b, &[], cont, &[]);
+        self.b.switch_to_block(do_b);
+        self.b.seal_block(do_b);
+        self.emit_release(v);
+        self.b.ins().jump(cont, &[]);
+        self.b.switch_to_block(cont);
+        self.b.seal_block(cont);
+    }
+
+    /// `emit_retain(v)` when `flag` is zero (a borrowed parameter being taken over).
+    fn emit_retain_if_not(&mut self, flag: Value, v: Value) {
+        let do_b = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.ins().brif(flag, cont, &[], do_b, &[]);
+        self.b.switch_to_block(do_b);
+        self.b.seal_block(do_b);
+        self.emit_retain(v);
+        self.b.ins().jump(cont, &[]);
+        self.b.switch_to_block(cont);
+        self.b.seal_block(cont);
     }
 
     fn slot(&self, id: LocalId) -> CResult<Slot> {
@@ -1136,14 +1321,41 @@ impl<'a, M: Module> FnCtx<'a, M> {
         ty_of_memo(node, &self.local_infos, &mut self.ty_cache)
     }
 
-    /// A local as a tagged value, boxing a primitive one.
-    fn read_local(&mut self, id: LocalId) -> CResult<Operand> {
+    /// A local as a tagged value, boxing a primitive one. At the local's last use
+    /// (`at`: the using node) an owned value is transferred out and the variable
+    /// cleared, so the function stops holding it.
+    fn read_local(&mut self, at: usize, id: LocalId) -> CResult<Operand> {
         let slot = self.slot(id)?;
         let raw = self.b.use_var(slot.var);
-        Ok(match slot.ty {
-            Ty::Val => Operand::borrowed(raw),
-            ty => self.box_raw(raw, ty),
-        })
+        if slot.ty != Ty::Val {
+            return Ok(self.box_raw(raw, slot.ty));
+        }
+        if self.liveness.retain.contains(&(at, id)) {
+            // Pending as an argument while a later argument transfers this local.
+            return Ok(self.make_owned(Operand::borrowed(raw)));
+        }
+        if !self.liveness.last.contains(&(at, id)) {
+            return Ok(Operand::borrowed(raw));
+        }
+        match slot.owning {
+            Owning::No => Ok(Operand::borrowed(raw)),
+            Owning::Yes => {
+                let nil = self.b.ins().iconst(types::I64, 0);
+                self.b.def_var(slot.var, nil);
+                Ok(Operand::owned(raw))
+            }
+            Owning::Param(bit) => {
+                // Owned exactly when the caller handed it over; the flag travels with
+                // the value, so a borrowed argument is passed on without refcounting.
+                let f = self.owned_bit(bit);
+                let nil = self.b.ins().iconst(types::I64, 0);
+                self.b.def_var(slot.var, nil);
+                Ok(Operand {
+                    val: raw,
+                    own: Own::Cond(f),
+                })
+            }
+        }
     }
 
     // ---- primitives -----------------------------------------------------------------
@@ -1577,18 +1789,21 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
     /// Release and forget owned locals in reverse order of binding.
     fn release_locals(&mut self, vars: &[(LocalId, Variable, bool)]) {
+        let mut items = Vec::new();
         for (id, var, owned) in vars.iter().rev() {
             if *owned {
                 let top = self.cleanup.pop();
                 debug_assert!(
-                    matches!(top, Some(Cleanup::Var(v)) if v == *var),
+                    matches!(top, Some(Cleanup::Var(v) | Cleanup::Param(v, _)) if v == *var),
                     "cleanup stack mismatch"
                 );
-                let v = self.b.use_var(*var);
-                self.emit_release(v);
+                if let Some(c) = top {
+                    items.push(c);
+                }
             }
             self.locals.remove(id);
         }
+        self.release_cleanups(&items);
     }
 
     /// After a call: branch to a cleanup block that releases every live owned operand
@@ -1617,13 +1832,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
             None => (0, None),
         };
         let items: Vec<Cleanup> = self.cleanup[floor..].iter().rev().copied().collect();
-        for c in items {
-            let v = match c {
-                Cleanup::Val(v) => v,
-                Cleanup::Var(var) => self.b.use_var(var),
-            };
-            self.emit_release(v);
-        }
+        self.release_cleanups(&items);
         match target {
             Some(block) => {
                 self.b.ins().jump(block, &[]);
@@ -1654,7 +1863,9 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.b.switch_to_block(hit);
         self.b.seal_block(hit);
         let r = self.call_rt(RtFn::Interrupted, &[]).unwrap();
-        self.emit_exc_path(r);
+        // Not necessarily for this thread: `nil` means carry on.
+        self.check_exc(r);
+        self.b.ins().jump(cont, &[]);
         self.b.switch_to_block(cont);
         self.b.seal_block(cont);
     }
@@ -1669,7 +1880,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
     fn compile(&mut self, node: &Node) -> CResult<Operand> {
         match node {
             Node::Const(v) => self.compile_const(v),
-            Node::Local(id) => self.read_local(*id),
+            Node::Local(id) => self.read_local(node as *const Node as usize, *id),
             Node::VarRef(v) => {
                 let var = v.get();
                 let p = self.const_slot(ConstEntry::Var(var.ns.to_string(), var.name.to_string()));
@@ -1758,7 +1969,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
             Node::Let { bindings, body } => self.compile_let(bindings, body),
             Node::Loop { id, bindings, body } => self.compile_loop(*id, bindings, body),
             Node::Recur { target, args } => self.compile_recur(*target, args),
-            Node::Fn(f) => self.compile_fn_value(f),
+            Node::Fn(f) => self.compile_fn_value(node as *const Node as usize, f),
             Node::Call { f, args, .. } => self.compile_call(f, args),
             Node::BuiltinCall { desc, args, .. } => {
                 let ty = self.ty_of(node);
@@ -1830,7 +2041,9 @@ impl<'a, M: Module> FnCtx<'a, M> {
         finally: Option<&Node>,
     ) -> CResult<Operand> {
         if catches.is_empty() && finally.is_none() {
-            return self.compile(body);
+            // Owned, so a `(try x)` argument never passes a local through borrowed.
+            let op = self.compile(body)?;
+            return Ok(self.make_owned(op));
         }
         let mut inner = |fc: &mut Self| -> CResult<Operand> {
             if catches.is_empty() {
@@ -2133,7 +2346,11 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 header,
                 vars: vars
                     .iter()
-                    .map(|(id, v, _)| (*v, self.local_ty(*id)))
+                    .map(|(id, v, _)| LoopVar {
+                        var: *v,
+                        ty: self.local_ty(*id),
+                        param_bit: None,
+                    })
                     .collect(),
                 depth: self.cleanup.len(),
             },
@@ -2156,14 +2373,14 @@ impl<'a, M: Module> FnCtx<'a, M> {
         // values, kept on the temporary stack while later arguments run.
         let mut ops: Vec<Option<Operand>> = Vec::with_capacity(args.len());
         let mut raws: Vec<Value> = Vec::with_capacity(args.len());
-        for (a, (_, ty)) in args.iter().zip(&ctx.vars) {
-            if *ty == Ty::Val {
+        for (a, lv) in args.iter().zip(&ctx.vars) {
+            if lv.ty == Ty::Val {
                 let op = self.compile(a)?;
                 self.push_tmp(op);
                 ops.push(Some(op));
                 raws.push(op.val);
             } else {
-                let raw = self.compile_typed(a, *ty)?;
+                let raw = self.compile_typed(a, lv.ty)?;
                 ops.push(None);
                 raws.push(raw);
             }
@@ -2183,31 +2400,50 @@ impl<'a, M: Module> FnCtx<'a, M> {
         // would otherwise leak once per iteration: release them, newest first. They
         // stay on the compile-time stack for the fall-through path.
         let inner: Vec<Cleanup> = self.cleanup[ctx.depth..].iter().rev().copied().collect();
-        for c in inner {
-            let v = match c {
-                Cleanup::Val(v) => v,
-                Cleanup::Var(var) => self.b.use_var(var),
-            };
-            self.emit_release(v);
-        }
-        let olds: Vec<Value> = ctx
+        self.release_cleanups(&inner);
+        // Old values before rebinding; parameters are released only if owned.
+        let olds: Vec<Cleanup> = ctx
             .vars
             .iter()
-            .filter(|(_, ty)| *ty == Ty::Val)
-            .map(|(v, _)| self.b.use_var(*v))
+            .filter(|lv| lv.ty == Ty::Val)
+            .map(|lv| match lv.param_bit {
+                Some(bit) => Cleanup::Param(lv.var, bit),
+                None => Cleanup::Var(lv.var),
+            })
             .collect();
-        for ((var, _), val) in ctx.vars.iter().zip(new_vals) {
-            self.b.def_var(*var, val);
+        // The old values must be read before the variables are redefined.
+        let old_vals: Vec<Cleanup> = olds
+            .iter()
+            .map(|c| match c {
+                Cleanup::Var(var) => Cleanup::Val(self.b.use_var(*var)),
+                Cleanup::Param(var, bit) => {
+                    let v = self.b.use_var(*var);
+                    Cleanup::ValIf(v, *bit)
+                }
+                c => *c,
+            })
+            .collect();
+        let mut rebound_bits = 0u64;
+        for (lv, val) in ctx.vars.iter().zip(new_vals) {
+            self.b.def_var(lv.var, val);
+            if let Some(bit) = lv.param_bit {
+                rebound_bits |= bit;
+            }
         }
-        for old in olds {
-            self.emit_release(old);
+        self.release_cleanups(&old_vals);
+        if rebound_bits != 0 {
+            // Rebound by recur: owned from now on.
+            let mask = self.owned_mask.expect("ownership mask");
+            let m = self.b.use_var(mask);
+            let m = self.b.ins().bor_imm_s(m, rebound_bits as i64);
+            self.b.def_var(mask, m);
         }
         self.b.ins().jump(ctx.header, &[]);
         self.dead_block();
         Ok(self.imm(api::consts::NIL))
     }
 
-    fn compile_fn_value(&mut self, f: &Rc<FnNode>) -> CResult<Operand> {
+    fn compile_fn_value(&mut self, at: usize, f: &Rc<FnNode>) -> CResult<Operand> {
         let func = self.unit.fn_id(self.module, f)?;
         if f.captures.is_empty() {
             let fv = self.const_slot(ConstEntry::FnObj {
@@ -2227,7 +2463,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         let n = self.b.ins().iconst(types::I64, f.captures.len() as i64);
         let fv = self.call_rt(RtFn::FnNew, &[proto, n]).unwrap();
         for (i, id) in f.captures.iter().enumerate() {
-            let op = self.read_local(*id)?;
+            let op = self.read_local(at, *id)?;
             let op = self.make_owned_force(op);
             let i = self.b.ins().iconst(types::I64, i as i64);
             self.call_rt(RtFn::FnSetCapture, &[fv, i, op.val]);
@@ -2286,9 +2522,14 @@ impl<'a, M: Module> FnCtx<'a, M> {
         let ops = self.eval_args(args)?;
         let op = inline_op(desc, args.len());
         let result = match op {
-            Some(op) => self.compile_inline(op, desc, &ops, as_cond)?,
+            Some(op) => {
+                let r = self.compile_inline(op, desc, &ops, as_cond)?;
+                self.release_tmps(&ops);
+                r
+            }
             None => {
-                let r = self.direct_call(desc, &ops)?;
+                let r = self.direct_call(desc, &ops, true)?;
+                self.release_untransferred(&ops);
                 if as_cond {
                     // Only the truth of the result is needed; the value itself goes.
                     let c = self.truthy(r);
@@ -2299,16 +2540,27 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 }
             }
         };
-        self.release_tmps(&ops);
         Ok(result)
     }
 
-    /// `builtin(null, argc, argv)` with the exception check; returns the raw result.
-    fn direct_call(&mut self, desc: &'static BuiltinDesc, ops: &[Operand]) -> CResult<Value> {
+    /// `builtin(null, argc, argv, owned)` with the exception check; returns the raw
+    /// result. With `transfer`, owned operands are handed over (popped from the
+    /// temporary stack); otherwise the builtin borrows and the caller releases.
+    fn direct_call(
+        &mut self,
+        desc: &'static BuiltinDesc,
+        ops: &[Operand],
+        transfer: bool,
+    ) -> CResult<Value> {
         let (argv, argc) = self.store_ops(ops);
+        let owned = if transfer {
+            self.transfer_tmps(ops)
+        } else {
+            self.b.ins().iconst(types::I64, 0)
+        };
         let fref = self.builtin_ref(desc)?;
         let this = self.b.ins().iconst(types::I64, 0);
-        let inst = self.b.ins().call(fref, &[this, argc, argv]);
+        let inst = self.b.ins().call(fref, &[this, argc, argv, owned]);
         let r = self.b.inst_results(inst)[0];
         self.check_exc(r);
         Ok(r)
@@ -2406,7 +2658,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
         self.b.switch_to_block(slow);
         self.b.seal_block(slow);
-        let r = self.direct_call(desc, ops)?;
+        let r = self.direct_call(desc, ops, false)?;
         let r = if as_cond {
             let c = self.truthy(r);
             self.emit_release(r);
@@ -2435,10 +2687,45 @@ impl<'a, M: Module> FnCtx<'a, M> {
         }
     }
 
+    /// Hand owned argument operands over to the callee: pop them from the temporary
+    /// stack (the callee releases or keeps them) and return the ownership mask. With
+    /// more than 64 arguments nothing is transferred.
+    fn transfer_tmps(&mut self, ops: &[Operand]) -> Value {
+        if ops.len() > 64 {
+            return self.b.ins().iconst(types::I64, 0);
+        }
+        let mut mask: u64 = 0;
+        let mut dynamic: Vec<(usize, Value)> = Vec::new();
+        for (i, op) in ops.iter().enumerate().rev() {
+            self.pop_tmp(*op);
+            match op.own {
+                Own::Owned => mask |= 1 << i,
+                Own::Cond(flag) => dynamic.push((i, flag)),
+                _ => {}
+            }
+        }
+        let mut m = self.b.ins().iconst(types::I64, mask as i64);
+        for (i, flag) in dynamic {
+            let bit = self.b.ins().iconst(types::I64, (1u64 << i) as i64);
+            let zero = self.b.ins().iconst(types::I64, 0);
+            let b = self.b.ins().select(flag, bit, zero);
+            m = self.b.ins().bor(m, b);
+        }
+        m
+    }
+
+    /// Release the arguments the callee did not take (more than 64 of them).
+    fn release_untransferred(&mut self, ops: &[Operand]) {
+        if ops.len() > 64 {
+            self.release_tmps(ops);
+        }
+    }
+
     fn compile_call(&mut self, f: &Node, args: &[Node]) -> CResult<Operand> {
         let fop = self.compile(f)?;
         self.push_tmp(fop);
         let (argv, argc, ops) = self.store_args(args)?;
+        let owned = self.transfer_tmps(&ops);
         let fv = fop.val;
 
         // Fast path: a heap pointer whose kind is Fn → call its entry directly.
@@ -2484,20 +2771,22 @@ impl<'a, M: Module> FnCtx<'a, M> {
         let inst = self
             .b
             .ins()
-            .call_indirect(self.call_sig, entry, &[fv, argc, argv]);
+            .call_indirect(self.call_sig, entry, &[fv, argc, argv, owned]);
         let r1 = self.b.inst_results(inst)[0];
         self.b.ins().jump(merge, &[BlockArg::Value(r1)]);
 
         self.b.switch_to_block(slow);
         self.b.seal_block(slow);
-        let r2 = self.call_rt(RtFn::Invoke, &[fv, argc, argv]).unwrap();
+        let r2 = self
+            .call_rt(RtFn::Invoke, &[fv, argc, argv, owned])
+            .unwrap();
         self.b.ins().jump(merge, &[BlockArg::Value(r2)]);
 
         self.b.switch_to_block(merge);
         self.b.seal_block(merge);
         let r = self.b.block_params(merge)[0];
         self.check_exc(r);
-        self.release_tmps(&ops);
+        self.release_untransferred(&ops);
         self.pop_tmp(fop);
         self.release(fop);
         Ok(Operand::owned(r))
@@ -2505,47 +2794,94 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
     fn compile_coll(&mut self, kind: CollKind, items: &[Node]) -> CResult<Operand> {
         let (addr, n, ops) = self.store_args(items)?;
+        let owned = self.transfer_tmps(&ops);
         let f = match kind {
             CollKind::Vector => RtFn::VectorFromSlice,
             CollKind::Map => RtFn::MapFromSlice,
             CollKind::Set => RtFn::SetFromSlice,
         };
-        let r = self.call_rt(f, &[addr, n]).unwrap();
-        self.release_tmps(&ops);
+        let r = self.call_rt(f, &[addr, n, owned]).unwrap();
+        self.release_untransferred(&ops);
         Ok(Operand::owned(r))
     }
 
     /// Body of one fn arity: bind params (and rest), compile the body as the recur
     /// target, release owned locals, return.
-    fn compile_arity(&mut self, a: &Arity, argv: Value, argc: Value) -> CResult<()> {
+    fn compile_arity(&mut self, a: &Arity, argv: Value, argc: Value, owned: Value) -> CResult<()> {
         let mut vars: Vec<(LocalId, Variable, bool)> = Vec::new();
-        for (j, id) in a.params.iter().enumerate() {
-            let v = self
-                .b
-                .ins()
-                .load(types::I64, MemFlagsData::trusted(), argv, 8 * j as i32);
-            let ty = self.local_ty(*id);
-            if ty != Ty::Val {
-                // `^long`/`^double` parameter: unboxed on entry (ClassCastException
-                // for anything else, like a primitive-hinted Clojure fn).
-                let raw = self.unbox(Operand::borrowed(v), ty, true)?;
-                let var = self.bind_typed(*id, raw, ty);
-                vars.push((*id, var, false));
-                continue;
-            }
-            if a.has_recur {
-                self.emit_retain(v);
-            }
-            let var = self.bind_local(*id, v, a.has_recur);
-            vars.push((*id, var, a.has_recur));
+        let mut bits: Vec<Option<u64>> = Vec::new();
+        let mask = self.b.declare_var(types::I64);
+        self.b.def_var(mask, owned);
+        self.owned_mask = Some(mask);
+        // Load every argument and protect the owned ones (and the rest list) before
+        // anything can throw: unboxing a `^long`/`^double` parameter may fail, and the
+        // exception path must then release the arguments that were handed over.
+        let vals: Vec<Value> = (0..a.params.len())
+            .map(|j| {
+                self.b
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), argv, 8 * j as i32)
+            })
+            .collect();
+        // The analyzer caps fixed parameters at 63, so every bit fits the mask.
+        debug_assert!(
+            vals.len() < 64,
+            "too many parameters for the ownership mask"
+        );
+        for (j, v) in vals.iter().enumerate() {
+            self.cleanup.push(Cleanup::ValIf(*v, 1 << j));
         }
-        if let Some(id) = a.rest {
+        let rest = a.rest.map(|_| {
             let nfixed = a.params.len() as i64;
             let extra = self.b.ins().iadd_imm_s(argc, -nfixed);
             let addr = self.b.ins().iadd_imm_s(argv, 8 * nfixed);
-            let r = self.call_rt(RtFn::ListFromSlice, &[addr, extra]).unwrap();
+            let rest_owned = self.b.ins().ushr_imm_s(owned, nfixed);
+            let r = self
+                .call_rt(RtFn::ListFromSlice, &[addr, extra, rest_owned])
+                .unwrap();
+            self.cleanup.push(Cleanup::Val(r));
+            r
+        });
+        let mut raws: Vec<Option<Value>> = Vec::with_capacity(vals.len());
+        for (id, v) in a.params.iter().zip(&vals) {
+            let ty = self.local_ty(*id);
+            raws.push(if ty != Ty::Val {
+                // ClassCastException for anything else, like a primitive-hinted
+                // Clojure fn.
+                Some(self.unbox(Operand::borrowed(*v), ty, true)?)
+            } else {
+                None
+            });
+        }
+        // Now bind: the protection entries are replaced by the parameters' own.
+        if rest.is_some() {
+            self.cleanup.pop();
+        }
+        for _ in &vals {
+            self.cleanup.pop();
+        }
+        for (j, (id, v)) in a.params.iter().zip(&vals).enumerate() {
+            match raws[j] {
+                Some(raw) => {
+                    // The boxed argument goes right away if it was handed over.
+                    let flag = self.owned_bit(1 << j);
+                    self.emit_release_if(flag, *v);
+                    let ty = self.local_ty(*id);
+                    let var = self.bind_typed(*id, raw, ty);
+                    vars.push((*id, var, false));
+                    bits.push(None);
+                }
+                None => {
+                    let var = self.bind_param(*id, *v, j);
+                    vars.push((*id, var, true));
+                    bits.push(Some(1 << j));
+                }
+            }
+        }
+        if let (Some(id), Some(r)) = (a.rest, rest) {
             let var = self.bind_local(id, r, true);
             vars.push((id, var, true));
+            bits.push(None);
         }
         let header = self.b.create_block();
         self.b.ins().jump(header, &[]);
@@ -2554,7 +2890,12 @@ impl<'a, M: Module> FnCtx<'a, M> {
             header,
             vars: vars
                 .iter()
-                .map(|(id, v, _)| (*v, self.local_ty(*id)))
+                .zip(&bits)
+                .map(|((id, v, _), bit)| LoopVar {
+                    var: *v,
+                    ty: self.local_ty(*id),
+                    param_bit: *bit,
+                })
                 .collect(),
             depth: self.cleanup.len(),
         });

@@ -50,7 +50,10 @@ pub struct ObjHeader {
 impl ObjHeader {
     pub fn new(kind: Kind) -> Self {
         #[cfg(feature = "live-count")]
-        LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
+        if counted(kind) {
+            LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::gc::note_alloc();
         ObjHeader {
             rc: AtomicI64::new(1),
             kind,
@@ -72,11 +75,24 @@ impl ObjHeader {
 #[cfg(feature = "live-count")]
 pub static LIVE_OBJECTS: AtomicI64 = AtomicI64::new(0);
 
-/// Bookkeeping hook called whenever a heap object is freed.
+/// Keywords are interned (weakly) and may be promoted to immortal by compiled code
+/// that mentions them; they are not part of the live-object count that the leak
+/// tests compare, which tracks ordinary allocations.
 #[inline]
-pub(crate) fn note_freed() {
+#[cfg_attr(not(feature = "live-count"), allow(dead_code))]
+pub(crate) fn counted(kind: Kind) -> bool {
+    kind != Kind::Keyword
+}
+
+/// Bookkeeping hook called whenever a counted heap object is freed or made immortal.
+#[inline]
+pub(crate) fn note_freed(kind: Kind) {
     #[cfg(feature = "live-count")]
-    LIVE_OBJECTS.fetch_sub(1, Ordering::Relaxed);
+    if counted(kind) {
+        LIVE_OBJECTS.fetch_sub(1, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "live-count"))]
+    let _ = kind;
 }
 
 /// Every allocation that is deliberately kept alive forever (immortal objects, fn
@@ -345,14 +361,32 @@ impl Clone for Value {
 impl Drop for Value {
     #[inline]
     fn drop(&mut self) {
-        if let Some(h) = self.header()
-            && h.rc.fetch_sub(1, Ordering::Release) == 1
-        {
-            fence(Ordering::Acquire);
-            note_freed();
-            // SAFETY: this was the last reference.
-            unsafe { obj::free(self.0 as *mut ObjHeader) }
+        if let Some(h) = self.header() {
+            // An atom or pending value losing a reference may be the root of a
+            // cycle: the collector's buffer takes this reference over (once) and
+            // decides later.
+            if matches!(h.kind, Kind::Atom | Kind::Pending)
+                && unsafe { crate::gc::take_candidate(self.0 as *const ObjHeader) }
+            {
+                return;
+            }
+            // SAFETY: `self` holds one reference.
+            unsafe { release_raw(self.0) }
         }
+    }
+}
+
+/// Drop one reference without the cycle-candidate hook (the collector's own path).
+///
+/// # Safety
+/// `bits` must hold a reference the caller owns, to a heap object.
+pub(crate) unsafe fn release_raw(bits: u64) {
+    let h = unsafe { &*(bits as *const ObjHeader) };
+    if h.rc.fetch_sub(1, Ordering::Release) == 1 {
+        fence(Ordering::Acquire);
+        note_freed(h.kind);
+        // SAFETY: this was the last reference.
+        unsafe { obj::free(bits as *mut ObjHeader) }
     }
 }
 

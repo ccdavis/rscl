@@ -242,3 +242,32 @@ Execution error: ArithmeticException: integer overflow
 user=> (loop [x 1.0 i 0] (if (< i 3) (recur (* x 2) (inc i)) x))   ; x and i stay unboxed
 8.0
 ```
+
+## Phase 9 — Concurrency (done)
+
+```
+user=> (def f (future (sleep 100) (+ 1 2)))  [(realized? f) @f (realized? f)]
+#'user/f
+[false 3 true]
+user=> (def p (promise))  (future (deliver p (str "hello from " (thread-id))))  @p
+#'user/p
+#object[Future 0x... {:status :pending}]
+"hello from 3"
+user=> (pmap (fn [n] (reduce + (range n))) [1000 2000 3000])
+(499500 1999000 4498500)
+user=> (def ^:dynamic *who* "main")  (binding [*who* "bound"] @(future *who*))
+#'user/*who*
+"bound"
+user=> (let [c (atom 0) l (atom nil)] (doseq [f (doall (repeatedly 8 #(future (dotimes [_ 1000] (locking l (reset! c (inc @c)))))))] @f) @c)
+8000
+user=> (let [f (future (sleep 10000))] [(future-cancel f) (try @f (catch Exception e (ex-message e)))])
+[true "future was cancelled"]
+```
+
+Memory hardening landed with this phase: locals are cleared at their last use and
+callers hand arguments over to callees, so `(reduce + (range 3000000))` runs in 13 MB
+(it took 273 MB before); reference cycles through atoms, promises and lazy seqs are
+collected (`(let [a (atom nil)] (reset! a (fn [] @a)))` two hundred thousand times
+runs in flat memory); keywords are interned weakly; `RSCL_HASH_SEED=random` protects
+maps keyed by untrusted input.
+

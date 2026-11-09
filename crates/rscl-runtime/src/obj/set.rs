@@ -1,4 +1,4 @@
-//! Persistent hash set backed by `imbl::HashSet` (deterministic hasher, see map.rs).
+//! Persistent hash set backed by `imbl::HashSet` (hasher shared with map.rs).
 use super::map::Hasher;
 use super::{Kind, alloc, cast};
 use crate::value::{ObjHeader, Value};
@@ -21,7 +21,7 @@ pub fn new(s: Set_) -> Value {
 }
 
 pub fn empty_set() -> Set_ {
-    Set_::with_hasher(Hasher::default())
+    Set_::with_hasher(Hasher)
 }
 
 pub fn from_slice(items: &[Value]) -> Value {

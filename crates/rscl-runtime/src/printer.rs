@@ -154,6 +154,21 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
             out.push(']');
         }
         Kind::Type => out.push_str(&obj::types::get(v).name),
+        Kind::Pending => {
+            let p = obj::pending::get(v);
+            let status = if p.is_cancelled() {
+                ":cancelled"
+            } else if p.is_realized() {
+                ":ready"
+            } else {
+                ":pending"
+            };
+            out.push_str(&format!(
+                "#object[{} 0x{:x} {{:status {status}}}]",
+                p.flavor.name(),
+                v.bits()
+            ));
+        }
         Kind::Protocol => {
             out.push_str("#protocol[");
             out.push_str(&obj::types::proto(v).name);

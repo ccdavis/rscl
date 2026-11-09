@@ -886,3 +886,47 @@
          (when (:doc m#) (println " " (:doc m#)))
          nil)
        (println "Unable to resolve var:" '~sym))))
+
+;;; ---- concurrency ----------------------------------------------------------------------
+
+(defmacro future
+  "Runs body on another thread; deref blocks for the result (or rethrows)."
+  [& body]
+  `(future-call (fn [] ~@body)))
+
+(defmacro delay
+  "Body runs once, on first deref or force."
+  [& body]
+  `(delay* (fn [] ~@body)))
+
+(defmacro locking
+  "Runs body holding a reentrant lock on x (an object; not an immediate)."
+  [x & body]
+  `(let [lockee# ~x]
+     (lock* lockee#)
+     (try ~@body (finally (unlock* lockee#)))))
+
+(defn pmap
+  "Like map, f applied in parallel (available-processors + 2 ahead); semi-lazy."
+  ([f coll]
+   (let [n (+ 2 (available-processors))
+         rets (map (fn [x] (future (f x))) coll)
+         step (fn step [[x & xs :as vs] fs]
+                (lazy-seq
+                 (if-let [s (seq fs)]
+                   (cons (deref x) (step xs (rest s)))
+                   (map deref vs))))]
+     (step rets (drop n rets))))
+  ([f coll & colls]
+   (pmap (fn [xs] (apply f xs)) (apply map vector coll colls))))
+
+(defn pcalls
+  "Calls the fns in parallel; a lazy seq of their results."
+  [& fns]
+  (pmap (fn [f] (f)) fns))
+
+(defmacro pvalues
+  "Evaluates the exprs in parallel; a lazy seq of their values."
+  [& exprs]
+  `(pcalls ~@(map (fn [e] (list 'clojure.core/fn [] e)) exprs)))
+

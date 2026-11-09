@@ -259,7 +259,8 @@ pub fn hasheq(v: &Value) -> u64 {
         | Kind::Namespace
         | Kind::Native
         | Kind::Type
-        | Kind::Protocol => mix64(v.bits()),
+        | Kind::Protocol
+        | Kind::Pending => mix64(v.bits()),
     }
 }
 

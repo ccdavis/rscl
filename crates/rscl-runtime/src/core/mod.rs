@@ -10,6 +10,7 @@ use crate::value::Value;
 pub mod arith;
 pub mod basic;
 pub mod coll;
+pub mod conc;
 pub mod fns;
 pub mod io;
 pub mod lazy;
@@ -44,6 +45,7 @@ pub fn all() -> impl Iterator<Item = &'static BuiltinDesc> {
         .chain(nsfns::TABLE.iter())
         .chain(re::TABLE.iter())
         .chain(types::TABLE.iter())
+        .chain(conc::TABLE.iter())
 }
 
 /// Look a builtin up by namespace and name (indexed once; the analyzer asks for
@@ -63,35 +65,102 @@ pub fn find(ns: &str, name: &str) -> Option<&'static BuiltinDesc> {
 
 /// Define native functions with the uniform ABI (no namespace registration). Each
 /// entry is `"display-name" => fn rust_ident(args) [fixed arities ; variadic-min] { body }`
-/// where the body evaluates to `RtResult<Value>`; `this` names the fn object itself.
+/// where the body evaluates to `RtResult<Value>`; `this` names the fn object itself,
+/// and `; owned = taker` binds a [`Taker`] for bodies that consume an argument.
+/// Arguments are borrowed views; those the caller handed over (`owned` bits) are
+/// released after the body unless the body took them.
 #[macro_export]
 macro_rules! native_fns {
-    ($( $name:expr => fn $ident:ident ( $args:ident $(, $this:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
+    ($( $name:expr => fn $ident:ident ( $args:ident $(, $this:ident)? $(; owned = $taker:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
         $(
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn $ident(
                 _this: *const $crate::obj::func::FnObj,
                 argc: i64,
                 argv: *const $crate::value::Value,
+                owned: u64,
             ) -> $crate::value::Value {
                 const MASK: u64 = 0 $(| (1u64 << $fixed))*;
                 const VMIN: i64 = -1 $(+ 1 + $vmin)?;
-                if !$crate::core::accepts(MASK, VMIN, argc) {
-                    return $crate::core::arity_error($name, argc);
-                }
-                let $args: &[$crate::value::VRef] = if argc == 0 {
-                    &[]
-                } else {
-                    unsafe { std::slice::from_raw_parts(argv as *const $crate::value::VRef, argc as usize) }
-                };
-                $( let $this = $crate::value::VRef::from_raw(_this as u64); )?
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                    || -> $crate::exc::RtResult<$crate::value::Value> { $body },
-                ));
+                let __taker = $crate::core::Taker::new(argv, argc, owned);
+                let r: std::thread::Result<$crate::exc::RtResult<$crate::value::Value>> =
+                    if !$crate::core::accepts(MASK, VMIN, argc) {
+                        Ok(Err($crate::exc::Exc_from($crate::core::arity_error($name, argc))))
+                    } else {
+                        let $args: &[$crate::value::VRef] = if argc == 0 {
+                            &[]
+                        } else {
+                            unsafe { std::slice::from_raw_parts(argv as *const $crate::value::VRef, argc as usize) }
+                        };
+                        let _ = &$args;
+                        $( let $this = $crate::value::VRef::from_raw(_this as u64); )?
+                        $( let $taker = &__taker; )?
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || -> $crate::exc::RtResult<$crate::value::Value> { $body },
+                        ))
+                    };
+                unsafe { $crate::core::release_owned(argv, argc, owned & !__taker.taken()) };
                 $crate::core::finish($name, r)
             }
         )*
     };
+}
+
+/// Release the arguments a caller handed over (bits of `owned`; the caller clears
+/// the bits of slots a body took).
+///
+/// # Safety
+/// `argv` must point at `argc` values; owned slots must not be used afterwards.
+pub unsafe fn release_owned(argv: *const Value, argc: i64, owned: u64) {
+    if owned == 0 {
+        return;
+    }
+    for i in 0..argc.min(64) {
+        if owned >> i & 1 == 1 {
+            drop(unsafe { std::ptr::read(argv.add(i as usize)) });
+        }
+    }
+}
+
+/// Lets a builtin take ownership of an argument it will consume (an owned slot's
+/// reference is moved out and the slot is excluded from the release after the body;
+/// a borrowed one is retained), so a sequence passed by a caller that no longer
+/// needs it is freed as the builtin walks it. The slot itself is never written, so
+/// the body's `&[VRef]` view stays valid; a taken slot must not be read again.
+pub struct Taker {
+    argv: *const Value,
+    argc: i64,
+    owned: u64,
+    taken: std::cell::Cell<u64>,
+}
+
+impl Taker {
+    pub fn new(argv: *const Value, argc: i64, owned: u64) -> Taker {
+        Taker {
+            argv,
+            argc,
+            owned,
+            taken: std::cell::Cell::new(0),
+        }
+    }
+
+    pub fn take(&self, i: usize) -> Value {
+        assert!((i as i64) < self.argc, "take: argument index out of range");
+        unsafe {
+            let slot = self.argv.add(i);
+            if i < 64 && self.owned >> i & 1 == 1 {
+                self.taken.set(self.taken.get() | 1 << i);
+                std::ptr::read(slot)
+            } else {
+                (*slot).clone()
+            }
+        }
+    }
+
+    /// Bits of the owned slots the body took over.
+    pub fn taken(&self) -> u64 {
+        self.taken.get()
+    }
 }
 
 /// Define builtins registered as vars in a namespace (`clojure.core` by default):
@@ -99,9 +168,9 @@ macro_rules! native_fns {
 /// `[1, 2]` accepts 1 or 2 args; `[; 0]` is variadic from 0; `[1; 3]` accepts 1 or 3+.
 #[macro_export]
 macro_rules! builtins {
-    (ns = $ns:literal; $( $name:literal => fn $ident:ident ( $args:ident $(, $this:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
+    (ns = $ns:literal; $( $name:literal => fn $ident:ident ( $args:ident $(, $this:ident)? $(; owned = $taker:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
         $crate::native_fns! {
-            $( concat!($ns, "/", $name) => fn $ident ( $args $(, $this)? ) [ $($fixed),* $(; $vmin)? ] $body )*
+            $( concat!($ns, "/", $name) => fn $ident ( $args $(, $this)? $(; owned = $taker)? ) [ $($fixed),* $(; $vmin)? ] $body )*
         }
         pub static TABLE: &[$crate::core::BuiltinDesc] = &[
             $( $crate::core::BuiltinDesc {
@@ -114,8 +183,8 @@ macro_rules! builtins {
             }, )*
         ];
     };
-    ($( $name:literal => fn $ident:ident ( $args:ident $(, $this:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
-        $crate::builtins! { ns = "clojure.core"; $( $name => fn $ident ( $args $(, $this)? ) [ $($fixed),* $(; $vmin)? ] $body )* }
+    ($( $name:literal => fn $ident:ident ( $args:ident $(, $this:ident)? $(; owned = $taker:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
+        $crate::builtins! { ns = "clojure.core"; $( $name => fn $ident ( $args $(, $this)? $(; owned = $taker)? ) [ $($fixed),* $(; $vmin)? ] $body )* }
     };
 }
 
@@ -189,6 +258,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Some(Kind::Protocol) => "Protocol",
         Some(Kind::SortedMap) => "PersistentTreeMap",
         Some(Kind::SortedSet) => "PersistentTreeSet",
+        Some(Kind::Pending) => obj::pending::get(v).flavor.name(),
         Some(Kind::Instance) => {
             // SAFETY: type objects are immortal, so their names live for the process.
             unsafe { &*(&*obj::types::inst(v).ty().name as *const str) }
