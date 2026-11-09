@@ -7,15 +7,16 @@ Where Clojure on the JVM calls Java, rscl calls Rust: the core library is Rust
 functions exposed as first-class fns, and later phases add a typed C-ABI FFI and a
 bridge for exposing whole Rust crates.
 
-Status: Phases 1–5 of the plan are done (see `docs/MILESTONES.md`): a working REPL
+Status: Phases 1–6 of the plan are done (see `docs/MILESTONES.md`): a working REPL
 with per-form incremental compilation and redefinition, `rscl run`, `rscl build`
 producing native binaries, `defmacro` with syntax-quote, lazy sequences, destructuring,
 atoms, regular expressions, a `core.clj` written from scratch on top of the Rust
 builtins, namespaces with `ns`/`require`/`in-ns` and multi-file programs (required
 namespaces are compiled into built binaries), fn-name stack traces on uncaught
 exceptions, `try`/`catch`/`finally`, a typed C FFI (`defnative`), stack-overflow and
-Ctrl-C guards, and a differential test corpus that runs every program under both the
-JIT and the AOT compiler. Next: the Rust library bridge (Phase 6).
+Ctrl-C guards, a bridge for exposing Rust crates as rscl namespaces, and a
+differential test corpus that runs every program under both the JIT and the AOT
+compiler. Next: types and protocols (Phase 7).
 
 ## Build and run
 
@@ -57,6 +58,27 @@ UPDATE_EXPECTED=1 scripts/validate.sh tests/corpus/x.clj   # (re)write an expect
 Types: `:void :long :int :double :float :bool :str :ptr`. Every core function
 (`+`, `conj`, `map`, ...) is itself a Rust function with the same calling convention
 as compiled rscl fns, so it is a first-class value with no wrapper.
+
+For whole Rust libraries, the `rscl-bridge` crate turns ordinary Rust functions into
+an rscl namespace (see `examples/native-demo`):
+
+```rust
+rscl_bridge::exports! {
+    ns "demo";
+    fn add(a: i64, b: i64) -> i64 { a + b }
+    fn greet(name: &str) -> String { format!("Hello, {name}!") }
+    fn parse_int(s: &str) -> Result<i64, String> { s.parse().map_err(|e| e.to_string()) }
+}
+```
+
+Build it as a `cdylib`, then `(load-native "libdemo.so" :as d)` gives `(d/add 1 2)`,
+`(d/parse-int "7")` and so on. Supported types: integers, floats, `bool`, `&str`/`String`,
+`Option<T>`, `Vec<T>`, `HashMap<String, T>`, raw `Val` (with `.call` for callbacks),
+and `Native<T>` for opaque Rust objects. `Err(msg)` and panics become rscl exceptions
+(keep the default `panic = "unwind"` in the bridge crate).
+The library never links the runtime: it receives a table of function pointers at
+registration, so there is exactly one runtime in the process. Rebuild the crate and
+call `load-native` again to pick up changes without restarting the REPL.
 
 ## Layout
 

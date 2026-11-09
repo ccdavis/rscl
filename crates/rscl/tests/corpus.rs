@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+mod common;
+use common::target_dir;
+
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 fn root() -> PathBuf {
@@ -59,7 +62,9 @@ fn run_with_timeout(mut cmd: Command) -> Outcome {
 
 fn run_jit(file: &Path) -> Outcome {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rscl"));
-    cmd.arg("run").arg(file);
+    cmd.arg("run")
+        .arg(file)
+        .env("RSCL_NATIVE_PATH", target_dir());
     run_with_timeout(cmd)
 }
 
@@ -67,12 +72,18 @@ fn run_aot(file: &Path) -> Outcome {
     let name = file.file_stem().unwrap().to_string_lossy().into_owned();
     let exe = std::env::temp_dir().join(format!("rscl_corpus_{}_{name}", std::process::id()));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rscl"));
-    cmd.arg("build").arg(file).arg("-o").arg(&exe);
+    cmd.arg("build")
+        .arg(file)
+        .arg("-o")
+        .arg(&exe)
+        .env("RSCL_NATIVE_PATH", target_dir());
     let built = run_with_timeout(cmd);
     if built.status != 0 {
         return built;
     }
-    let o = run_with_timeout(Command::new(&exe));
+    let mut run = Command::new(&exe);
+    run.env("RSCL_NATIVE_PATH", target_dir());
+    let o = run_with_timeout(run);
     let _ = std::fs::remove_file(&exe);
     o
 }

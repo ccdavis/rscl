@@ -6,6 +6,7 @@ set -u
 cd "$(dirname "$0")/.."
 cargo build -q || exit 1
 BIN=target/debug/rscl
+export RSCL_NATIVE_PATH="$PWD/target/debug"
 MODES=(jit aot)
 [ -n "${RSCL_JIT_ONLY:-}" ] && MODES=(jit)
 files=("$@")

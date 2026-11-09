@@ -121,3 +121,37 @@ Execution error: ArithmeticException: Divide by zero
     at user/inner
     at user/outer
 ```
+
+## Phase 6 — Rust library bridge (done)
+
+```rust
+// examples/native-demo/src/lib.rs, built as a cdylib
+rscl_bridge::exports! {
+    ns "demo";
+    fn add(a: i64, b: i64) -> i64 { a + b }
+    fn greet(name: &str) -> String { format!("Hello, {name}!") }
+    fn parse_int(s: &str) -> Result<i64, String> { s.trim().parse().map_err(|e| format!("{e}")) }
+    fn make_counter(start: i64) -> Native<Counter> { Native(Counter { n: Mutex::new(start) }) }
+    fn counter_inc(c: &Native<Counter>) -> i64 { /* ... */ }
+    fn apply_twice(f: Val, x: Val) -> rscl_bridge::Result<Val> { let y = f.call(&[x])?; f.call(&[y]) }
+}
+```
+
+```
+user=> (load-native "librscl_demo.so" :as d)      ; searched as given, RSCL_NATIVE_PATH, next to rscl
+demo
+user=> (d/add 1 2)
+3
+user=> (d/parse-int "x")
+Execution error: RuntimeException: cannot parse "x": invalid digit found in string
+user=> (def c (d/make-counter 10))  (d/counter-inc c)
+#'user/c
+11
+user=> (d/apply-twice inc 5)
+7
+;; edit the Rust, `cargo build -p rscl-demo`, then:
+user=> (load-native "librscl_demo.so")
+demo                                          ; vars now point at the new code
+```
+
+A built binary that calls `load-native` loads the same `.so` at start-up.

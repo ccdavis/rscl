@@ -96,6 +96,31 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   `:str` a `const char*` (strings are copied in and out), `:ptr` a raw address as an
   integer, `:bool` a C `_Bool`.
 
+## Native bridge libraries
+
+- `(load-native path)` opens a shared library (as given, then under each
+  `RSCL_NATIVE_PATH` directory, then next to the rscl executable). If it exports
+  `rscl_module_register`, its functions become vars in the namespace it names;
+  `(load-native path :as alias)` also aliases that namespace. Loading the same path
+  again (after a rebuild) maps a private copy of the file and registers it, so the
+  vars point at the new code; the old code stays mapped for values that still refer
+  to it.
+- Exported fn names have underscores turned into hyphens. Arity is fixed; wrong
+  arity or an unconvertible argument throws `ArityException`/`ClassCastException`;
+  `Err(msg)` throws `RuntimeException`; a Rust panic throws `RuntimeException` too,
+  which requires the default `panic = "unwind"` (the `exports!` macro refuses to
+  compile under `panic = "abort"`). `Vec<T>` and `HashMap<String, T>` parameters
+  accept `nil` as empty; a returned `HashMap` has string keys.
+- Native objects (`Native<T>`) print as `#object[type 0x...]`, compare by identity,
+  and are dropped (running `T`'s destructor in the library) when unreferenced. They
+  belong to the library instance that created them: after a reload, a handle made by
+  the old copy is a `ClassCastException` to the new one, never a reinterpretation.
+- A plain C library (no `rscl_module_register`) is opened globally so its symbols are
+  visible to `defnative`, to other libraries and to `dlsym`; bridge libraries stay
+  local so reloaded copies cannot clash.
+- A compiled program loads bridge libraries at start-up through the same
+  `load-native` call; static linking of bridge libraries is not supported yet.
+
 ## Memory
 
 - Heap objects are reference counted (atomic). Compile-time constants are immortal.

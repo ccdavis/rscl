@@ -5,6 +5,7 @@ set -u
 cd "$(dirname "$0")/.."
 cargo build --release -q || exit 1
 BIN=target/release/rscl
+export RSCL_NATIVE_PATH="$PWD/target/release"
 fail=0
 for f in "$@"; do
   for mode in jit aot; do

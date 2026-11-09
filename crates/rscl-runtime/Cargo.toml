@@ -13,6 +13,7 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 imbl = { workspace = true }
 regex = "1"
+rscl-abi = { path = "../rscl-abi" }
 
 [features]
 default = []

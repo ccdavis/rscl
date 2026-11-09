@@ -1,0 +1,9 @@
+3 Hello, rscl! 6765
+42 cannot parse "x": invalid digit found in string
+6 10 0 2.5 nil
+(big hello world) a=1 b=[2 3] c="s"
+7 hi!! :caught
+11 12 Native Long cannot be cast to rscl_demo::Counter (argument c)
+Wrong number of args (1) passed to: add String cannot be cast to i64 (argument a)
+true true demo
+(11 22 33) 5050

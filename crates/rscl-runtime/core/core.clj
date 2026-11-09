@@ -546,6 +546,12 @@
     `(do (clojure.core/in-ns '~name)
          ~@(filter identity (map process refs)))))
 
+(defmacro load-native
+  "Load a native library; a bridge library's fns become vars in its namespace.
+  (load-native \"libfoo.so\" :as foo) aliases that namespace."
+  ([path] `(load-native* ~path))
+  ([path as alias] `(load-native* ~path ~as '~alias)))
+
 ;;; ---- macros that use destructuring -----------------------------------------------
 
 (defmacro if-let

@@ -149,6 +149,13 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
             }
             out.push(')');
         }
+        Kind::Native => {
+            out.push_str(&format!(
+                "#object[{} 0x{:x}]",
+                obj::native::get(v).type_name,
+                v.bits()
+            ));
+        }
         Kind::Regex => {
             out.push_str("#\"");
             out.push_str(&obj::regex::get(v).source);

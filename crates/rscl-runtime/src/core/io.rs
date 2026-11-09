@@ -57,9 +57,20 @@ builtins! {
         let _ = std::io::stdout().flush();
         std::process::exit(code)
     }
-    "load-native" => fn cf_load_native(args) [1] {
+    "load-native*" => fn cf_load_native(args) [1, 3] {
+        // (load-native* "path/libfoo.so") or (load-native* "path" :as 'alias); the
+        // `load-native` macro in core.clj quotes the alias.
         let path = args::string(&args[0], "path")?;
-        crate::native::load_library(path).map(|_| Value::NIL)
+        let ns = crate::bridge::load(path)?;
+        if args.len() == 3 {
+            if !crate::obj::keyword::as_kw(&args[1]).is_some_and(|k| k.ns().is_none() && k.name() == "as") {
+                return err(ILLEGAL_ARGUMENT, format!("load-native: unknown option {} (expected :as alias)", crate::printer::pr_str(&args[1])));
+            }
+            let Some(ns) = &ns else { return err(RUNTIME, format!("{path} is not an rscl bridge library: no namespace to alias")) };
+            let Some(alias) = crate::obj::symbol::as_sym(&args[2]) else { return err(ILLEGAL_ARGUMENT, ":as requires a symbol") };
+            crate::ns::current().alias(&alias.qualified(), crate::ns::find_or_create(ns));
+        }
+        Ok(ns.map_or(Value::NIL, |n| crate::obj::symbol::new(None, &n)))
     }
     "native-symbol?" => fn cf_native_symbol_p(args) [1] {
         Ok(Value::bool(!crate::native::lookup(args::string(&args[0], "name")?).is_null()))

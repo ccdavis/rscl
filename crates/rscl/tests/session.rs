@@ -2,6 +2,8 @@
 //! built-in namespaces, and macros that load code during expansion.
 use std::path::PathBuf;
 
+mod common;
+
 use rscl::session;
 use rscl_runtime::printer::pr_str;
 
@@ -89,4 +91,36 @@ fn macros_may_require_during_expansion() {
         ),
         "\"<m>\""
     );
+}
+
+#[test]
+fn native_library_reload_rebinds_vars() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    start();
+    let lib = common::target_dir().join("librscl_demo.so");
+    let copy = std::env::temp_dir().join(format!("rscl_reload_{}.so", std::process::id()));
+    std::fs::copy(&lib, &copy).expect("copy demo library");
+    let path = copy.to_string_lossy().into_owned();
+    assert_eq!(
+        eval(&format!("(load-native \"{path}\" :as rl) (rl/add 2 3)")),
+        "5"
+    );
+    eval("(def first-add rl/add)");
+    eval("(def old-counter (rl/make-counter 0))");
+    // A rebuilt library at the same path is a new file: load it again and the vars
+    // point at the new copy's functions.
+    let _ = std::fs::remove_file(&copy);
+    std::fs::copy(&lib, &copy).expect("copy demo library again");
+    assert_eq!(eval(&format!("(load-native \"{path}\") (rl/add 4 5)")), "9");
+    assert_eq!(eval("(identical? first-add rl/add)"), "false");
+    assert_eq!(eval("(first-add 1 1)"), "2"); // the old copy stays mapped
+    // A native object belongs to the library instance that made it: the new copy
+    // must refuse it rather than reinterpret the old allocation.
+    let rejected = eval("(rl/counter-inc old-counter)");
+    assert!(
+        rejected.starts_with("EXC ClassCastException"),
+        "got: {rejected}"
+    );
+    assert_eq!(eval("(rl/counter-inc (rl/make-counter 5))"), "6");
+    let _ = std::fs::remove_file(&copy);
 }

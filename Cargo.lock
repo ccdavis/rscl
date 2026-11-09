@@ -582,8 +582,27 @@ dependencies = [
  "cranelift-native",
  "cranelift-object",
  "libloading",
+ "rscl-demo",
  "rscl-runtime",
  "rustyline",
+]
+
+[[package]]
+name = "rscl-abi"
+version = "0.1.0"
+
+[[package]]
+name = "rscl-bridge"
+version = "0.1.0"
+dependencies = [
+ "rscl-abi",
+]
+
+[[package]]
+name = "rscl-demo"
+version = "0.1.0"
+dependencies = [
+ "rscl-bridge",
 ]
 
 [[package]]
@@ -592,6 +611,7 @@ version = "0.1.0"
 dependencies = [
  "imbl",
  "regex",
+ "rscl-abi",
 ]
 
 [[package]]

@@ -13,6 +13,7 @@ pub mod lazyseq;
 pub mod list;
 pub mod long;
 pub mod map;
+pub mod native;
 pub mod regex;
 pub mod set;
 pub mod string;
@@ -42,6 +43,7 @@ pub enum Kind {
     Namespace = 15,
     Cons = 16,
     Regex = 17,
+    Native = 18,
 }
 
 impl Kind {
@@ -64,6 +66,7 @@ impl Kind {
             Kind::Namespace => "Namespace",
             Kind::Cons => "Cons",
             Kind::Regex => "Regex",
+            Kind::Native => "Native",
         }
     }
 }
@@ -86,6 +89,7 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
             Kind::Exception => drop(Box::from_raw(p as *mut exception::ExcObj)),
             Kind::Atom => drop(Box::from_raw(p as *mut atom::AtomObj)),
             Kind::Regex => drop(Box::from_raw(p as *mut regex::RegexObj)),
+            Kind::Native => drop(Box::from_raw(p as *mut native::NativeObj)),
             // Sequence cells are dismantled iteratively: a long realised chain would
             // otherwise recurse once per element while dropping.
             Kind::List | Kind::Cons | Kind::LazySeq => {

@@ -163,6 +163,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Some(Kind::Namespace) => "Namespace",
         Some(Kind::Cons) => "Cons",
         Some(Kind::Regex) => "Pattern",
+        Some(Kind::Native) => "Native",
         None => "Object",
     }
 }

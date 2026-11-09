@@ -1,0 +1,9 @@
+[package]
+name = "rscl-abi"
+description = "The C ABI shared by the rscl runtime and rscl bridge libraries (no runtime code)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

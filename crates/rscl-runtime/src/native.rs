@@ -1,7 +1,7 @@
 //! Native (C ABI) symbol lookup for the typed FFI, the interrupt flag, and the stack
-//! guard. Libraries opened with `load-native` are `RTLD_GLOBAL`, so one `dlsym`
-//! over the whole process finds everything: the host binary (built with
-//! `-rdynamic`), libc/libm, and loaded libraries.
+//! guard. Symbols are searched in the libraries opened by `load-native` (newest
+//! first), then process-wide: the host binary (built with `-rdynamic`), libc/libm,
+//! and plain C libraries, which `load-native` promotes to `RTLD_GLOBAL`.
 use std::cell::Cell;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -54,14 +54,16 @@ fn thread_stack_floor() -> usize {
     thread_stack_bounds().0
 }
 
-const RTLD_NOW: c_int = 2;
-const RTLD_GLOBAL: c_int = 0x100;
+pub const RTLD_NOW: c_int = 2;
+pub const RTLD_LOCAL: c_int = 0;
+pub const RTLD_GLOBAL: c_int = 0x100;
 
-/// `dlopen` a shared library so its symbols become visible to `lookup`.
-pub fn load_library(path: &str) -> RtResult<()> {
+/// `dlopen` (always `RTLD_NOW`) with the error turned into a `RuntimeException` that
+/// names `display` (the path as the user wrote it).
+pub fn dlopen_checked(path: &str, display: &str, flags: c_int) -> RtResult<*mut c_void> {
     let c = CString::new(path)
         .map_err(|_| crate::exc::throw_new(RUNTIME, "library path contains NUL"))?;
-    let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+    let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | flags) };
     if h.is_null() {
         let msg = unsafe {
             let e = dlerror();
@@ -71,18 +73,43 @@ pub fn load_library(path: &str) -> RtResult<()> {
                 std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned()
             }
         };
-        return err(RUNTIME, format!("cannot load native library {path}: {msg}"));
+        return err(
+            RUNTIME,
+            format!("cannot load native library {display}: {msg}"),
+        );
     }
-    Ok(())
+    Ok(h)
 }
 
-/// Address of a C symbol visible in the process, or null. On a miss the standard
-/// libraries are opened once (`RTLD_GLOBAL`) and the lookup retried, so `cos` works
-/// even in a host that was linked without libm.
+/// `dlopen` a shared library globally so its symbols become visible to `lookup`.
+pub fn load_library(path: &str) -> RtResult<()> {
+    dlopen_checked(path, path, RTLD_GLOBAL).map(drop)
+}
+
+/// Handles of libraries opened by `load-native`, newest first, so a reloaded library's
+/// symbols win over the previous copy's.
+static HANDLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+pub fn remember_handle(h: *mut c_void) {
+    let mut v = HANDLES.lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|&x| x != h as usize);
+    v.insert(0, h as usize);
+}
+
+/// Address of a C symbol: libraries opened by `load-native` (newest first), then the
+/// whole process. On a miss the standard libraries are opened once and the lookup
+/// retried, so `cos` works even in a host that was linked without libm.
 pub fn lookup(name: &str) -> *const u8 {
     let Ok(c) = CString::new(name) else {
         return std::ptr::null();
     };
+    let handles: Vec<usize> = HANDLES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for h in handles {
+        let p = unsafe { dlsym(h as *mut c_void, c.as_ptr()) as *const u8 };
+        if !p.is_null() {
+            return p;
+        }
+    }
     let p = unsafe { dlsym(std::ptr::null_mut(), c.as_ptr()) as *const u8 };
     if !p.is_null() {
         return p;

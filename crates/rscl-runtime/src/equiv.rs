@@ -158,7 +158,9 @@ pub fn hasheq(v: &Value) -> u64 {
             mix64(h)
         }
         // Identity-hashed kinds.
-        Kind::Fn | Kind::Var | Kind::Exception | Kind::Atom | Kind::Namespace => mix64(v.bits()),
+        Kind::Fn | Kind::Var | Kind::Exception | Kind::Atom | Kind::Namespace | Kind::Native => {
+            mix64(v.bits())
+        }
     }
 }
 
