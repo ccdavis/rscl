@@ -3,10 +3,12 @@
 //! Handles special forms, symbol resolution (locals, captures, vars), built-in
 //! rewrite macros (`defn`, `let`, `when`, ... until `core.clj` defines the real ones),
 //! closure conversion (free variables become captures) and `recur` validation.
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use rscl_runtime::obj::var::VarObj;
-use rscl_runtime::obj::{Kind, list, map, symbol, vector};
+use rscl_runtime::core::BuiltinDesc;
+use rscl_runtime::obj::var::{FLAG_DYNAMIC, VarObj};
+use rscl_runtime::obj::{Kind, func, keyword, list, map, symbol, vector};
 use rscl_runtime::{Value, ns, pos};
 
 use crate::errors::{CResult, fail};
@@ -73,6 +75,14 @@ pub enum Node {
     Fn(Rc<FnNode>),
     Call {
         f: Box<Node>,
+        args: Vec<Node>,
+        pos: u32,
+    },
+    /// A call to a Rust builtin through its var, resolved at compile time (the var's
+    /// root is that builtin and the var is neither dynamic nor a macro). Compiled as a
+    /// direct call, with inline fast paths for fixnum arithmetic and comparisons.
+    BuiltinCall {
+        desc: &'static BuiltinDesc,
         args: Vec<Node>,
         pos: u32,
     },
@@ -174,9 +184,19 @@ impl FnNode {
     }
 }
 
+/// Static type of a local or expression: a tagged value, or an unboxed primitive
+/// (`^long`/`^double` hints, numeric literals and arithmetic on typed operands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ty {
+    Val,
+    Long,
+    Double,
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalInfo {
     pub name: String,
+    pub ty: Ty,
 }
 
 struct RecurCtx {
@@ -185,6 +205,208 @@ struct RecurCtx {
     used: bool,
     /// `try` nesting depth when the target was entered; `recur` may not cross a `try`.
     try_depth: usize,
+    /// Static types of the arguments of every `recur` to this target, for checking
+    /// that primitive loop locals stay primitive.
+    arg_tys: Vec<Vec<Ty>>,
+}
+
+/// `^long` / `^double` on a binding symbol.
+fn hint_of(form: &Value) -> Option<Ty> {
+    let sym = symbol::as_sym(form)?;
+    let m = map::as_map(&sym.meta)?;
+    let tag = m.m.get(&keyword::intern(None, "tag"))?;
+    match symbol::as_sym(tag)?.name() {
+        "double" => Some(Ty::Double),
+        "long" => Some(Ty::Long),
+        _ => None,
+    }
+}
+
+/// `recur` or `throw` never produce a value, so they take the type of the other branch.
+fn is_bottom(n: &Node) -> bool {
+    matches!(n, Node::Recur { .. } | Node::Throw(_))
+}
+
+/// Memo of expression types keyed by node address (the tree is not mutated while a
+/// function is compiled).
+pub type TyCache = HashMap<usize, Ty>;
+
+/// The static type of an expression given the locals' types. Sound by construction:
+/// a `Long` expression always evaluates to an integer (or throws), a `Double` one to
+/// a double (or throws), so unboxed evaluation cannot change a program's result.
+pub fn ty_of(node: &Node, locals: &[LocalInfo]) -> Ty {
+    ty_of_memo(node, locals, &mut TyCache::new())
+}
+
+/// `ty_of` with a memo, for code generation (the analyzer's locals may still change
+/// while it infers, so it uses a fresh memo per query).
+pub fn ty_of_memo(node: &Node, locals: &[LocalInfo], cache: &mut TyCache) -> Ty {
+    let key = node as *const Node as usize;
+    if let Some(&t) = cache.get(&key) {
+        return t;
+    }
+    let t = match node {
+        Node::Const(v) => {
+            if v.as_int().is_some() {
+                Ty::Long
+            } else if v.as_double().is_some() {
+                Ty::Double
+            } else {
+                Ty::Val
+            }
+        }
+        Node::Local(id) => locals.get(*id as usize).map_or(Ty::Val, |l| l.ty),
+        Node::If { then, else_, .. } => {
+            let t = ty_of_memo(then, locals, cache);
+            let e = ty_of_memo(else_, locals, cache);
+            if is_bottom(then) {
+                e
+            } else if is_bottom(else_) || t == e {
+                t
+            } else {
+                Ty::Val
+            }
+        }
+        Node::Do(nodes) => nodes
+            .last()
+            .map_or(Ty::Val, |n| ty_of_memo(n, locals, cache)),
+        Node::Let { body, .. } | Node::Loop { body, .. } => ty_of_memo(body, locals, cache),
+        Node::BuiltinCall { desc, args, .. } => match PrimOp::of(desc, args.len()) {
+            Some(op) => {
+                let tys: Vec<Ty> = args.iter().map(|a| ty_of_memo(a, locals, cache)).collect();
+                op.result_ty(&tys)
+            }
+            None => Ty::Val,
+        },
+        _ => Ty::Val,
+    };
+    cache.insert(key, t);
+    t
+}
+
+/// Core operators the compiler implements itself: fixnum fast paths on tagged values
+/// and unboxed arithmetic on primitives. One table drives type inference and code
+/// generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Inc,
+    Dec,
+    Rem,
+    Quot,
+    Mod,
+    ToDouble,
+    ToLong,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    NumEq,
+    Ne,
+    Zero,
+    Pos,
+    Neg,
+}
+
+impl PrimOp {
+    pub fn of(desc: &BuiltinDesc, argc: usize) -> Option<PrimOp> {
+        if desc.ns != "clojure.core" {
+            return None;
+        }
+        Some(match (desc.name, argc) {
+            ("+", _) => PrimOp::Add,
+            ("*", _) => PrimOp::Mul,
+            ("-", n) if n >= 1 => PrimOp::Sub,
+            ("/", n) if n >= 1 => PrimOp::Div,
+            ("inc", 1) => PrimOp::Inc,
+            ("dec", 1) => PrimOp::Dec,
+            ("rem", 2) => PrimOp::Rem,
+            ("quot", 2) => PrimOp::Quot,
+            ("mod", 2) => PrimOp::Mod,
+            ("double", 1) => PrimOp::ToDouble,
+            ("long", 1) => PrimOp::ToLong,
+            ("<", 2) => PrimOp::Lt,
+            ("<=", 2) => PrimOp::Le,
+            (">", 2) => PrimOp::Gt,
+            (">=", 2) => PrimOp::Ge,
+            ("=", 2) => PrimOp::Eq,
+            ("==", 2) => PrimOp::NumEq,
+            ("not=", 2) => PrimOp::Ne,
+            ("zero?", 1) => PrimOp::Zero,
+            ("pos?", 1) => PrimOp::Pos,
+            ("neg?", 1) => PrimOp::Neg,
+            _ => return None,
+        })
+    }
+
+    pub fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            PrimOp::Lt
+                | PrimOp::Le
+                | PrimOp::Gt
+                | PrimOp::Ge
+                | PrimOp::Eq
+                | PrimOp::NumEq
+                | PrimOp::Ne
+        )
+    }
+
+    pub fn is_sign_test(self) -> bool {
+        matches!(self, PrimOp::Zero | PrimOp::Pos | PrimOp::Neg)
+    }
+
+    /// Comparisons and sign tests: the result is a boolean on every path.
+    pub fn is_predicate(self) -> bool {
+        self.is_comparison() || self.is_sign_test()
+    }
+
+    /// Operators with a fast path on tagged fixnums when the operand types are not
+    /// statically known.
+    pub fn has_fixnum_path(self, argc: usize) -> bool {
+        match self {
+            PrimOp::Add | PrimOp::Sub | PrimOp::Mul => argc == 2,
+            PrimOp::Inc | PrimOp::Dec => true,
+            _ => self.is_predicate(),
+        }
+    }
+
+    /// Result type of an arithmetic operator: `Long` when every operand is a long
+    /// (integer overflow throws as it would in the builtin), `Double` when any operand
+    /// is a double (the rest are coerced, with a `ClassCastException` for non-numbers,
+    /// as the builtin would throw), `Val` otherwise. Predicates are values (booleans).
+    pub fn result_ty(self, tys: &[Ty]) -> Ty {
+        let all_long = tys.iter().all(|t| *t == Ty::Long);
+        let any_double = tys.contains(&Ty::Double);
+        match self {
+            PrimOp::Add | PrimOp::Mul if tys.is_empty() => Ty::Long,
+            PrimOp::Add | PrimOp::Sub | PrimOp::Mul => {
+                if any_double {
+                    Ty::Double
+                } else if all_long {
+                    Ty::Long
+                } else {
+                    Ty::Val
+                }
+            }
+            PrimOp::Div if any_double => Ty::Double,
+            PrimOp::Inc | PrimOp::Dec if tys[0] != Ty::Val => tys[0],
+            PrimOp::Rem | PrimOp::Quot | PrimOp::Mod if all_long => Ty::Long,
+            PrimOp::ToDouble => Ty::Double,
+            PrimOp::ToLong => Ty::Long,
+            _ => Ty::Val,
+        }
+    }
+}
+
+/// May a `recur` argument of type `arg` rebind a loop local of type `var`? A long
+/// widens to a double; anything else must match exactly.
+fn recur_compatible(var: Ty, arg: Ty) -> bool {
+    var == arg || (var == Ty::Double && arg == Ty::Long)
 }
 
 struct Frame {
@@ -203,6 +425,21 @@ pub struct Analyzer {
 }
 
 pub use rscl_runtime::reader::is_special;
+
+/// The builtin a var call may be linked to directly: the var must currently hold the
+/// runtime's own fn for that name (so a redefinition before this point is honoured),
+/// and must not be dynamic or a macro. Later rebinding of such a var is not seen by
+/// code compiled earlier (direct linking, as `clojure.compiler.direct-linking` does).
+fn direct_builtin(var: &VarObj) -> Option<&'static BuiltinDesc> {
+    if var.has_flag(FLAG_DYNAMIC) || var.is_macro() {
+        return None;
+    }
+    let desc = rscl_runtime::core::find(&var.ns, &var.name)?;
+    let root = var.root();
+    let is_that_builtin =
+        func::as_fn(&root).is_some_and(|f| std::ptr::fn_addr_eq(f.proto().entry, desc.entry));
+    is_that_builtin.then_some(desc)
+}
 
 impl Analyzer {
     pub fn new(ns: &'static ns::NsObj) -> Self {
@@ -236,9 +473,14 @@ impl Analyzer {
     }
 
     fn declare_local(&mut self, name: &str) -> LocalId {
+        self.declare_typed(name, Ty::Val)
+    }
+
+    fn declare_typed(&mut self, name: &str, ty: Ty) -> LocalId {
         let id = self.locals.len() as LocalId;
         self.locals.push(LocalInfo {
             name: name.to_string(),
+            ty,
         });
         self.frame()
             .scopes
@@ -444,6 +686,15 @@ impl Analyzer {
             .iter()
             .map(|a| self.analyze(a, false))
             .collect::<CResult<Vec<_>>>()?;
+        if let Node::VarRef(v) = &f
+            && let Some(desc) = direct_builtin(v.get())
+        {
+            return Ok(Node::BuiltinCall {
+                desc,
+                args,
+                pos: pos::pos_id(form),
+            });
+        }
         Ok(Node::Call {
             f: Box::new(f),
             args,
@@ -638,9 +889,16 @@ impl Analyzer {
             meta = Some(m);
         }
         let meta = meta.map(rscl_runtime::obj::map::new);
-        if let Some(m) = &meta {
-            // Flags matter at compile time too (a `binding` in the same file).
-            var_obj.set_meta(m.clone());
+        // Like Clojure, `^:dynamic` takes effect at compile time (a `binding` later in
+        // the same form); the rest of the metadata is applied when the def runs, so a
+        // throwing init leaves it untouched.
+        if let Some(m) = &meta
+            && rscl_runtime::obj::map::get(m)
+                .m
+                .get(&keyword::intern(None, "dynamic"))
+                .is_some_and(Value::truthy)
+        {
+            var_obj.set_flag(FLAG_DYNAMIC, true);
         }
         let init = match init {
             Some(f) => Some(Box::new(self.analyze(f, false)?)),
@@ -671,6 +929,7 @@ impl Analyzer {
         }
         self.push_scope();
         let mut bindings = Vec::new();
+        let mut hinted = Vec::new();
         let pairs: Vec<Value> = bv.v.iter().cloned().collect();
         for kv in pairs.chunks(2) {
             let Some(sym) = symbol::as_sym(&kv[0]) else {
@@ -694,26 +953,62 @@ impl Analyzer {
                     return Err(e);
                 }
             };
-            let id = self.declare_local(sym.name());
+            // A hint fixes the type; otherwise a primitive initialiser makes the
+            // local primitive (for a loop, provisionally: see below).
+            let hint = hint_of(&kv[0]);
+            let ty = hint.unwrap_or_else(|| ty_of(&init, &self.locals));
+            let id = self.declare_typed(sym.name(), ty);
+            hinted.push(hint.is_some());
             bindings.push((id, init));
         }
         let loop_id = self.next_loop;
         if is_loop {
             self.next_loop += 1;
-            let try_depth = self.frame().try_depth;
-            self.frame().recur.push(RecurCtx {
-                target: RecurTarget::Loop(loop_id),
-                arity: bindings.len(),
-                used: false,
-                try_depth,
-            });
         }
-        let body = self.analyze_body(&items[2..], tail || is_loop);
-        if is_loop {
-            self.frame().recur.pop();
-        }
+        let try_depth = self.frame().try_depth;
+        // A loop local inferred primitive must be rebound with the same primitive by
+        // every `recur`; otherwise it is demoted to a value and the body analysed
+        // again, since the types of the locals bound inside it may change.
+        let body = loop {
+            if is_loop {
+                self.frame().recur.push(RecurCtx {
+                    target: RecurTarget::Loop(loop_id),
+                    arity: bindings.len(),
+                    used: false,
+                    try_depth,
+                    arg_tys: Vec::new(),
+                });
+            }
+            let body = self.analyze_body(&items[2..], tail || is_loop);
+            let ctx = if is_loop {
+                self.frame().recur.pop()
+            } else {
+                None
+            };
+            let body = match body {
+                Ok(b) => b,
+                Err(e) => {
+                    self.pop_scope();
+                    return Err(e);
+                }
+            };
+            let Some(ctx) = ctx else { break body };
+            let mut demoted = false;
+            for (i, (id, _)) in bindings.iter().enumerate() {
+                let ty = self.locals[*id as usize].ty;
+                if ty == Ty::Val || hinted[i] {
+                    continue;
+                }
+                if !ctx.arg_tys.iter().all(|tys| recur_compatible(ty, tys[i])) {
+                    self.locals[*id as usize].ty = Ty::Val;
+                    demoted = true;
+                }
+            }
+            if !demoted {
+                break body;
+            }
+        };
         self.pop_scope();
-        let body = body?;
         Ok(if is_loop {
             Node::Loop {
                 id: loop_id,
@@ -752,7 +1047,10 @@ impl Analyzer {
             .iter()
             .map(|a| self.analyze(a, false))
             .collect::<CResult<Vec<_>>>()?;
-        self.frame().recur.last_mut().unwrap().used = true;
+        let tys: Vec<Ty> = args.iter().map(|a| ty_of(a, &self.locals)).collect();
+        let ctx = self.frame().recur.last_mut().unwrap();
+        ctx.used = true;
+        ctx.arg_tys.push(tys);
         Ok(Node::Recur { target, args })
     }
 
@@ -841,7 +1139,8 @@ impl Analyzer {
                     self.pop_scope();
                     return fail(p, "Can't use qualified name as parameter");
                 }
-                params.push(self.declare_local(sym.name()));
+                let ty = hint_of(p).unwrap_or(Ty::Val);
+                params.push(self.declare_typed(sym.name(), ty));
                 i += 1;
             }
             if params.len() >= 64 {
@@ -855,6 +1154,7 @@ impl Analyzer {
                 arity: n_recur,
                 used: false,
                 try_depth,
+                arg_tys: Vec::new(),
             });
             let body = self.analyze_body(&af[1..], true);
             let ctx = self.frame().recur.pop().unwrap();

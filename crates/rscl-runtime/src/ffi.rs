@@ -37,6 +37,55 @@ pub unsafe extern "C" fn rt_release(v: Value) {
     drop(v);
 }
 
+// ---- primitives --------------------------------------------------------------------
+
+/// Unbox a number as `f64` for primitive arithmetic (`nil` on success, `EXC` with a
+/// `ClassCastException` otherwise, the error the boxed operator would raise).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_unbox_double(v: VRef, out: *mut f64) -> Value {
+    match crate::num::expect_num(&v) {
+        Ok(crate::num::Num::I(n)) => {
+            unsafe { *out = n as f64 };
+            Value::NIL
+        }
+        Ok(crate::num::Num::D(d)) => {
+            unsafe { *out = d };
+            Value::NIL
+        }
+        Err(_) => Value::EXC,
+    }
+}
+
+/// Unbox an integer as `i64`. `strict` (a `^long` binding) rejects doubles like a
+/// primitive parameter would; otherwise a double is truncated as `(long d)` does.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_unbox_long(v: VRef, out: *mut i64, strict: i64) -> Value {
+    match crate::num::expect_num(&v) {
+        Ok(crate::num::Num::I(n)) => {
+            unsafe { *out = n };
+            Value::NIL
+        }
+        Ok(crate::num::Num::D(d)) if strict == 0 => {
+            unsafe { *out = d as i64 };
+            Value::NIL
+        }
+        Ok(crate::num::Num::D(_)) => unsafe { rt_throw_prim(2) },
+        Err(_) => Value::EXC,
+    }
+}
+
+/// Failure in inline primitive code: 0 integer overflow, 1 division by zero, 2 a
+/// double where a long is required.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_throw_prim(code: i64) -> Value {
+    match code {
+        0 => exc::throw_new(exception::ARITHMETIC, "integer overflow"),
+        1 => exc::throw_new(exception::ARITHMETIC, "Divide by zero"),
+        _ => exc::throw_new(exception::CLASS_CAST, "Double cannot be cast to Long"),
+    };
+    Value::EXC
+}
+
 // ---- constants ---------------------------------------------------------------------
 
 #[unsafe(no_mangle)]

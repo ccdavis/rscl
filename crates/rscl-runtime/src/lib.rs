@@ -33,3 +33,10 @@ pub const CORE_CLJ: &str = include_str!("../core/core.clj");
 pub use exc::{Exc, RtResult};
 pub use obj::Kind;
 pub use value::{VRef, Value, live_objects};
+
+/// Allocation-heavy workloads (persistent collections, lazy seqs) spend a quarter of
+/// their time in malloc; mimalloc roughly halves that. The staticlib carries it into
+/// AOT-built programs too.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

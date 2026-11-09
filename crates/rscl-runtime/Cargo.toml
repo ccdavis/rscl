@@ -12,10 +12,13 @@ crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 imbl = { workspace = true }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 regex = "1"
 rscl-abi = { path = "../rscl-abi" }
 
 [features]
-default = []
+default = ["mimalloc"]
+# Global allocator; off for valgrind runs, which cannot see mimalloc's heap.
+mimalloc = ["dep:mimalloc"]
 # Count live heap objects (used by tests to catch leaks without valgrind).
 live-count = []

@@ -7,7 +7,7 @@ Where Clojure on the JVM calls Java, rscl calls Rust: the core library is Rust
 functions exposed as first-class fns, and later phases add a typed C-ABI FFI and a
 bridge for exposing whole Rust crates.
 
-Status: Phases 1–7 of the plan are done (see `docs/MILESTONES.md`): a working REPL
+Status: Phases 1–8 of the plan are done (see `docs/MILESTONES.md`): a working REPL
 with per-form incremental compilation and redefinition, `rscl run`, `rscl build`
 producing native binaries, `defmacro` with syntax-quote, lazy sequences, destructuring,
 atoms, regular expressions, a `core.clj` written from scratch on top of the Rust
@@ -16,8 +16,10 @@ namespaces are compiled into built binaries), fn-name stack traces on uncaught
 exceptions, `try`/`catch`/`finally`, a typed C FFI (`defnative`), stack-overflow and
 Ctrl-C guards, a bridge for exposing Rust crates as rscl namespaces, `deftype`,
 `defrecord`, protocols, multimethods, dynamic vars with `binding`, var metadata and
-`doc`, sorted maps and sets, and a differential test corpus that runs every program
-under both the JIT and the AOT compiler. Next: performance (Phase 8).
+`doc`, sorted maps and sets, unboxed `long`/`double` locals with `^long`/`^double`
+hints and inline arithmetic, direct calls to Rust builtins, and a differential test
+corpus that runs every program under both the JIT and the AOT compiler. Next:
+concurrency (Phase 9).
 
 ## Build and run
 
@@ -31,7 +33,9 @@ target/debug/rscl build prog.clj -o prog     # native executable (needs `cc`)
 ```
 
 `build` options: `--opt` (Cranelift `speed`), `--native` (host CPU features instead
-of baseline x86-64), `--keep-obj`, `--link LIB`, `--lib-path DIR`, `--no-eval`. The
+of baseline x86-64), `--keep-obj`, `--link LIB`, `--lib-path DIR`, `--no-eval`.
+`scripts/bench.sh` times `bench/*.clj` against Python and the JVM (see
+`docs/MILESTONES.md`, Phase 8). The
 linker needs `librscl_runtime.a`, found next to the `rscl` binary or via
 `RSCL_RUNTIME_LIB`. `require` looks for `foo/bar.clj` in the program's directory, the
 working directory, each `--path DIR`, and `RSCL_PATH`.

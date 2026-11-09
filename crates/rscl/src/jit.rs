@@ -62,6 +62,8 @@ impl Jit {
         rscl_runtime::entry::init();
         let flags = [
             ("opt_level", "none"),
+            // Fast register allocation: the REPL compiles core.clj at start-up.
+            ("regalloc_algorithm", "single_pass"),
             ("use_colocated_libcalls", "false"),
             ("is_pic", "false"),
             ("preserve_frame_pointers", "true"),
@@ -71,6 +73,10 @@ impl Jit {
         for &f in RtFn::ALL {
             let d = f.desc();
             builder.symbol(d.name, d.addr);
+        }
+        // Direct calls to core builtins import them by their Rust symbol.
+        for d in rscl_runtime::core::all() {
+            builder.symbol(d.symbol, d.entry as *const u8);
         }
         builder.symbol(
             "rscl_interrupt_flag",

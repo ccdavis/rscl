@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::{Kind, cast};
 use crate::value::{ObjHeader, Value};
@@ -17,6 +17,12 @@ pub const FLAG_PRIVATE: u32 = 4;
 #[repr(C)]
 pub struct VarObj {
     pub hdr: ObjHeader,
+    /// Lock-free copy of the root for generated code, valid only when the root can
+    /// never be freed (an immediate or an immortal object) and the var is not
+    /// dynamic; `UNBOUND` otherwise, which sends readers to `rt_var_root`. A stale
+    /// read after a `def` still sees a live (immortal) value, like Clojure's volatile
+    /// root read.
+    fast: AtomicU64,
     pub ns: Box<str>,
     pub name: Box<str>,
     root: Mutex<Value>,
@@ -24,10 +30,15 @@ pub struct VarObj {
     meta: Mutex<Value>,
 }
 
+/// Byte offset of `fast` (ABI for generated code).
+pub const OFF_FAST: i32 = 16;
+const _: () = assert!(std::mem::offset_of!(VarObj, fast) == OFF_FAST as usize);
+
 /// Create an immortal var with no root. Only `ns.rs` should call this.
 pub(crate) fn new(ns: &str, name: &str) -> *const VarObj {
     Box::into_raw(Box::new(VarObj {
         hdr: ObjHeader::immortal(Kind::Var),
+        fast: AtomicU64::new(crate::value::UNBOUND),
         ns: ns.into(),
         name: name.into(),
         root: Mutex::new(Value::UNBOUND),
@@ -118,7 +129,22 @@ impl VarObj {
     /// Replace the root. The old value is released after the lock is dropped.
     pub fn bind_root(&self, v: Value) {
         let old = std::mem::replace(&mut *self.root.lock().unwrap(), v);
+        self.refresh_fast();
         drop(old);
+    }
+
+    /// Recompute `fast` from the root and flags.
+    fn refresh_fast(&self) {
+        let root = self.root.lock().unwrap();
+        let stable = !root.is_unbound()
+            && !self.has_flag(FLAG_DYNAMIC)
+            && root.header().is_none_or(|h| h.is_immortal());
+        let bits = if stable {
+            root.bits()
+        } else {
+            crate::value::UNBOUND
+        };
+        self.fast.store(bits, Ordering::Release);
     }
     pub fn unbind(&self) {
         self.bind_root(Value::UNBOUND);
@@ -131,6 +157,9 @@ impl VarObj {
             self.flags.fetch_or(f, Ordering::AcqRel);
         } else {
             self.flags.fetch_and(!f, Ordering::AcqRel);
+        }
+        if f & FLAG_DYNAMIC != 0 {
+            self.refresh_fast();
         }
     }
     pub fn is_macro(&self) -> bool {

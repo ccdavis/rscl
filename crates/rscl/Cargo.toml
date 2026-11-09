@@ -16,7 +16,7 @@ name = "rscl"
 path = "src/main.rs"
 
 [dependencies]
-rscl-runtime = { path = "../rscl-runtime" }
+rscl-runtime = { path = "../rscl-runtime", default-features = false }
 cranelift-codegen = { workspace = true }
 cranelift-frontend = { workspace = true }
 cranelift-module = { workspace = true }
@@ -27,6 +27,11 @@ rustyline = { workspace = true }
 libloading = { workspace = true }
 
 [dev-dependencies]
-rscl-runtime = { path = "../rscl-runtime", features = ["live-count"] }
+rscl-runtime = { path = "../rscl-runtime", default-features = false, features = ["live-count"] }
 # Built for its cdylib: the bridge tests load target/<profile>/librscl_demo.so.
 rscl-demo = { path = "../../examples/native-demo" }
+
+[features]
+default = ["mimalloc"]
+# Forwarded to the runtime (see its Cargo.toml); `--no-default-features` for valgrind.
+mimalloc = ["rscl-runtime/mimalloc"]

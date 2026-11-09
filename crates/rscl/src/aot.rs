@@ -137,8 +137,10 @@ fn object_module(o: &BuildOptions) -> Result<ObjectModule, BuildError> {
     let isa = isa_builder
         .finish(settings::Flags::new(flags))
         .map_err(internal)?;
-    let builder =
+    let mut builder =
         ObjectBuilder::new(isa, "rscl_program", default_libcall_names()).map_err(internal)?;
+    // One section per function lets the linker drop unreferenced code (`--gc-sections`).
+    builder.per_function_section(true);
     Ok(ObjectModule::new(builder))
 }
 
@@ -184,6 +186,7 @@ fn link(obj: &Path, out: &Path, o: &BuildOptions) -> Result<(), BuildError> {
     // Export symbols so the typed FFI can resolve them with dlsym at start-up, and keep
     // libm/libdl linked even when nothing references them statically.
     cmd.arg("-rdynamic").arg("-Wl,--no-as-needed");
+    cmd.arg("-Wl,--gc-sections");
     for p in &o.lib_paths {
         cmd.arg(format!("-L{p}"));
     }

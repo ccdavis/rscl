@@ -204,3 +204,41 @@ user/documented
 nil
 ```
 
+
+## Phase 8 — Performance (done)
+
+Unboxed `long`/`double` locals (inferred from literals and arithmetic, or forced with
+`^long`/`^double`), inline fixnum and primitive arithmetic and comparisons, direct
+calls to Rust builtins, lock-free var reads for immortal roots, capture-less fns as
+shared immortal objects, inline refcount guards, mimalloc, the single-pass register
+allocator for the JIT, and `--gc-sections` for built binaries.
+
+```
+$ scripts/bench.sh --runs 5          # bench/*.clj; same source for Clojure 1.12 on OpenJDK 21; CPython 3.14
+benchmark        python    clojure   rscl-jit   rscl-aot   rscl-opt
+colls                47        643        606        307        312
+fib                 131        491        347         41         46
+loop_sum            382        485        325         23         20
+mandelbrot          122        492        312         10         10
+(median of 5 runs, milliseconds; the JVM time includes its start-up)
+```
+
+`rscl-jit` is `rscl run`, which includes about 270 ms to compile `core.clj` at start-up;
+`rscl-aot` is a binary from `rscl build`, `rscl-opt` one from `rscl build --opt`.
+`fib` is `(fib 32)`, `loop_sum` ten million iterations of integer arithmetic,
+`mandelbrot` a 320×200 grid with `^double` parameters, `colls` persistent
+vectors/maps, lazy seqs, sorting and string building. Before this phase the AOT
+times were 414, 1183, 696 and 489 ms. The remaining gap on `colls` is allocation in
+the persistent collections and per-element lazy-seq cells (chunked seqs are backlog).
+
+```
+user=> (defn sum-to [^long n] (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc (rem (* i i) 7))) acc)))
+#'user/sum-to
+user=> (time (sum-to 10000000))
+Elapsed time: 18.934731 msecs
+19999999
+user=> (let [x 9223372036854775807] (inc x))         ; primitive arithmetic keeps the semantics
+Execution error: ArithmeticException: integer overflow
+user=> (loop [x 1.0 i 0] (if (< i 3) (recur (* x 2) (inc i)) x))   ; x and i stay unboxed
+8.0
+```

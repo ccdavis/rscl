@@ -8,20 +8,21 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use cranelift_codegen::entity::EntityRef;
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlagsData, SigRef, Signature, StackSlot,
     StackSlotData, StackSlotKind, UserFuncName, Value, types,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
-use rscl_runtime::api::{self, RtFn, Ty};
+use rscl_runtime::api::{self, RtFn, Ty as RtTy};
+use rscl_runtime::core::BuiltinDesc;
 use rscl_runtime::obj::Kind;
 use rscl_runtime::{obj, printer};
 
 use crate::analyzer::{
     Analyzer, Arity, CatchClause, CollKind, FnNode, LocalId, LocalInfo, LoopId, NativeTy, Node,
-    RecurTarget,
+    PrimOp, RecurTarget, Ty, TyCache, ty_of_memo,
 };
 use crate::errors::{CResult, CompileError};
 
@@ -43,6 +44,7 @@ pub struct Compiler<M: Module> {
     pub module: M,
     fb_ctx: FunctionBuilderContext,
     rt_ids: HashMap<RtFn, FuncId>,
+    builtin_ids: HashMap<&'static str, FuncId>,
     debug_ir: bool,
     next_unit: u32,
     /// The runtime's `rscl_interrupt_flag` (an imported data symbol).
@@ -63,6 +65,14 @@ enum ConstEntry {
     /// Address of a C symbol, resolved with dlsym at unit initialisation.
     Native(String),
     Proto {
+        func: FuncId,
+        name: String,
+        mask: u64,
+        vmin: i64,
+    },
+    /// An immortal fn object for a capture-less fn: created once per unit, shared by
+    /// every evaluation of the `fn*` form (Clojure's non-closure fns are singletons too).
+    FnObj {
         func: FuncId,
         name: String,
         mask: u64,
@@ -148,11 +158,11 @@ fn thunk_signature<M: Module>(module: &M) -> Signature {
     sig
 }
 
-fn cl_type(t: Ty) -> cranelift_codegen::ir::Type {
+fn cl_type(t: RtTy) -> cranelift_codegen::ir::Type {
     match t {
-        Ty::I64 => types::I64,
-        Ty::F64 => types::F64,
-        Ty::I32 => types::I32,
+        RtTy::I64 => types::I64,
+        RtTy::F64 => types::F64,
+        RtTy::I32 => types::I32,
     }
 }
 
@@ -162,6 +172,7 @@ impl<M: Module> Compiler<M> {
             module,
             fb_ctx: FunctionBuilderContext::new(),
             rt_ids: HashMap::new(),
+            builtin_ids: HashMap::new(),
             debug_ir: std::env::var_os("RSCL_DEBUG_IR").is_some(),
             next_unit: 0,
             flag_id: None,
@@ -395,7 +406,14 @@ impl<M: Module> Compiler<M> {
             }
             let flag_id = self.flag_id.unwrap();
             let b = FunctionBuilder::new(&mut ctx.func, &mut self.fb_ctx);
-            let mut fc = FnCtx::new(b, &mut self.module, u, &mut self.rt_ids, flag_id)?;
+            let mut fc = FnCtx::new(
+                b,
+                &mut self.module,
+                u,
+                &mut self.rt_ids,
+                &mut self.builtin_ids,
+                flag_id,
+            )?;
             body(&mut fc)?;
             debug_assert!(
                 fc.cleanup.is_empty(),
@@ -594,14 +612,27 @@ impl<M: Module> Compiler<M> {
                         name,
                         mask,
                         vmin,
+                    }
+                    | ConstEntry::FnObj {
+                        func,
+                        name,
+                        mask,
+                        vmin,
                     } => {
                         let fref = fc.func_ref(*func);
                         let addr = fc.b.ins().func_addr(types::I64, fref);
                         let (np, nl) = fc.blob_ptr(name);
                         let mask = fc.b.ins().iconst(types::I64, *mask as i64);
                         let vmin = fc.b.ins().iconst(types::I64, *vmin);
-                        fc.call_rt(RtFn::FnProtoNew, &[addr, np, nl, mask, vmin])
-                            .unwrap()
+                        let proto = fc
+                            .call_rt(RtFn::FnProtoNew, &[addr, np, nl, mask, vmin])
+                            .unwrap();
+                        if matches!(c, ConstEntry::FnObj { .. }) {
+                            let zero = fc.b.ins().iconst(types::I64, 0);
+                            fc.call_rt(RtFn::FnNew, &[proto, zero]).unwrap()
+                        } else {
+                            proto
+                        }
                     }
                 };
                 if matches!(
@@ -611,6 +642,7 @@ impl<M: Module> Compiler<M> {
                         | ConstEntry::Double(_)
                         | ConstEntry::Long(_)
                         | ConstEntry::Edn(_)
+                        | ConstEntry::FnObj { .. }
                 ) {
                     fc.call_rt(RtFn::MakeImmortal, &[v]);
                 }
@@ -676,10 +708,18 @@ fn max_args(node: &Node) -> usize {
             .len()
             .max(max_args(f))
             .max(args.iter().map(max_args).max().unwrap_or(0)),
+        Node::BuiltinCall { args, .. } => {
+            args.len().max(args.iter().map(max_args).max().unwrap_or(0))
+        }
         Node::Coll { items, .. } => items
             .len()
             .max(items.iter().map(max_args).max().unwrap_or(0)),
     }
+}
+
+/// Operators with a fast path on tagged fixnums (operand types unknown statically).
+fn inline_op(desc: &BuiltinDesc, argc: usize) -> Option<PrimOp> {
+    PrimOp::of(desc, argc).filter(|op| op.has_fixnum_path(argc))
 }
 
 // ---- per-function state --------------------------------------------------------------
@@ -727,7 +767,8 @@ enum Cleanup {
 #[derive(Clone)]
 struct LoopCtx {
     header: Block,
-    vars: Vec<Variable>,
+    /// Loop variables with their static types (primitive ones hold raw bits).
+    vars: Vec<(Variable, Ty)>,
     /// `cleanup.len()` right after the loop variables were bound: everything above it
     /// was bound or produced inside the body and must be released before `recur`.
     depth: usize,
@@ -736,6 +777,15 @@ struct LoopCtx {
 #[derive(Clone, Copy)]
 struct Slot {
     var: Variable,
+    /// `Val`: a tagged value. `Long`/`Double`: raw `i64`/`f64` in the variable.
+    ty: Ty,
+}
+
+fn raw_type(ty: Ty) -> cranelift_codegen::ir::Type {
+    match ty {
+        Ty::Double => types::F64,
+        _ => types::I64,
+    }
 }
 
 struct FnCtx<'a, M: Module> {
@@ -744,6 +794,8 @@ struct FnCtx<'a, M: Module> {
     unit: &'a mut UnitCtx,
     rt_ids: &'a mut HashMap<RtFn, FuncId>,
     rt_refs: HashMap<RtFn, FuncRef>,
+    builtin_ids: &'a mut HashMap<&'static str, FuncId>,
+    builtin_refs: HashMap<&'static str, FuncRef>,
     func_refs: HashMap<FuncId, FuncRef>,
     locals: HashMap<LocalId, Slot>,
     cleanup: Vec<Cleanup>,
@@ -753,7 +805,9 @@ struct FnCtx<'a, M: Module> {
     table_base: Value,
     blob_base: Value,
     call_sig: SigRef,
-    local_names: Vec<String>,
+    /// The analyzer's locals table (names for diagnostics, types for inference).
+    local_infos: Vec<LocalInfo>,
+    ty_cache: TyCache,
     /// Active `try` handlers, innermost last.
     handlers: Vec<Handler>,
     flag_id: DataId,
@@ -775,6 +829,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         module: &'a mut M,
         unit: &'a mut UnitCtx,
         rt_ids: &'a mut HashMap<RtFn, FuncId>,
+        builtin_ids: &'a mut HashMap<&'static str, FuncId>,
         flag_id: DataId,
     ) -> CResult<Self> {
         let call_sig = b.func.import_signature(fn_signature(module));
@@ -786,6 +841,8 @@ impl<'a, M: Module> FnCtx<'a, M> {
             unit,
             rt_ids,
             rt_refs: HashMap::new(),
+            builtin_ids,
+            builtin_refs: HashMap::new(),
             func_refs: HashMap::new(),
             locals: HashMap::new(),
             cleanup: Vec::new(),
@@ -795,7 +852,8 @@ impl<'a, M: Module> FnCtx<'a, M> {
             table_base: dummy,
             blob_base: dummy,
             call_sig,
-            local_names: Vec::new(),
+            local_infos: Vec::new(),
+            ty_cache: TyCache::new(),
             handlers: Vec::new(),
             flag_id,
             flag_addr: None,
@@ -828,7 +886,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
     /// Emit the per-function prologue pieces: constant table base, blob base, argv slot.
     fn start(&mut self, argv_cap: usize, locals: &[LocalInfo]) -> CResult<()> {
-        self.local_names = locals.iter().map(|l| l.name.clone()).collect();
+        self.local_infos = locals.to_vec();
         let tgv = self
             .module
             .declare_data_in_func(self.unit.table_id, self.b.func);
@@ -897,6 +955,28 @@ impl<'a, M: Module> FnCtx<'a, M> {
         r
     }
 
+    /// Import of a Rust builtin by its symbol (uniform fn signature).
+    fn builtin_ref(&mut self, desc: &'static BuiltinDesc) -> CResult<FuncRef> {
+        if let Some(&r) = self.builtin_refs.get(desc.symbol) {
+            return Ok(r);
+        }
+        let id = match self.builtin_ids.get(desc.symbol) {
+            Some(&id) => id,
+            None => {
+                let sig = fn_signature(self.module);
+                let id = self
+                    .module
+                    .declare_function(desc.symbol, Linkage::Import, &sig)
+                    .map_err(internal)?;
+                self.builtin_ids.insert(desc.symbol, id);
+                id
+            }
+        };
+        let r = self.module.declare_func_in_func(id, self.b.func);
+        self.builtin_refs.insert(desc.symbol, r);
+        Ok(r)
+    }
+
     fn const_slot(&mut self, e: ConstEntry) -> Value {
         let i = self.unit.intern_const(e);
         self.b.ins().load(
@@ -932,7 +1012,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
     fn release(&mut self, op: Operand) {
         if op.own == Own::Owned {
-            self.call_rt(RtFn::Release, &[op.val]);
+            self.emit_release(op.val);
         }
     }
 
@@ -940,11 +1020,58 @@ impl<'a, M: Module> FnCtx<'a, M> {
     fn make_owned(&mut self, op: Operand) -> Operand {
         match op.own {
             Own::Borrowed => {
-                self.call_rt(RtFn::Retain, &[op.val]);
+                self.emit_retain(op.val);
                 Operand::owned(op.val)
             }
             _ => op,
         }
+    }
+
+    /// Branch to a block in which `v` is known to be a mortal heap object (a pointer
+    /// whose refcount is non-negative); immediates and immortals skip it. Returns the
+    /// continuation block; the caller emits the mortal-case code, jumps to the
+    /// continuation and switches to it.
+    fn rc_guard(&mut self, v: Value) -> Block {
+        let low = self.b.ins().band_imm_s(v, 3);
+        let tag_ok = self.b.ins().icmp_imm_s(IntCC::Equal, low, 0);
+        let nonzero = self.b.ins().icmp_imm_s(IntCC::NotEqual, v, 0);
+        let is_ptr = self.b.ins().band(tag_ok, nonzero);
+        let check = self.b.create_block();
+        let mortal = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.ins().brif(is_ptr, check, &[], cont, &[]);
+        self.b.switch_to_block(check);
+        self.b.seal_block(check);
+        let rc = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), v, api::consts::OFF_RC);
+        let is_mortal = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, rc, 0);
+        self.b.ins().brif(is_mortal, mortal, &[], cont, &[]);
+        self.b.switch_to_block(mortal);
+        self.b.seal_block(mortal);
+        cont
+    }
+
+    /// Release `v` (+1 → 0): a call only for mortal heap objects.
+    fn emit_release(&mut self, v: Value) {
+        let cont = self.rc_guard(v);
+        self.call_rt(RtFn::Release, &[v]);
+        self.b.ins().jump(cont, &[]);
+        self.b.switch_to_block(cont);
+        self.b.seal_block(cont);
+    }
+
+    /// Retain `v`: a call only for mortal heap objects.
+    fn emit_retain(&mut self, v: Value) {
+        let cont = self.rc_guard(v);
+        self.call_rt(RtFn::Retain, &[v]);
+        self.b.ins().jump(cont, &[]);
+        self.b.switch_to_block(cont);
+        self.b.seal_block(cont);
     }
 
     /// Like `make_owned` but the result is always tagged `Owned`, for storage in a
@@ -973,11 +1100,479 @@ impl<'a, M: Module> FnCtx<'a, M> {
     fn bind_local(&mut self, id: LocalId, val: Value, owned: bool) -> Variable {
         let var = self.b.declare_var(types::I64);
         self.b.def_var(var, val);
-        self.locals.insert(id, Slot { var });
+        self.locals.insert(id, Slot { var, ty: Ty::Val });
         if owned {
             self.cleanup.push(Cleanup::Var(var));
         }
         var
+    }
+
+    /// Bind a primitive local holding raw bits (no refcounting).
+    fn bind_typed(&mut self, id: LocalId, raw: Value, ty: Ty) -> Variable {
+        let var = self.b.declare_var(raw_type(ty));
+        self.b.def_var(var, raw);
+        self.locals.insert(id, Slot { var, ty });
+        var
+    }
+
+    fn slot(&self, id: LocalId) -> CResult<Slot> {
+        self.locals.get(&id).copied().ok_or_else(|| {
+            internal(format!(
+                "unbound local #{id} ({})",
+                self.local_infos
+                    .get(id as usize)
+                    .map_or("?", |l| l.name.as_str())
+            ))
+        })
+    }
+
+    /// Static type of a local as the analyzer inferred it (the slot's type may differ
+    /// inside a closure, where captures arrive boxed).
+    fn local_ty(&self, id: LocalId) -> Ty {
+        self.local_infos.get(id as usize).map_or(Ty::Val, |l| l.ty)
+    }
+
+    fn ty_of(&mut self, node: &Node) -> Ty {
+        ty_of_memo(node, &self.local_infos, &mut self.ty_cache)
+    }
+
+    /// A local as a tagged value, boxing a primitive one.
+    fn read_local(&mut self, id: LocalId) -> CResult<Operand> {
+        let slot = self.slot(id)?;
+        let raw = self.b.use_var(slot.var);
+        Ok(match slot.ty {
+            Ty::Val => Operand::borrowed(raw),
+            ty => self.box_raw(raw, ty),
+        })
+    }
+
+    // ---- primitives -----------------------------------------------------------------
+
+    /// Box raw bits: a fixnum when it fits (no allocation), else a heap number.
+    fn box_raw(&mut self, raw: Value, ty: Ty) -> Operand {
+        match ty {
+            Ty::Double => Operand::owned(self.call_rt(RtFn::BoxDouble, &[raw]).unwrap()),
+            Ty::Long => {
+                let shifted = self.b.ins().ishl_imm_s(raw, 1);
+                let back = self.b.ins().sshr_imm_s(shifted, 1);
+                let fits = self.b.ins().icmp(IntCC::Equal, back, raw);
+                let fast = self.b.create_block();
+                let slow = self.b.create_block();
+                let merge = self.b.create_block();
+                self.b.append_block_param(merge, types::I64);
+                self.b.ins().brif(fits, fast, &[], slow, &[]);
+                self.b.switch_to_block(fast);
+                self.b.seal_block(fast);
+                let tagged = self.b.ins().bor_imm_s(shifted, 1);
+                self.b.ins().jump(merge, &[BlockArg::Value(tagged)]);
+                self.b.switch_to_block(slow);
+                self.b.seal_block(slow);
+                let boxed = self.call_rt(RtFn::BoxLong, &[raw]).unwrap();
+                self.b.ins().jump(merge, &[BlockArg::Value(boxed)]);
+                self.b.switch_to_block(merge);
+                self.b.seal_block(merge);
+                Operand::owned(self.b.block_params(merge)[0])
+            }
+            Ty::Val => Operand::borrowed(raw),
+        }
+    }
+
+    /// Unbox a tagged value into raw bits of `want`, throwing `ClassCastException`
+    /// for non-numbers. Fixnums are converted inline; everything else goes through
+    /// the runtime. Consumes `op`.
+    fn unbox(&mut self, op: Operand, want: Ty, strict: bool) -> CResult<Value> {
+        let v = op.val;
+        let is_fix = self.b.ins().band_imm_s(v, 1);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let merge = self.b.create_block();
+        self.b.append_block_param(merge, raw_type(want));
+        self.b.ins().brif(is_fix, fast, &[], slow, &[]);
+
+        self.b.switch_to_block(fast);
+        self.b.seal_block(fast);
+        let n = self.b.ins().sshr_imm_s(v, 1);
+        let r = if want == Ty::Double {
+            self.b.ins().fcvt_from_sint(types::F64, n)
+        } else {
+            n
+        };
+        self.b.ins().jump(merge, &[BlockArg::Value(r)]);
+
+        self.b.switch_to_block(slow);
+        self.b.seal_block(slow);
+        let slot = self.scratch_slot();
+        let out = self.b.ins().stack_addr(types::I64, slot, 0);
+        self.push_tmp(op);
+        let r = if want == Ty::Double {
+            self.call_rt(RtFn::UnboxDouble, &[v, out]).unwrap()
+        } else {
+            let s = self.b.ins().iconst(types::I64, i64::from(strict));
+            self.call_rt(RtFn::UnboxLong, &[v, out, s]).unwrap()
+        };
+        self.check_exc(r);
+        self.pop_tmp(op);
+        let loaded = self.b.ins().stack_load(types::I64, raw_type(want), slot, 0);
+        self.b.ins().jump(merge, &[BlockArg::Value(loaded)]);
+
+        self.b.switch_to_block(merge);
+        self.b.seal_block(merge);
+        let r = self.b.block_params(merge)[0];
+        self.release(op);
+        Ok(r)
+    }
+
+    /// Convert raw bits between primitive types (`Long` widens to `Double`; a double
+    /// is truncated to a long as `(long d)` does).
+    fn convert(&mut self, raw: Value, from: Ty, to: Ty) -> Value {
+        match (from, to) {
+            (Ty::Long, Ty::Double) => self.b.ins().fcvt_from_sint(types::F64, raw),
+            (Ty::Double, Ty::Long) => self.b.ins().fcvt_to_sint_sat(types::I64, raw),
+            _ => raw,
+        }
+    }
+
+    /// Raw bits of `from` where `to` is required: a long widens to a double; a double
+    /// where a long is required (a `^long` binding or parameter) is a
+    /// `ClassCastException`, never a silent truncation (`(long d)` truncates).
+    fn coerce(&mut self, raw: Value, from: Ty, to: Ty) -> CResult<Value> {
+        if from == Ty::Double && to == Ty::Long {
+            let c = self.b.ins().iconst(types::I64, 2);
+            let r = self.call_rt(RtFn::ThrowPrim, &[c]).unwrap();
+            self.emit_exc_path(r);
+            self.dead_block();
+            return Ok(self.raw_zero(to));
+        }
+        Ok(self.convert(raw, from, to))
+    }
+
+    fn raw_zero(&mut self, ty: Ty) -> Value {
+        if ty == Ty::Double {
+            self.b.ins().f64const(0.0)
+        } else {
+            self.b.ins().iconst(types::I64, 0)
+        }
+    }
+
+    /// Throw an `ArithmeticException` when `cond` holds (ends in the continuation).
+    fn arith_check(&mut self, cond: Value, code: i64) {
+        let fail = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.ins().brif(cond, fail, &[], cont, &[]);
+        self.b.switch_to_block(fail);
+        self.b.seal_block(fail);
+        let c = self.b.ins().iconst(types::I64, code);
+        let r = self.call_rt(RtFn::ThrowPrim, &[c]).unwrap();
+        self.emit_exc_path(r);
+        self.b.switch_to_block(cont);
+        self.b.seal_block(cont);
+    }
+
+    /// Evaluate `node` to raw bits of type `want` (`Long` or `Double`).
+    fn compile_typed(&mut self, node: &Node, want: Ty) -> CResult<Value> {
+        debug_assert!(want != Ty::Val);
+        match node {
+            Node::Const(v) => {
+                if let Some(n) = v.as_int() {
+                    return Ok(if want == Ty::Double {
+                        self.b.ins().f64const(n as f64)
+                    } else {
+                        self.b.ins().iconst(types::I64, n)
+                    });
+                }
+                // A double literal in a long context only arises from a strict `^long`
+                // binding, which must throw: fall through to the generic unboxing.
+                if let Some(d) = v.as_double()
+                    && want == Ty::Double
+                {
+                    return Ok(self.b.ins().f64const(d));
+                }
+            }
+            Node::Local(id) => {
+                let slot = self.slot(*id)?;
+                if slot.ty != Ty::Val {
+                    let raw = self.b.use_var(slot.var);
+                    return self.coerce(raw, slot.ty, want);
+                }
+            }
+            Node::If { test, then, else_ } if self.ty_of(node) != Ty::Val => {
+                let c = self.compile_cond(test)?;
+                let then_b = self.b.create_block();
+                let else_b = self.b.create_block();
+                let merge = self.b.create_block();
+                self.b.append_block_param(merge, raw_type(want));
+                self.b.ins().brif(c, then_b, &[], else_b, &[]);
+                self.b.switch_to_block(then_b);
+                self.b.seal_block(then_b);
+                let a = self.compile_typed(then, want)?;
+                self.b.ins().jump(merge, &[BlockArg::Value(a)]);
+                self.b.switch_to_block(else_b);
+                self.b.seal_block(else_b);
+                let e = self.compile_typed(else_, want)?;
+                self.b.ins().jump(merge, &[BlockArg::Value(e)]);
+                self.b.switch_to_block(merge);
+                self.b.seal_block(merge);
+                return Ok(self.b.block_params(merge)[0]);
+            }
+            Node::Let { bindings, body } => {
+                let vars = self.bind_all(bindings, false)?;
+                let r = self.compile_typed(body, want)?;
+                self.release_locals(&vars);
+                return Ok(r);
+            }
+            Node::Do(nodes) if !nodes.is_empty() => {
+                for n in &nodes[..nodes.len() - 1] {
+                    let op = self.compile(n)?;
+                    self.release(op);
+                }
+                return self.compile_typed(&nodes[nodes.len() - 1], want);
+            }
+            Node::Recur { target, args } => {
+                self.compile_recur(*target, args)?;
+                return Ok(self.raw_zero(want));
+            }
+            Node::Throw(e) => {
+                self.compile_throw(e)?;
+                return Ok(self.raw_zero(want));
+            }
+            Node::BuiltinCall { desc, args, .. } => {
+                let ty = self.ty_of(node);
+                if ty != Ty::Val {
+                    let raw = self.compile_prim_builtin(desc, args, ty)?;
+                    return self.coerce(raw, ty, want);
+                }
+            }
+            _ => {}
+        }
+        // Anything else: evaluate as a value and unbox (a `^long` binding is strict).
+        let op = self.compile(node)?;
+        self.unbox(op, want, want == Ty::Long)
+    }
+
+    /// Evaluate operands left to right to raw bits of `want`: statically primitive ones
+    /// directly, the rest as values that are unboxed only after every operand has been
+    /// evaluated, so a `ClassCastException` surfaces at the same point as in the
+    /// builtin. Unboxing runs newest first, keeping the earlier operands protected on
+    /// the temporary stack while a later one may throw.
+    fn prim_args(&mut self, args: &[Node], want: Ty) -> CResult<Vec<Value>> {
+        enum Pre {
+            Raw(Value),
+            Boxed(Operand),
+        }
+        let mut pre = Vec::with_capacity(args.len());
+        for a in args {
+            if self.ty_of(a) != Ty::Val {
+                pre.push(Pre::Raw(self.compile_typed(a, want)?));
+            } else {
+                let op = self.compile(a)?;
+                self.push_tmp(op);
+                pre.push(Pre::Boxed(op));
+            }
+        }
+        let mut out: Vec<Option<Value>> = vec![None; pre.len()];
+        for (i, p) in pre.into_iter().enumerate().rev() {
+            out[i] = Some(match p {
+                Pre::Raw(v) => v,
+                Pre::Boxed(op) => {
+                    self.pop_tmp(op);
+                    self.unbox(op, want, want == Ty::Long)?
+                }
+            });
+        }
+        Ok(out.into_iter().map(|v| v.expect("operand")).collect())
+    }
+
+    /// Primitive arithmetic for a builtin whose static result type is `ty`.
+    fn compile_prim_builtin(
+        &mut self,
+        desc: &'static BuiltinDesc,
+        args: &[Node],
+        ty: Ty,
+    ) -> CResult<Value> {
+        let op = PrimOp::of(desc, args.len()).ok_or_else(|| internal("not a primitive op"))?;
+        match op {
+            PrimOp::ToDouble => return self.compile_typed(&args[0], Ty::Double),
+            PrimOp::ToLong => {
+                // `(long d)` truncates, unlike a `^long` binding.
+                return match self.ty_of(&args[0]) {
+                    Ty::Val => {
+                        let o = self.compile(&args[0])?;
+                        self.unbox(o, Ty::Long, false)
+                    }
+                    t => {
+                        let raw = self.compile_typed(&args[0], t)?;
+                        Ok(self.convert(raw, t, Ty::Long))
+                    }
+                };
+            }
+            PrimOp::Inc | PrimOp::Dec => {
+                let a = self.compile_typed(&args[0], ty)?;
+                return Ok(if ty == Ty::Double {
+                    let one = self.b.ins().f64const(1.0);
+                    if op == PrimOp::Inc {
+                        self.b.ins().fadd(a, one)
+                    } else {
+                        self.b.ins().fsub(a, one)
+                    }
+                } else {
+                    let one = self.b.ins().iconst(types::I64, 1);
+                    let (r, of) = if op == PrimOp::Inc {
+                        self.b.ins().sadd_overflow(a, one)
+                    } else {
+                        self.b.ins().ssub_overflow(a, one)
+                    };
+                    self.arith_check(of, 0);
+                    r
+                });
+            }
+            PrimOp::Rem | PrimOp::Quot | PrimOp::Mod => {
+                let xs = self.prim_args(args, Ty::Long)?;
+                let (a, b) = (xs[0], xs[1]);
+                let zero = self.b.ins().icmp_imm_s(IntCC::Equal, b, 0);
+                self.arith_check(zero, 1);
+                // `MIN / -1` overflows (and traps in hardware): handle -1 separately.
+                let minus_one = self.b.ins().icmp_imm_s(IntCC::Equal, b, -1);
+                let one = self.b.ins().iconst(types::I64, 1);
+                let safe_b = self.b.ins().select(minus_one, one, b);
+                if op == PrimOp::Quot {
+                    let min = self.b.ins().icmp_imm_s(IntCC::Equal, a, i64::MIN);
+                    let overflow = self.b.ins().band(minus_one, min);
+                    self.arith_check(overflow, 0);
+                    let neg = self.b.ins().ineg(a);
+                    let q = self.b.ins().sdiv(a, safe_b);
+                    return Ok(self.b.ins().select(minus_one, neg, q));
+                }
+                let r = self.b.ins().srem(a, safe_b);
+                let zero_v = self.b.ins().iconst(types::I64, 0);
+                let r = self.b.ins().select(minus_one, zero_v, r);
+                if op == PrimOp::Rem {
+                    return Ok(r);
+                }
+                // mod: the result takes the divisor's sign.
+                let x = self.b.ins().bxor(r, b);
+                let differ = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, x, 0);
+                let nonzero = self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
+                let adjust = self.b.ins().band(differ, nonzero);
+                let adjusted = self.b.ins().iadd(r, b);
+                return Ok(self.b.ins().select(adjust, adjusted, r));
+            }
+            _ => {}
+        }
+        // + - * / folds over every operand, evaluated before any arithmetic.
+        if args.is_empty() {
+            return Ok(if op == PrimOp::Mul {
+                self.b.ins().iconst(types::I64, 1)
+            } else {
+                self.b.ins().iconst(types::I64, 0)
+            });
+        }
+        let xs = self.prim_args(args, ty)?;
+        if xs.len() == 1 {
+            return Ok(match op {
+                PrimOp::Sub => {
+                    if ty == Ty::Double {
+                        self.b.ins().fneg(xs[0])
+                    } else {
+                        let zero = self.b.ins().iconst(types::I64, 0);
+                        let (r, of) = self.b.ins().ssub_overflow(zero, xs[0]);
+                        self.arith_check(of, 0);
+                        r
+                    }
+                }
+                PrimOp::Div => {
+                    let one = self.b.ins().f64const(1.0);
+                    self.b.ins().fdiv(one, xs[0])
+                }
+                _ => xs[0],
+            });
+        }
+        let mut acc = xs[0];
+        for &x in &xs[1..] {
+            acc = if ty == Ty::Double {
+                match op {
+                    PrimOp::Add => self.b.ins().fadd(acc, x),
+                    PrimOp::Sub => self.b.ins().fsub(acc, x),
+                    PrimOp::Mul => self.b.ins().fmul(acc, x),
+                    _ => self.b.ins().fdiv(acc, x),
+                }
+            } else {
+                let (r, of) = match op {
+                    PrimOp::Add => self.b.ins().sadd_overflow(acc, x),
+                    PrimOp::Sub => self.b.ins().ssub_overflow(acc, x),
+                    _ => self.b.ins().smul_overflow(acc, x),
+                };
+                self.arith_check(of, 0);
+                r
+            };
+        }
+        Ok(acc)
+    }
+
+    /// A comparison or sign test on primitive operands as an i8 condition, when the
+    /// static types allow it: any double operand makes it a double comparison (longs
+    /// widen, values are unboxed with a check); all-long operands compare as longs.
+    /// `=`/`not=` need both types known (a long never equals a double).
+    fn prim_cond(&mut self, desc: &'static BuiltinDesc, args: &[Node]) -> CResult<Option<Value>> {
+        let Some(op) = PrimOp::of(desc, args.len()).filter(|o| o.is_predicate()) else {
+            return Ok(None);
+        };
+        let tys: Vec<Ty> = args.iter().map(|a| self.ty_of(a)).collect();
+        if op.is_sign_test() {
+            if tys[0] == Ty::Val {
+                return Ok(None);
+            }
+            let a = self.compile_typed(&args[0], tys[0])?;
+            let c = if tys[0] == Ty::Long {
+                let cc = match op {
+                    PrimOp::Zero => IntCC::Equal,
+                    PrimOp::Pos => IntCC::SignedGreaterThan,
+                    _ => IntCC::SignedLessThan,
+                };
+                self.b.ins().icmp_imm_s(cc, a, 0)
+            } else {
+                let z = self.b.ins().f64const(0.0);
+                let cc = match op {
+                    PrimOp::Zero => FloatCC::Equal,
+                    PrimOp::Pos => FloatCC::GreaterThan,
+                    _ => FloatCC::LessThan,
+                };
+                self.b.ins().fcmp(cc, a, z)
+            };
+            return Ok(Some(c));
+        }
+        let any_double = tys.contains(&Ty::Double);
+        let all_long = tys.iter().all(|t| *t == Ty::Long);
+        if matches!(op, PrimOp::Eq | PrimOp::Ne) {
+            if tys[0] == Ty::Val || tys[1] == Ty::Val {
+                return Ok(None);
+            }
+            if tys[0] != tys[1] {
+                // Evaluate for effects; a long and a double are never `=`.
+                for a in args {
+                    let o = self.compile(a)?;
+                    self.release(o);
+                }
+                let r = i64::from(op == PrimOp::Ne);
+                return Ok(Some(self.b.ins().iconst(types::I8, r)));
+            }
+        }
+        let (icc, fcc) = match op {
+            PrimOp::Lt => (IntCC::SignedLessThan, FloatCC::LessThan),
+            PrimOp::Le => (IntCC::SignedLessThanOrEqual, FloatCC::LessThanOrEqual),
+            PrimOp::Gt => (IntCC::SignedGreaterThan, FloatCC::GreaterThan),
+            PrimOp::Ge => (IntCC::SignedGreaterThanOrEqual, FloatCC::GreaterThanOrEqual),
+            PrimOp::Ne => (IntCC::NotEqual, FloatCC::NotEqual),
+            _ => (IntCC::Equal, FloatCC::Equal),
+        };
+        if any_double {
+            let xs = self.prim_args(args, Ty::Double)?;
+            Ok(Some(self.b.ins().fcmp(fcc, xs[0], xs[1])))
+        } else if all_long {
+            let xs = self.prim_args(args, Ty::Long)?;
+            Ok(Some(self.b.ins().icmp(icc, xs[0], xs[1])))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Release and forget owned locals in reverse order of binding.
@@ -990,7 +1585,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
                     "cleanup stack mismatch"
                 );
                 let v = self.b.use_var(*var);
-                self.call_rt(RtFn::Release, &[v]);
+                self.emit_release(v);
             }
             self.locals.remove(id);
         }
@@ -1027,7 +1622,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 Cleanup::Val(v) => v,
                 Cleanup::Var(var) => self.b.use_var(var),
             };
-            self.call_rt(RtFn::Release, &[v]);
+            self.emit_release(v);
         }
         match target {
             Some(block) => {
@@ -1074,23 +1669,39 @@ impl<'a, M: Module> FnCtx<'a, M> {
     fn compile(&mut self, node: &Node) -> CResult<Operand> {
         match node {
             Node::Const(v) => self.compile_const(v),
-            Node::Local(id) => {
-                let slot = *self.locals.get(id).ok_or_else(|| {
-                    internal(format!(
-                        "unbound local #{id} ({})",
-                        self.local_names
-                            .get(*id as usize)
-                            .map_or("?", |l| l.as_str())
-                    ))
-                })?;
-                Ok(Operand::borrowed(self.b.use_var(slot.var)))
-            }
+            Node::Local(id) => self.read_local(*id),
             Node::VarRef(v) => {
                 let var = v.get();
                 let p = self.const_slot(ConstEntry::Var(var.ns.to_string(), var.name.to_string()));
+                // Fast path: the var's lock-free word holds the root when it is an
+                // immediate or immortal (never freed) value; otherwise take the root
+                // under the lock with a +1.
+                let fast = self.b.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    p,
+                    api::consts::OFF_VAR_FAST,
+                );
+                let slow_path =
+                    self.b
+                        .ins()
+                        .icmp_imm_s(IntCC::Equal, fast, api::consts::UNBOUND as i64);
+                let slow = self.b.create_block();
+                let merge = self.b.create_block();
+                self.b.append_block_param(merge, types::I64);
+                self.b
+                    .ins()
+                    .brif(slow_path, slow, &[], merge, &[BlockArg::Value(fast)]);
+                self.b.switch_to_block(slow);
+                self.b.seal_block(slow);
                 let r = self.call_rt(RtFn::VarRoot, &[p]).unwrap();
                 self.check_exc(r);
-                Ok(Operand::owned(r))
+                self.b.ins().jump(merge, &[BlockArg::Value(r)]);
+                self.b.switch_to_block(merge);
+                self.b.seal_block(merge);
+                let v = self.b.block_params(merge)[0];
+                // Releasing an immortal value is a no-op, so both paths may be owned.
+                Ok(Operand::owned(v))
             }
             Node::TheVar(v) => {
                 let var = v.get();
@@ -1112,6 +1723,9 @@ impl<'a, M: Module> FnCtx<'a, M> {
                         self.call_rt(RtFn::VarBindRoot, &[p, op.val]).unwrap()
                     }
                 };
+                // Metadata after the init, so a throwing init leaves the var untouched.
+                // (The analyzer already applied `^:dynamic` at compile time; the root
+                // is republished when the flag changes.)
                 if let Some(m) = meta {
                     let mv = self.compile_const(m)?;
                     let mv = self.make_owned_force(mv);
@@ -1146,6 +1760,14 @@ impl<'a, M: Module> FnCtx<'a, M> {
             Node::Recur { target, args } => self.compile_recur(*target, args),
             Node::Fn(f) => self.compile_fn_value(f),
             Node::Call { f, args, .. } => self.compile_call(f, args),
+            Node::BuiltinCall { desc, args, .. } => {
+                let ty = self.ty_of(node);
+                if ty != Ty::Val {
+                    let raw = self.compile_prim_builtin(desc, args, ty)?;
+                    return Ok(self.box_raw(raw, ty));
+                }
+                self.compile_builtin_call(desc, args, false)
+            }
             Node::Coll { kind, items } => self.compile_coll(*kind, items),
             Node::Throw(e) => self.compile_throw(e),
             Node::Try {
@@ -1415,10 +2037,21 @@ impl<'a, M: Module> FnCtx<'a, M> {
         Ok(Operand::borrowed(self.const_slot(entry)))
     }
 
-    fn compile_if(&mut self, test: &Node, then: &Node, else_: &Node) -> CResult<Operand> {
+    /// An i8 condition for `test`: inline comparisons skip the boolean value.
+    fn compile_cond(&mut self, test: &Node) -> CResult<Value> {
+        if let Node::BuiltinCall { desc, args, .. } = test
+            && (inline_op(desc, args.len()).is_some() || self.ty_of(test) == Ty::Val)
+        {
+            return Ok(self.compile_builtin_call(desc, args, true)?.val);
+        }
         let t = self.compile(test)?;
         let c = self.truthy(t.val);
         self.release(t);
+        Ok(c)
+    }
+
+    fn compile_if(&mut self, test: &Node, then: &Node, else_: &Node) -> CResult<Operand> {
+        let c = self.compile_cond(test)?;
         let then_b = self.b.create_block();
         let else_b = self.b.create_block();
         let merge = self.b.create_block();
@@ -1455,6 +2088,13 @@ impl<'a, M: Module> FnCtx<'a, M> {
     ) -> CResult<Vec<(LocalId, Variable, bool)>> {
         let mut out = Vec::with_capacity(bindings.len());
         for (id, init) in bindings {
+            let ty = self.local_ty(*id);
+            if ty != Ty::Val {
+                let raw = self.compile_typed(init, ty)?;
+                let var = self.bind_typed(*id, raw, ty);
+                out.push((*id, var, false));
+                continue;
+            }
             let op = self.compile(init)?;
             let op = if force_owned {
                 self.make_owned_force(op)
@@ -1491,7 +2131,10 @@ impl<'a, M: Module> FnCtx<'a, M> {
             id,
             LoopCtx {
                 header,
-                vars: vars.iter().map(|(_, v, _)| *v).collect(),
+                vars: vars
+                    .iter()
+                    .map(|(id, v, _)| (*v, self.local_ty(*id)))
+                    .collect(),
                 depth: self.cleanup.len(),
             },
         );
@@ -1509,18 +2152,32 @@ impl<'a, M: Module> FnCtx<'a, M> {
             RecurTarget::Fn => self.fn_recur.clone(),
         }
         .ok_or_else(|| internal("recur target missing"))?;
-        let mut ops = Vec::with_capacity(args.len());
-        for a in args {
-            let op = self.compile(a)?;
-            self.push_tmp(op);
-            ops.push(op);
+        // Primitive loop variables take raw bits; the rest are evaluated as owned
+        // values, kept on the temporary stack while later arguments run.
+        let mut ops: Vec<Option<Operand>> = Vec::with_capacity(args.len());
+        let mut raws: Vec<Value> = Vec::with_capacity(args.len());
+        for (a, (_, ty)) in args.iter().zip(&ctx.vars) {
+            if *ty == Ty::Val {
+                let op = self.compile(a)?;
+                self.push_tmp(op);
+                ops.push(Some(op));
+                raws.push(op.val);
+            } else {
+                let raw = self.compile_typed(a, *ty)?;
+                ops.push(None);
+                raws.push(raw);
+            }
         }
-        for op in ops.iter().rev() {
+        for op in ops.iter().rev().flatten() {
             self.pop_tmp(*op);
         }
         let new_vals: Vec<Value> = ops
             .iter()
-            .map(|op| self.make_owned_force(*op).val)
+            .zip(&raws)
+            .map(|(op, raw)| match op {
+                Some(op) => self.make_owned_force(*op).val,
+                None => *raw,
+            })
             .collect();
         // Locals bound inside the loop body (`let` etc.) are live on this path and
         // would otherwise leak once per iteration: release them, newest first. They
@@ -1531,14 +2188,19 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 Cleanup::Val(v) => v,
                 Cleanup::Var(var) => self.b.use_var(var),
             };
-            self.call_rt(RtFn::Release, &[v]);
+            self.emit_release(v);
         }
-        let olds: Vec<Value> = ctx.vars.iter().map(|v| self.b.use_var(*v)).collect();
-        for (var, val) in ctx.vars.iter().zip(new_vals) {
+        let olds: Vec<Value> = ctx
+            .vars
+            .iter()
+            .filter(|(_, ty)| *ty == Ty::Val)
+            .map(|(v, _)| self.b.use_var(*v))
+            .collect();
+        for ((var, _), val) in ctx.vars.iter().zip(new_vals) {
             self.b.def_var(*var, val);
         }
         for old in olds {
-            self.call_rt(RtFn::Release, &[old]);
+            self.emit_release(old);
         }
         self.b.ins().jump(ctx.header, &[]);
         self.dead_block();
@@ -1547,6 +2209,15 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
     fn compile_fn_value(&mut self, f: &Rc<FnNode>) -> CResult<Operand> {
         let func = self.unit.fn_id(self.module, f)?;
+        if f.captures.is_empty() {
+            let fv = self.const_slot(ConstEntry::FnObj {
+                func,
+                name: f.name.clone(),
+                mask: f.arity_mask(),
+                vmin: f.variadic_min(),
+            });
+            return Ok(Operand::borrowed(fv));
+        }
         let proto = self.const_slot(ConstEntry::Proto {
             func,
             name: f.name.clone(),
@@ -1556,34 +2227,205 @@ impl<'a, M: Module> FnCtx<'a, M> {
         let n = self.b.ins().iconst(types::I64, f.captures.len() as i64);
         let fv = self.call_rt(RtFn::FnNew, &[proto, n]).unwrap();
         for (i, id) in f.captures.iter().enumerate() {
-            let slot = *self
-                .locals
-                .get(id)
-                .ok_or_else(|| internal(format!("capture of unbound local #{id}")))?;
-            let v = self.b.use_var(slot.var);
-            self.call_rt(RtFn::Retain, &[v]);
+            let op = self.read_local(*id)?;
+            let op = self.make_owned_force(op);
             let i = self.b.ins().iconst(types::I64, i as i64);
-            self.call_rt(RtFn::FnSetCapture, &[fv, i, v]);
+            self.call_rt(RtFn::FnSetCapture, &[fv, i, op.val]);
         }
         Ok(Operand::owned(fv))
     }
 
     /// Evaluate `items` and store them in the argv slot; returns (addr, count).
     fn store_args(&mut self, items: &[Node]) -> CResult<(Value, Value, Vec<Operand>)> {
+        let ops = self.eval_args(items)?;
+        let (addr, n) = self.store_ops(&ops);
+        Ok((addr, n, ops))
+    }
+
+    /// Evaluate arguments left to right, keeping each on the owned-temporary stack.
+    fn eval_args(&mut self, items: &[Node]) -> CResult<Vec<Operand>> {
         let mut ops = Vec::with_capacity(items.len());
         for a in items {
             let op = self.compile(a)?;
             self.push_tmp(op);
             ops.push(op);
         }
+        Ok(ops)
+    }
+
+    /// Write evaluated arguments into the argv slot; returns (addr, count).
+    fn store_ops(&mut self, ops: &[Operand]) -> (Value, Value) {
         let addr = self.argv_addr();
         for (i, op) in ops.iter().enumerate() {
             self.b
                 .ins()
                 .store(MemFlagsData::trusted(), op.val, addr, 8 * i as i32);
         }
-        let n = self.b.ins().iconst(types::I64, items.len() as i64);
-        Ok((addr, n, ops))
+        let n = self.b.ins().iconst(types::I64, ops.len() as i64);
+        (addr, n)
+    }
+
+    /// Direct call of a Rust builtin, with an inline fixnum fast path for the
+    /// arithmetic and comparison operators. With `as_cond`, the result is an i8
+    /// condition (for `if`) instead of a value.
+    fn compile_builtin_call(
+        &mut self,
+        desc: &'static BuiltinDesc,
+        args: &[Node],
+        as_cond: bool,
+    ) -> CResult<Operand> {
+        if let Some(c) = self.prim_cond(desc, args)? {
+            return Ok(if as_cond {
+                Operand::imm(c)
+            } else {
+                let t = self.b.ins().iconst(types::I64, api::consts::TRUE as i64);
+                let f = self.b.ins().iconst(types::I64, api::consts::FALSE as i64);
+                Operand::imm(self.b.ins().select(c, t, f))
+            });
+        }
+        let ops = self.eval_args(args)?;
+        let op = inline_op(desc, args.len());
+        let result = match op {
+            Some(op) => self.compile_inline(op, desc, &ops, as_cond)?,
+            None => {
+                let r = self.direct_call(desc, &ops)?;
+                if as_cond {
+                    // Only the truth of the result is needed; the value itself goes.
+                    let c = self.truthy(r);
+                    self.emit_release(r);
+                    Operand::imm(c)
+                } else {
+                    Operand::owned(r)
+                }
+            }
+        };
+        self.release_tmps(&ops);
+        Ok(result)
+    }
+
+    /// `builtin(null, argc, argv)` with the exception check; returns the raw result.
+    fn direct_call(&mut self, desc: &'static BuiltinDesc, ops: &[Operand]) -> CResult<Value> {
+        let (argv, argc) = self.store_ops(ops);
+        let fref = self.builtin_ref(desc)?;
+        let this = self.b.ins().iconst(types::I64, 0);
+        let inst = self.b.ins().call(fref, &[this, argc, argv]);
+        let r = self.b.inst_results(inst)[0];
+        self.check_exc(r);
+        Ok(r)
+    }
+
+    /// Fixnum fast path for `op`, falling back to the builtin for anything else
+    /// (boxed longs, doubles, non-numbers, overflow). Operands are already on the
+    /// temporary stack; the caller releases them.
+    fn compile_inline(
+        &mut self,
+        op: PrimOp,
+        desc: &'static BuiltinDesc,
+        ops: &[Operand],
+        as_cond: bool,
+    ) -> CResult<Operand> {
+        let a = ops[0].val;
+        let b = ops.get(1).map(|o| o.val);
+        let tagged = match b {
+            Some(b) => self.b.ins().band(a, b),
+            None => a,
+        };
+        let is_fix = self.b.ins().band_imm_s(tagged, 1);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let merge = self.b.create_block();
+        let merge_ty = if as_cond { types::I8 } else { types::I64 };
+        self.b.append_block_param(merge, merge_ty);
+        self.b.ins().brif(is_fix, fast, &[], slow, &[]);
+
+        self.b.switch_to_block(fast);
+        self.b.seal_block(fast);
+        let is_pred = op.is_predicate();
+        match op {
+            PrimOp::Add | PrimOp::Sub | PrimOp::Mul | PrimOp::Inc | PrimOp::Dec => {
+                // a = 2x+1, b = 2y+1: the tagged forms combine with one adjustment;
+                // a 64-bit overflow means the result leaves the 63-bit fixnum range.
+                let (res, of) = match op {
+                    PrimOp::Add => {
+                        let b1 = self.b.ins().iadd_imm_s(b.unwrap(), -1);
+                        self.b.ins().sadd_overflow(a, b1)
+                    }
+                    PrimOp::Sub => {
+                        let b1 = self.b.ins().iadd_imm_s(b.unwrap(), -1);
+                        self.b.ins().ssub_overflow(a, b1)
+                    }
+                    PrimOp::Mul => {
+                        let x = self.b.ins().sshr_imm_s(a, 1);
+                        let y2 = self.b.ins().iadd_imm_s(b.unwrap(), -1);
+                        let (p, of) = self.b.ins().smul_overflow(x, y2);
+                        (self.b.ins().bor_imm_s(p, 1), of)
+                    }
+                    PrimOp::Inc => {
+                        let two = self.b.ins().iconst(types::I64, 2);
+                        self.b.ins().sadd_overflow(a, two)
+                    }
+                    _ => {
+                        let two = self.b.ins().iconst(types::I64, 2);
+                        self.b.ins().ssub_overflow(a, two)
+                    }
+                };
+                let res = if as_cond { self.truthy(res) } else { res };
+                self.b
+                    .ins()
+                    .brif(of, slow, &[], merge, &[BlockArg::Value(res)]);
+            }
+            _ => {
+                let c = match op {
+                    PrimOp::Lt => self.b.ins().icmp(IntCC::SignedLessThan, a, b.unwrap()),
+                    PrimOp::Le => self
+                        .b
+                        .ins()
+                        .icmp(IntCC::SignedLessThanOrEqual, a, b.unwrap()),
+                    PrimOp::Gt => self.b.ins().icmp(IntCC::SignedGreaterThan, a, b.unwrap()),
+                    PrimOp::Ge => self
+                        .b
+                        .ins()
+                        .icmp(IntCC::SignedGreaterThanOrEqual, a, b.unwrap()),
+                    PrimOp::Eq | PrimOp::NumEq => self.b.ins().icmp(IntCC::Equal, a, b.unwrap()),
+                    PrimOp::Ne => self.b.ins().icmp(IntCC::NotEqual, a, b.unwrap()),
+                    PrimOp::Zero => self.b.ins().icmp_imm_s(IntCC::Equal, a, 1),
+                    PrimOp::Pos => self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, a, 1),
+                    PrimOp::Neg => self.b.ins().icmp_imm_s(IntCC::SignedLessThan, a, 0),
+                    _ => unreachable!(),
+                };
+                let res = if as_cond {
+                    c
+                } else {
+                    let t = self.b.ins().iconst(types::I64, api::consts::TRUE as i64);
+                    let f = self.b.ins().iconst(types::I64, api::consts::FALSE as i64);
+                    self.b.ins().select(c, t, f)
+                };
+                self.b.ins().jump(merge, &[BlockArg::Value(res)]);
+            }
+        }
+
+        self.b.switch_to_block(slow);
+        self.b.seal_block(slow);
+        let r = self.direct_call(desc, ops)?;
+        let r = if as_cond {
+            let c = self.truthy(r);
+            self.emit_release(r);
+            c
+        } else {
+            r
+        };
+        self.b.ins().jump(merge, &[BlockArg::Value(r)]);
+
+        self.b.switch_to_block(merge);
+        self.b.seal_block(merge);
+        let r = self.b.block_params(merge)[0];
+        // Predicates yield booleans on both paths; arithmetic may yield a boxed long
+        // from the builtin, so it is owned (releasing a fixnum is a no-op).
+        Ok(if as_cond || is_pred {
+            Operand::imm(r)
+        } else {
+            Operand::owned(r)
+        })
     }
 
     fn release_tmps(&mut self, ops: &[Operand]) {
@@ -1682,8 +2524,17 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 .b
                 .ins()
                 .load(types::I64, MemFlagsData::trusted(), argv, 8 * j as i32);
+            let ty = self.local_ty(*id);
+            if ty != Ty::Val {
+                // `^long`/`^double` parameter: unboxed on entry (ClassCastException
+                // for anything else, like a primitive-hinted Clojure fn).
+                let raw = self.unbox(Operand::borrowed(v), ty, true)?;
+                let var = self.bind_typed(*id, raw, ty);
+                vars.push((*id, var, false));
+                continue;
+            }
             if a.has_recur {
-                self.call_rt(RtFn::Retain, &[v]);
+                self.emit_retain(v);
             }
             let var = self.bind_local(*id, v, a.has_recur);
             vars.push((*id, var, a.has_recur));
@@ -1701,7 +2552,10 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.b.switch_to_block(header);
         self.fn_recur = Some(LoopCtx {
             header,
-            vars: vars.iter().map(|(_, v, _)| *v).collect(),
+            vars: vars
+                .iter()
+                .map(|(id, v, _)| (*v, self.local_ty(*id)))
+                .collect(),
             depth: self.cleanup.len(),
         });
         let res = self.compile(&a.body);

@@ -233,7 +233,9 @@ unsafe extern "C" fn api_register_fn(
     // The bridge's `Entry` takes `*const c_void`; ours takes `*const FnObj`: same ABI.
     let entry: func::Entry = unsafe { std::mem::transmute::<Entry, func::Entry>(entry) };
     let proto = func::new_proto(entry, &qualified, arity_mask, variadic_min);
-    ns.intern(name).bind_root(func::new(proto, 0));
+    let f = func::new(proto, 0);
+    crate::ffi::make_immortal(&f);
+    ns.intern(name).bind_root(f);
 }
 unsafe extern "C" fn api_pr_str(v: u64) -> u64 {
     string::from_string(crate::printer::pr_str(&borrowed(v))).into_raw()

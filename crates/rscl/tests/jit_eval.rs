@@ -610,3 +610,81 @@ fn dynamic_vars_and_sorted_colls() {
         );
     });
 }
+
+#[test]
+fn primitives_do_not_leak() {
+    with_jit(|j| {
+        assert_eq!(
+            eval(
+                j,
+                "(loop [i 0 acc 0] (if (< i 1000) (recur (inc i) (+ acc i)) acc))"
+            ),
+            "499500"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(loop [x 0.0 i 0] (if (< i 10) (recur (+ x 0.5) (inc i)) x))"
+            ),
+            "5.0"
+        );
+        // Boxed at the boundary: doubles into a vector, longs beyond the fixnum range.
+        assert_eq!(
+            eval(
+                j,
+                "(loop [i 0 v []] (if (< i 3) (recur (inc i) (conj v (* i 1.5))) v))"
+            ),
+            "[0.0 1.5 3.0]"
+        );
+        assert_eq!(
+            eval(j, "(let [x 4611686018427387903] (+ x 1))"),
+            "4611686018427387904"
+        );
+        assert_eq!(
+            eval(j, "(let [x 1] (+ x nil))"),
+            "EXC ClassCastException: nil cannot be cast to Number"
+        );
+        assert_eq!(
+            eval(j, "(let [d 1.5] (+ d (str \"x\")))"),
+            "EXC ClassCastException: String cannot be cast to Number"
+        );
+        assert_eq!(
+            eval(j, "(let [x 9223372036854775807] (inc x))"),
+            "EXC ArithmeticException: integer overflow"
+        );
+        assert_eq!(
+            eval(j, "(let [a 1 b 0] (rem a b))"),
+            "EXC ArithmeticException: Divide by zero"
+        );
+        def(j, "(defn hinted [^double a ^long b] (+ a b))");
+        assert_eq!(eval(j, "(hinted 1 2)"), "3.0");
+        assert_eq!(
+            eval(j, "(hinted (str \"a\") 2)"),
+            "EXC ClassCastException: String cannot be cast to Number"
+        );
+        assert_eq!(
+            eval(j, "(hinted 1.0 (double 2))"),
+            "EXC ClassCastException: Double cannot be cast to Long"
+        );
+        // A primitive local captured by a closure is boxed once.
+        assert_eq!(
+            eval(j, "(let [d 2.5 f (fn [] (* d 2))] [(f) (f)])"),
+            "[5.0 5.0]"
+        );
+        // Demoted loop local (rebound with a string) behaves as a value.
+        assert_eq!(
+            eval(
+                j,
+                "(loop [x 1 n 0] (if (< n 2) (recur (if (= n 0) (str \"s\") x) (inc n)) x))"
+            ),
+            "\"s\""
+        );
+        // Inline comparisons on boxed values, including the fallback to the builtin.
+        assert_eq!(
+            eval(j, "(let [s (str \"a\")] (if (= s \"a\") :yes :no))"),
+            ":yes"
+        );
+        assert_eq!(eval(j, "(if (next (list 1 2)) :more :done)"), ":more");
+        assert_eq!(eval(j, "(cond (< 2 1) :a (> 2 1) :b)"), ":b");
+    });
+}

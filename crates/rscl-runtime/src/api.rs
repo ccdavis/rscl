@@ -60,6 +60,9 @@ runtime_fns! {
     VarSet        = "rt_var_set"        => crate::ns::rt_var_set : (I64, I64) -> I64;
     VarSetMeta    = "rt_var_set_meta"   => crate::ns::rt_var_set_meta : (I64, I64);
     BoxDouble     = "rt_box_double"     => crate::ffi::rt_box_double : (F64) -> I64;
+    UnboxDouble   = "rt_unbox_double"   => crate::ffi::rt_unbox_double : (I64, I64) -> I64;
+    UnboxLong     = "rt_unbox_long"     => crate::ffi::rt_unbox_long : (I64, I64, I64) -> I64;
+    ThrowPrim     = "rt_throw_prim"     => crate::ffi::rt_throw_prim : (I64) -> I64;
     BoxLong       = "rt_box_long"       => crate::ffi::rt_box_long : (I64) -> I64;
     StringNew     = "rt_string_new"     => crate::ffi::rt_string_new : (I64, I64) -> I64;
     Keyword       = "rt_keyword"        => crate::ffi::rt_keyword : (I64, I64, I64, I64) -> I64;
@@ -100,7 +103,10 @@ runtime_fns! {
 pub mod consts {
     pub use crate::value::{EXC, FALSE, NIL, TRUE, UNBOUND};
     pub const KIND_FN: u32 = crate::obj::Kind::Fn as u32;
+    /// `ObjHeader.rc`, then `ObjHeader.kind`.
+    pub const OFF_RC: i32 = 0;
     pub const OFF_KIND: i32 = 8;
+    pub const OFF_VAR_FAST: i32 = crate::obj::var::OFF_FAST;
     pub const OFF_PROTO: i32 = crate::obj::func::OFF_PROTO;
     pub const OFF_NCAPTURES: i32 = crate::obj::func::OFF_NCAPTURES;
     pub const OFF_CAPTURES: i32 = crate::obj::func::OFF_CAPTURES;

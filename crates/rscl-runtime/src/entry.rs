@@ -20,6 +20,8 @@ pub fn init() {
             let qualified = format!("{}/{}", d.ns, d.name);
             let proto = func::new_proto(d.entry, &qualified, d.arity_mask, d.variadic_min);
             let f = func::new(proto, 0);
+            // Capture-less fns are shared, never freed: var reads need no refcounting.
+            crate::ffi::make_immortal(&f);
             ns::find_or_create(d.ns).intern(d.name).bind_root(f);
         }
         core.intern("*command-line-args*").bind_root(Value::NIL);

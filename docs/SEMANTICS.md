@@ -181,6 +181,37 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   collection with the same contents) and are callable. `sorted-map-by` and
   `sorted-set-by` (custom comparators) are not supported yet.
 
+## Primitives and performance
+
+- Locals have a static type: a tagged value, or an unboxed `long`/`double`. A `let`
+  or `loop` local whose initialiser is a numeric literal or arithmetic on typed
+  operands is primitive; `^long`/`^double` on a binding or fn parameter forces it
+  (a non-number, or a double for `^long`, is a `ClassCastException` at bind time).
+  A loop local stays primitive only if every `recur` rebinds it with the same
+  primitive (a long may widen to a double); otherwise it is an ordinary value.
+- Arithmetic on primitives is inlined: `+ - * inc dec rem quot mod` on longs with
+  the same overflow and division-by-zero `ArithmeticException`s as the boxed
+  operators; `+ - * / inc dec` on doubles; `< <= > >= == zero? pos? neg?` and `=`
+  when the operand types are known. Mixing a double with a value operand coerces the
+  value as `(double x)` would. Results are boxed where a value is needed (a fixnum
+  costs nothing, a double allocates), so the inference never changes a program's
+  result or its exceptions, only its speed.
+- Calls to `clojure.core` fns implemented in Rust (`conj`, `get`, `str`, ...) whose
+  var still holds the runtime's fn are linked directly, like Clojure's
+  direct-linking: redefining such a var later does not affect code compiled before,
+  and the decision is made per top-level form, so a rebinding inside a form is not
+  seen by calls later in that same form (dynamic vars and macros are exempt). User
+  fns are always called through their var, so REPL redefinition works; `+ - * inc
+  dec < <= > >= = == not= zero? pos? neg?` on two fixnums are inlined with a
+  fallback to the fn.
+- A `fn` without captures is one immortal object shared by every evaluation of the
+  form (**divergence**: Clojure creates a new object per evaluation, so two
+  evaluations are not `identical?` there; here they are). A var whose root can never
+  be freed (an immediate or an immortal object) is read without locking or
+  refcounting.
+- `rscl build --opt` compiles with Cranelift's `speed` level and drops unreferenced
+  functions at link time. The JIT uses the fast single-pass register allocator.
+
 ## Memory
 
 - Heap objects are reference counted (atomic). Compile-time constants are immortal.

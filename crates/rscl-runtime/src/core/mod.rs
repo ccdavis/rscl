@@ -1,5 +1,8 @@
 //! Core builtins: Rust functions with the uniform calling convention, registered into
 //! their namespaces at start-up and callable as first-class fns with zero glue.
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use crate::obj::func::Entry;
 use crate::obj::{self, Kind};
 use crate::value::Value;
@@ -15,10 +18,14 @@ pub mod re;
 pub mod string;
 pub mod types;
 
+#[derive(Debug)]
 pub struct BuiltinDesc {
     pub ns: &'static str,
     pub name: &'static str,
     pub entry: Entry,
+    /// Linker symbol of `entry` (the Rust function name), for direct calls from
+    /// compiled code. Direct calls pass a null `this`: builtins never read it.
+    pub symbol: &'static str,
     pub arity_mask: u64,
     pub variadic_min: i64,
 }
@@ -39,8 +46,19 @@ pub fn all() -> impl Iterator<Item = &'static BuiltinDesc> {
         .chain(types::TABLE.iter())
 }
 
+/// Look a builtin up by namespace and name (indexed once; the analyzer asks for
+/// every var call it compiles).
 pub fn find(ns: &str, name: &str) -> Option<&'static BuiltinDesc> {
-    all().find(|d| d.ns == ns && d.name == name)
+    type Index = HashMap<&'static str, HashMap<&'static str, &'static BuiltinDesc>>;
+    static INDEX: OnceLock<Index> = OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let mut m: Index = HashMap::new();
+        for d in all() {
+            m.entry(d.ns).or_default().insert(d.name, d);
+        }
+        m
+    });
+    index.get(ns)?.get(name).copied()
 }
 
 /// Define native functions with the uniform ABI (no namespace registration). Each
@@ -90,6 +108,7 @@ macro_rules! builtins {
                 ns: $ns,
                 name: $name,
                 entry: $ident,
+                symbol: stringify!($ident),
                 arity_mask: 0 $(| (1u64 << $fixed))*,
                 variadic_min: -1 $(+ 1 + $vmin)?,
             }, )*

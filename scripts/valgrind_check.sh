@@ -3,7 +3,8 @@
 # usage: scripts/valgrind_check.sh FILE.clj [more files...]
 set -u
 cd "$(dirname "$0")/.."
-cargo build --release -q || exit 1
+# Without mimalloc: valgrind only tracks the system allocator.
+cargo build --release -q --no-default-features || exit 1
 BIN=target/release/rscl
 export RSCL_NATIVE_PATH="$PWD/target/release"
 fail=0
