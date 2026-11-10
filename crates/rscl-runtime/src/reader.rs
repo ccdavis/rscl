@@ -844,11 +844,18 @@ impl<'a> Reader<'a> {
             Some(rest) => (true, rest),
             None => (false, tok.strip_prefix('+').unwrap_or(tok)),
         };
+        // `36rZN`: in a radix literal a trailing `N` is a digit, never the suffix.
+        let radix_at = body.find(['r', 'R']).filter(|&i| {
+            !body.starts_with("0x")
+                && !body.starts_with("0X")
+                && i > 0
+                && body[..i].chars().all(|c| c.is_ascii_digit())
+        });
         let (body, force_big) = match body.strip_suffix('N') {
-            Some(b) => (b, true),
-            None => (body, false),
+            Some(b) if radix_at.is_none() => (b, true),
+            _ => (body, false),
         };
-        if body.ends_with('M') {
+        if radix_at.is_none() && body.ends_with('M') {
             return Err(self.syntax(format!("BigDecimal literals are not supported yet: {tok}")));
         }
         if body.contains('/') {
@@ -870,10 +877,7 @@ impl<'a> Reader<'a> {
         if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
             return int(hex, 16);
         }
-        if let Some(i) = body.find(['r', 'R'])
-            && body[..i].chars().all(|c| c.is_ascii_digit())
-            && !body[..i].is_empty()
-        {
+        if let Some(i) = radix_at {
             let radix: u32 = body[..i].parse().map_err(|_| bad())?;
             if !(2..=36).contains(&radix) {
                 return Err(self.syntax(format!("Radix out of range: {tok}")));

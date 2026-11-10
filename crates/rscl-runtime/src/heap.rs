@@ -153,18 +153,58 @@ fn hard_failure(size: usize) {
     unsafe { write(2, buf.as_ptr(), n) };
 }
 
-/// Is a raised error waiting for this thread? Consumes it. The error is retargeted
-/// at whoever crosses the limit next, so an unregistered thread (one not running rscl
-/// code) cannot keep it forever.
+/// Is a raised error waiting for this thread? Consumes it. An error addressed to
+/// another thread is dropped by whoever notices that the heap is back under its
+/// limit, so a thread that never reaches a safepoint cannot keep the interrupt flag
+/// raised for everyone. The caller refreshes the flag when this returns true or the
+/// pending state changed.
 pub fn take_oom() -> bool {
     if !OOM_PENDING.load(Ordering::Acquire) {
         return false;
     }
     let target = OOM_THREAD.load(Ordering::Relaxed);
     if target != crate::native::thread_id() {
+        if over_limit().is_none() {
+            OOM_PENDING.store(false, Ordering::Release);
+            crate::native::oom_cleared();
+        }
         return false;
     }
     OOM_PENDING.swap(false, Ordering::AcqRel)
+}
+
+/// Hand this thread's unflushed byte count to the global one, and drop an error
+/// addressed to it. Called when a thread that ran rscl code ends: without it every
+/// short-lived thread would leave up to 64 KB of drift in the count.
+pub fn thread_exit() {
+    let n = DELTA.with(|d| d.replace(0));
+    if n != 0 {
+        LIVE.fetch_add(n, Ordering::Relaxed);
+    }
+    if OOM_PENDING.load(Ordering::Acquire)
+        && OOM_THREAD.load(Ordering::Relaxed) == crate::native::thread_id()
+    {
+        OOM_PENDING.store(false, Ordering::Release);
+        crate::native::oom_cleared();
+    }
+}
+
+struct ExitFlush;
+
+impl Drop for ExitFlush {
+    fn drop(&mut self) {
+        thread_exit();
+    }
+}
+
+thread_local! {
+    static EXIT_FLUSH: ExitFlush = const { ExitFlush };
+}
+
+/// Arrange for `thread_exit` to run again when the thread's locals are destroyed,
+/// which catches what the thread frees after its rscl work is over.
+pub fn arm_exit_flush() {
+    EXIT_FLUSH.with(|_| {});
 }
 
 pub fn oom_pending() -> bool {
@@ -235,20 +275,22 @@ pub fn configure() {
             Ok(0) => set_limit(None),
             Ok(mb) => set_limit(Some(mb.saturating_mul(1 << 20))),
             Err(_) => {
-                eprintln!("rscl: ignoring RSCL_MAX_HEAP_MB={s:?} (expected a number of megabytes)");
-                set_limit(None);
+                eprintln!(
+                    "rscl: ignoring RSCL_MAX_HEAP_MB={s:?} (expected a number of megabytes); using the default limit"
+                );
+                set_limit(default_limit());
             }
         },
-        Err(_) => {
-            let phys = physical_memory();
-            let cg = cgroup_limit();
-            let avail = match (phys, cg) {
-                (Some(p), Some(c)) => Some(p.min(c)),
-                (p, c) => p.or(c),
-            };
-            set_limit(avail.map(|a| a / 2));
-        }
+        Err(_) => set_limit(default_limit()),
     }
+}
+
+fn default_limit() -> Option<usize> {
+    let avail = match (physical_memory(), cgroup_limit()) {
+        (Some(p), Some(c)) => Some(p.min(c)),
+        (p, c) => p.or(c),
+    };
+    avail.map(|a| a / 2)
 }
 
 #[cfg(test)]

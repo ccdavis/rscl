@@ -17,7 +17,7 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
     if a.kind().is_none() && b.kind().is_none() {
         return false;
     }
-    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+    if let (Some(x), Some(y)) = (int_value(a), int_value(b)) {
         return x == y;
     }
     let (Some(ka), Some(kb)) = (a.kind(), b.kind()) else {
@@ -202,7 +202,7 @@ fn hash_set_items<'a>(items: impl Iterator<Item = &'a Value>) -> u64 {
 }
 
 pub fn hasheq(v: &Value) -> u64 {
-    if let Some(n) = v.as_int() {
+    if let Some(n) = int_value(v) {
         return mix64(n as u64);
     }
     let Some(kind) = v.kind() else {
@@ -210,8 +210,8 @@ pub fn hasheq(v: &Value) -> u64 {
         return mix64(v.bits() ^ 0xa5a5);
     };
     match kind {
-        Kind::Long => unreachable!("handled by as_int"),
-        // A BigInt that fits a long was handled by `as_int`, with the long's hash.
+        Kind::Long => unreachable!("handled by int_value"),
+        // A BigInt that fits a long was handled by `int_value`, with the long's hash.
         Kind::BigInt => {
             mix64(hash_bytes(&obj::bigint::get(v).to_signed_bytes_le()) ^ 0xb16b_0000_0000_0001)
         }
@@ -267,6 +267,13 @@ pub fn hasheq(v: &Value) -> u64 {
         | Kind::Protocol
         | Kind::Pending => mix64(v.bits()),
     }
+}
+
+/// The 64-bit integer a value stands for in `=` and `hash`: a long, or a `BigInt`
+/// that fits one (so `(= 1N 1)` and both find the same map entry).
+pub fn int_value(v: &Value) -> Option<i64> {
+    v.as_int()
+        .or_else(|| obj::bigint::as_big(v).and_then(num_traits::ToPrimitive::to_i64))
 }
 
 #[cfg(test)]

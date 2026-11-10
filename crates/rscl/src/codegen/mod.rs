@@ -949,6 +949,8 @@ struct FnCtx<'a, M: Module> {
     /// Last uses of locals (see `liveness`): the value is transferred out and the
     /// variable cleared.
     liveness: Liveness,
+    /// Position of the primitive operation being compiled (for its error path).
+    prim_pos: u32,
     /// The `owned` argument mask, as a variable so `recur` can set bits.
     owned_mask: Option<Variable>,
     /// Active `try` handlers, innermost last.
@@ -998,6 +1000,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
             local_infos: Vec::new(),
             ty_cache: TyCache::new(),
             liveness: Liveness::default(),
+            prim_pos: 0,
             owned_mask: None,
             handlers: Vec::new(),
             flag_id,
@@ -1571,7 +1574,9 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.b.switch_to_block(fail);
         self.b.seal_block(fail);
         let c = self.b.ins().iconst(types::I64, code);
+        self.srcloc(self.prim_pos);
         let r = self.call_rt(RtFn::ThrowPrim, &[c]).unwrap();
+        self.srcloc(0);
         self.emit_exc_path(r);
         self.b.switch_to_block(cont);
         self.b.seal_block(cont);
@@ -1644,10 +1649,10 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 self.compile_throw(expr, *pos)?;
                 return Ok(self.raw_zero(want));
             }
-            Node::BuiltinCall { desc, args, .. } => {
+            Node::BuiltinCall { desc, args, pos } => {
                 let ty = self.ty_of(node);
                 if ty != Ty::Val {
-                    let raw = self.compile_prim_builtin(desc, args, ty)?;
+                    let raw = self.compile_prim_builtin(desc, args, ty, *pos)?;
                     return self.coerce(raw, ty, want);
                 }
             }
@@ -1693,6 +1698,21 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
     /// Primitive arithmetic for a builtin whose static result type is `ty`.
     fn compile_prim_builtin(
+        &mut self,
+        desc: &'static BuiltinDesc,
+        args: &[Node],
+        ty: Ty,
+        pos: u32,
+    ) -> CResult<Value> {
+        // The overflow and divide-by-zero checks of this operation report `pos`; a
+        // nested primitive operand sets and restores its own.
+        let outer = std::mem::replace(&mut self.prim_pos, pos);
+        let r = self.compile_prim_op(desc, args, ty);
+        self.prim_pos = outer;
+        r
+    }
+
+    fn compile_prim_op(
         &mut self,
         desc: &'static BuiltinDesc,
         args: &[Node],
@@ -2076,7 +2096,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
             Node::BuiltinCall { desc, args, pos } => {
                 let ty = self.ty_of(node);
                 if ty != Ty::Val {
-                    let raw = self.compile_prim_builtin(desc, args, ty)?;
+                    let raw = self.compile_prim_builtin(desc, args, ty, *pos)?;
                     return Ok(self.box_raw(raw, ty));
                 }
                 self.compile_builtin_call(desc, args, false, *pos)

@@ -60,46 +60,39 @@ fn big(i: i64) -> BigInt {
     BigInt::from(i)
 }
 
-/// Both as `BigInt`, when neither is a double.
-fn bigs(a: &Num, b: &Num) -> Option<(BigInt, BigInt)> {
-    let conv = |n: &Num| match n {
-        Num::I(i) => Some(big(*i)),
-        Num::B(b) => Some(b.clone()),
-        Num::D(_) => None,
-    };
-    Some((conv(a)?, conv(b)?))
+fn into_big(n: Num) -> BigInt {
+    match n {
+        Num::I(i) => big(i),
+        Num::B(b) => b,
+        Num::D(_) => unreachable!("doubles are handled before integers"),
+    }
+}
+
+fn is_double(a: &Num, b: &Num) -> bool {
+    matches!(a, Num::D(_)) || matches!(b, Num::D(_))
 }
 
 pub fn add(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (&a, &b) {
-        (Num::I(x), Num::I(y)) => Num::I(x.checked_add(*y).map_or_else(overflow, Ok)?),
-        (Num::D(_), _) | (_, Num::D(_)) => Num::D(f(&a) + f(&b)),
-        _ => {
-            let (x, y) = bigs(&a, &b).expect("integers");
-            Num::B(x + y)
-        }
+    Ok(match (a, b) {
+        (Num::I(x), Num::I(y)) => Num::I(x.checked_add(y).map_or_else(overflow, Ok)?),
+        (a, b) if is_double(&a, &b) => Num::D(f(&a) + f(&b)),
+        (a, b) => Num::B(into_big(a) + into_big(b)),
     })
 }
 
 pub fn sub(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (&a, &b) {
-        (Num::I(x), Num::I(y)) => Num::I(x.checked_sub(*y).map_or_else(overflow, Ok)?),
-        (Num::D(_), _) | (_, Num::D(_)) => Num::D(f(&a) - f(&b)),
-        _ => {
-            let (x, y) = bigs(&a, &b).expect("integers");
-            Num::B(x - y)
-        }
+    Ok(match (a, b) {
+        (Num::I(x), Num::I(y)) => Num::I(x.checked_sub(y).map_or_else(overflow, Ok)?),
+        (a, b) if is_double(&a, &b) => Num::D(f(&a) - f(&b)),
+        (a, b) => Num::B(into_big(a) - into_big(b)),
     })
 }
 
 pub fn mul(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (&a, &b) {
-        (Num::I(x), Num::I(y)) => Num::I(x.checked_mul(*y).map_or_else(overflow, Ok)?),
-        (Num::D(_), _) | (_, Num::D(_)) => Num::D(f(&a) * f(&b)),
-        _ => {
-            let (x, y) = bigs(&a, &b).expect("integers");
-            Num::B(x * y)
-        }
+    Ok(match (a, b) {
+        (Num::I(x), Num::I(y)) => Num::I(x.checked_mul(y).map_or_else(overflow, Ok)?),
+        (a, b) if is_double(&a, &b) => Num::D(f(&a) * f(&b)),
+        (a, b) => Num::B(into_big(a) * into_big(b)),
     })
 }
 
@@ -134,17 +127,33 @@ pub fn mul_p(a: Num, b: Num) -> RtResult<Num> {
     }
 }
 
+/// `x / y` as a double for integers that do not divide exactly. Converting each
+/// operand first would give infinity or NaN beyond the double range, so the quotient
+/// is computed to 64 significant bits as an integer and scaled back.
+fn big_ratio(x: &BigInt, y: &BigInt) -> f64 {
+    let shift = 64 - (x.bits() as i64 - y.bits() as i64);
+    let q = if shift >= 0 {
+        (x << shift as usize) / y
+    } else {
+        x / (y << (-shift) as usize)
+    };
+    let q = q.to_f64().unwrap_or(f64::INFINITY);
+    // Two steps keep the scale factor itself inside the double range.
+    let half = -shift / 2;
+    q * 2f64.powi(half as i32) * 2f64.powi((-shift - half) as i32)
+}
+
 pub fn div(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (&a, &b) {
-        (Num::D(_), _) | (_, Num::D(_)) => Num::D(f(&a) / f(&b)),
+    Ok(match (a, b) {
+        (a, b) if is_double(&a, &b) => Num::D(f(&a) / f(&b)),
         (Num::I(_), Num::I(0)) => return err(ARITHMETIC, "Divide by zero"),
-        (Num::I(x), Num::I(y)) => match x.checked_rem(*y) {
-            Some(0) => Num::I(x.checked_div(*y).map_or_else(overflow, Ok)?),
-            Some(_) => Num::D(*x as f64 / *y as f64),
+        (Num::I(x), Num::I(y)) => match x.checked_rem(y) {
+            Some(0) => Num::I(x.checked_div(y).map_or_else(overflow, Ok)?),
+            Some(_) => Num::D(x as f64 / y as f64),
             None => return overflow(),
         },
-        _ => {
-            let (x, y) = bigs(&a, &b).expect("integers");
+        (a, b) => {
+            let (x, y) = (into_big(a), into_big(b));
             if y.is_zero() {
                 return err(ARITHMETIC, "Divide by zero");
             }
@@ -152,15 +161,15 @@ pub fn div(a: Num, b: Num) -> RtResult<Num> {
             if r.is_zero() {
                 Num::B(q)
             } else {
-                Num::D(f(&a) / f(&b))
+                Num::D(big_ratio(&x, &y))
             }
         }
     })
 }
 
 pub fn quot(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (&a, &b) {
-        (Num::D(_), _) | (_, Num::D(_)) => {
+    Ok(match (a, b) {
+        (a, b) if is_double(&a, &b) => {
             let q = f(&a) / f(&b);
             if q.is_finite() {
                 Num::D(q.trunc())
@@ -169,9 +178,9 @@ pub fn quot(a: Num, b: Num) -> RtResult<Num> {
             }
         }
         (Num::I(_), Num::I(0)) => return err(ARITHMETIC, "Divide by zero"),
-        (Num::I(x), Num::I(y)) => Num::I(x.checked_div(*y).map_or_else(overflow, Ok)?),
-        _ => {
-            let (x, y) = bigs(&a, &b).expect("integers");
+        (Num::I(x), Num::I(y)) => Num::I(x.checked_div(y).map_or_else(overflow, Ok)?),
+        (a, b) => {
+            let (x, y) = (into_big(a), into_big(b));
             if y.is_zero() {
                 return err(ARITHMETIC, "Divide by zero");
             }
@@ -181,8 +190,8 @@ pub fn quot(a: Num, b: Num) -> RtResult<Num> {
 }
 
 pub fn rem(a: Num, b: Num) -> RtResult<Num> {
-    Ok(match (&a, &b) {
-        (Num::D(_), _) | (_, Num::D(_)) => {
+    Ok(match (a, b) {
+        (a, b) if is_double(&a, &b) => {
             let (x, y) = (f(&a), f(&b));
             if y == 0.0 {
                 return err(ARITHMETIC, "Divide by zero");
@@ -191,9 +200,9 @@ pub fn rem(a: Num, b: Num) -> RtResult<Num> {
             }
         }
         (Num::I(_), Num::I(0)) => return err(ARITHMETIC, "Divide by zero"),
-        (Num::I(x), Num::I(y)) => Num::I(x.checked_rem(*y).unwrap_or(0)),
-        _ => {
-            let (x, y) = bigs(&a, &b).expect("integers");
+        (Num::I(x), Num::I(y)) => Num::I(x.checked_rem(y).unwrap_or(0)),
+        (a, b) => {
+            let (x, y) = (into_big(a), into_big(b));
             if y.is_zero() {
                 return err(ARITHMETIC, "Divide by zero");
             }
@@ -204,20 +213,36 @@ pub fn rem(a: Num, b: Num) -> RtResult<Num> {
 
 /// Clojure `mod`: result has the sign of the divisor.
 pub fn modulo(a: Num, b: Num) -> RtResult<Num> {
-    if let Some((x, y)) = bigs(&a, &b)
-        && !matches!((&a, &b), (Num::I(_), Num::I(_)))
-    {
-        if y.is_zero() {
-            return err(ARITHMETIC, "Divide by zero");
+    match (a, b) {
+        (Num::I(_), Num::I(0)) => err(ARITHMETIC, "Divide by zero"),
+        (Num::I(x), Num::I(y)) => {
+            let r = x.checked_rem(y).unwrap_or(0);
+            Ok(Num::I(if r != 0 && (r < 0) != (y < 0) {
+                r + y
+            } else {
+                r
+            }))
         }
-        return Ok(Num::B(x.mod_floor(&y)));
+        (a, b) if is_double(&a, &b) => {
+            let y = f(&b);
+            let r = match rem(a, b)? {
+                Num::D(r) => r,
+                _ => unreachable!("double rem"),
+            };
+            Ok(Num::D(if r != 0.0 && (r < 0.0) != (y < 0.0) {
+                r + y
+            } else {
+                r
+            }))
+        }
+        (a, b) => {
+            let (x, y) = (into_big(a), into_big(b));
+            if y.is_zero() {
+                return err(ARITHMETIC, "Divide by zero");
+            }
+            Ok(Num::B(x.mod_floor(&y)))
+        }
     }
-    let r = rem(a, b.clone())?;
-    Ok(match (&r, &b) {
-        (Num::I(r), Num::I(y)) if *r != 0 && (*r < 0) != (*y < 0) => Num::I(r + y),
-        (Num::D(r), y) if *r != 0.0 && (*r < 0.0) != (f(y) < 0.0) => Num::D(r + f(y)),
-        _ => r,
-    })
 }
 
 pub fn neg(a: Num) -> RtResult<Num> {
@@ -226,6 +251,15 @@ pub fn neg(a: Num) -> RtResult<Num> {
         Num::D(d) => Num::D(-d),
         Num::B(b) => Num::B(-b),
     })
+}
+
+/// Unary `-'`: only the smallest long needs promoting.
+pub fn neg_p(a: Num) -> Num {
+    match a {
+        Num::I(x) => x.checked_neg().map_or_else(|| Num::B(-big(x)), Num::I),
+        Num::D(d) => Num::D(-d),
+        Num::B(b) => Num::B(-b),
+    }
 }
 
 pub fn inc(a: Num) -> RtResult<Num> {
@@ -249,10 +283,9 @@ pub fn cmp(a: &Num, b: &Num) -> Option<Ordering> {
     match (a, b) {
         (Num::I(x), Num::I(y)) => Some(x.cmp(y)),
         (Num::D(_), _) | (_, Num::D(_)) => f(a).partial_cmp(&f(b)),
-        _ => {
-            let (x, y) = bigs(a, b).expect("integers");
-            Some(x.cmp(&y))
-        }
+        (Num::B(x), Num::B(y)) => Some(x.cmp(y)),
+        (Num::B(x), Num::I(y)) => Some(x.cmp(&big(*y))),
+        (Num::I(x), Num::B(y)) => Some(big(*x).cmp(y)),
     }
 }
 
@@ -381,6 +414,18 @@ mod tests {
         assert!(to_long(&promoted).is_err());
         crate::exc::take();
         assert_eq!(is_even(&Num::B(big(10))), Some(true));
+        // A quotient of integers beyond the double range is still finite.
+        let huge = Num::B(num_traits::pow(big(10), 400));
+        let q = div(
+            add(huge.clone(), Num::I(1)).unwrap(),
+            Num::B(num_traits::pow(big(10), 399)),
+        );
+        assert!(matches!(q.unwrap(), Num::D(d) if (d - 10.0).abs() < 1e-9));
+        assert_eq!(neg_p(Num::I(i64::MIN)), Num::B(-big(i64::MIN)));
+        assert_eq!(neg_p(Num::D(0.0)), Num::D(-0.0));
+        assert!(matches!(neg_p(Num::D(0.0)), Num::D(d) if d.is_sign_negative()));
+        assert_eq!(modulo(Num::I(-7), Num::I(3)).unwrap(), Num::I(2));
+        assert_eq!(modulo(Num::D(-7.0), Num::I(3)).unwrap(), Num::D(2.0));
         assert_eq!(sign(&Num::B(big(-3))), Ordering::Less);
     }
 }

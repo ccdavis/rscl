@@ -54,9 +54,7 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
         Kind::Long => out.push_str(&obj::long::get(v).to_string()),
         Kind::BigInt => {
             out.push_str(&obj::bigint::get(v).to_string());
-            if readably {
-                out.push('N');
-            }
+            out.push('N');
         }
         Kind::Double => out.push_str(&format_double(obj::double::get(v))),
         Kind::String => {

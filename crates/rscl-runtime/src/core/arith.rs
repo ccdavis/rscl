@@ -77,8 +77,7 @@ builtins! {
     "*'" => fn cf_mul_p(args) [; 0] { fold(args, Num::I(1), num::mul_p) }
     "-'" => fn cf_sub_p(args) [; 1] {
         if args.len() == 1 {
-            let n = expect_num(&args[0])?;
-            return Ok(to_value(num::sub_p(Num::I(0), n)?));
+            return Ok(to_value(num::neg_p(expect_num(&args[0])?)));
         }
         fold(&args[1..], expect_num(&args[0])?, num::sub_p)
     }

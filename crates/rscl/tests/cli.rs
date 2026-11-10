@@ -99,3 +99,36 @@ fn heap_limit_raises_a_catchable_out_of_memory_error() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn primitive_arithmetic_errors_report_their_line() {
+    let dir = std::env::temp_dir().join(format!("rscl_cli_prim_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prim.clj");
+    std::fs::write(&file, "(defn f [^long a ^long b]\n  (quot a b))\n(f 1 0)\n").unwrap();
+    let out = rscl(&["run", file.to_str().unwrap()], &[]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let want = format!("    at user/f ({}:2)", file.display());
+    assert!(err.contains(&want), "missing {want:?} in {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn short_lived_threads_do_not_skew_the_heap_count() {
+    // Each future frees on its own thread what the main thread allocated; the count
+    // must not drift into a spurious error.
+    let out = rscl(
+        &[
+            "-e",
+            "(defn mk [] (let [v (vec (range 3000))] (future (count v)))) \
+             (println (loop [i 0] (if (< i 4000) (do (deref (mk)) (recur (inc i))) i)))",
+        ],
+        &[("RSCL_MAX_HEAP_MB", "64")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("4000"));
+}

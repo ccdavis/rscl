@@ -279,6 +279,7 @@ pub fn register_thread() {
         g = w.cv.wait(g).unwrap_or_else(|e| e.into_inner());
     }
     g.running += 1;
+    crate::heap::arm_exit_flush();
     REGISTERED.with(|r| r.set(true));
 }
 
@@ -291,6 +292,8 @@ pub fn unregister_thread() {
     g.running -= 1;
     REGISTERED.with(|r| r.set(false));
     w.cv.notify_all();
+    drop(g);
+    crate::heap::thread_exit();
 }
 
 /// The thread is about to block outside rscl code (reading input, waiting): it

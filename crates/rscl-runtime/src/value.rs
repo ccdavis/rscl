@@ -310,16 +310,14 @@ impl Value {
         self.0 == other.0
     }
 
-    /// Integer value of a fixnum or boxed long.
+    /// Integer value of a fixnum or boxed long (not of a `BigInt`: see
+    /// `equiv::int_value` for equality and hashing across the two).
     #[inline]
-    /// Integer value of a fixnum, boxed long, or a `BigInt` that fits in 64 bits.
     pub fn as_int(&self) -> Option<i64> {
         if let Some(n) = self.as_fixnum() {
             Some(n)
         } else if self.is_kind(Kind::Long) {
             Some(obj::long::get(self))
-        } else if self.is_kind(Kind::BigInt) {
-            num_traits::ToPrimitive::to_i64(obj::bigint::get(self))
         } else {
             None
         }

@@ -929,6 +929,25 @@ fn bigints_do_not_leak() {
         );
         assert_eq!(eval(j, "(long 5N)"), "5");
         assert_eq!(
+            eval(j, "[(int? 1N) (integer? 1N) (get {1 :a} 1N)]"),
+            "[false true :a]"
+        );
+        assert_eq!(
+            eval(j, "[(str 1N) (str [1N]) (print-str 1N)]"),
+            "[\"1\" \"[1N]\" \"1N\"]"
+        );
+        assert_eq!(
+            eval(j, "[36rZN (-' 0.0) (-' -9223372036854775808)]"),
+            "[1283 -0.0 9223372036854775808N]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [a (reduce *' (repeat 400 10))] (/ (inc a) (quot a 10)))"
+            ),
+            "10.0"
+        );
+        assert_eq!(
             eval(j, "(bigint \"-12345678901234567890\")"),
             "-12345678901234567890N"
         );

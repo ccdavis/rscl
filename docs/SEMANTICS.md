@@ -10,10 +10,13 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   Arithmetic that overflows 64 bits throws `ArithmeticException` (Clojure's unprimed
   operators `+ - * inc dec`); the primed operators `+' -' *' inc' dec'` promote to a
   BigInt instead. BigInts are written `123N` (an integer literal too large for 64
-  bits is read as a BigInt too) and print as `123N` with `pr`/`prn` and as `123` with
-  `str`. They are contagious in arithmetic and comparisons, come back down to a long
+  bits is read as a BigInt too) and print as `123N`; only `str` of the number itself
+  gives `123`. In a radix literal a trailing `N` is a digit (`36rZN` is 1283). They are contagious in arithmetic and comparisons, come back down to a long
   only through `long`/`int` (which throw when the value does not fit), and are equal
-  to and hash like the long of the same value (`(= 1N 1)`, `(get {1N :a} 1)`).
+  to and hash like the long of the same value (`(= 1N 1)`, `(get {1N :a} 1)`), though
+  `int?` is false for them. A quotient of BigInts that does not divide exactly is a
+  double computed from the exact ratio, so it is right even when the operands
+  exceed the double range.
   `bigint`, `biginteger`, `bigint?` exist; `integer?` is true for them. There is no
   BigDecimal (`M` literals are rejected).
 - `/` on integers that divide exactly gives an integer; otherwise it gives a double
@@ -50,7 +53,8 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   `Uncaught exception: Class: message` on stderr, followed by one
   `    at ns/fn (file:line)` line per rscl fn on the stack when the exception was first
   thrown (found by walking frame pointers; Rust frames in between are omitted), and
-  exit with status 1. The line is that of the call or `throw` the fn was executing;
+  exit with status 1. The line is that of the call, `throw` or failing arithmetic
+  operation the fn was executing;
   the file is `<repl>` or `<expr>` for code typed at the REPL or given with `-e`.
   Built binaries carry the same table, so traces are identical in both modes.
 - Exception classes are a small built-in taxonomy standing in for JVM classes:

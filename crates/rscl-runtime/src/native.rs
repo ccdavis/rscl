@@ -184,6 +184,11 @@ pub fn request_oom() {
     rscl_interrupt_flag.store(1, Ordering::Release);
 }
 
+/// A pending heap-limit error was dropped without being delivered.
+pub fn oom_cleared() {
+    refresh_flag();
+}
+
 /// The collector wants every thread at a safepoint.
 pub fn request_safepoint() {
     GC_PENDING.store(true, Ordering::Release);
