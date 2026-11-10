@@ -42,8 +42,11 @@ pub fn in_core<T>(f: impl FnOnce() -> T) -> T {
 /// Compile and run `core.clj` in the JIT so its macros and fns are available.
 pub fn load_core(jit: &mut Jit) -> Result<(), EvalError> {
     in_core(|| {
-        for form in core_forms()? {
-            jit.eval(&form)?;
+        let forms = core_forms()?;
+        // The forms live in a `Vec` while earlier ones run.
+        let _root = rscl_runtime::gc::root_slice(&forms);
+        for form in &forms {
+            jit.eval(form)?;
         }
         Ok(())
     })

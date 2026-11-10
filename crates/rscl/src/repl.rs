@@ -73,9 +73,7 @@ pub fn run(paths: &[String]) -> i32 {
         } else {
             "  #_=> ".to_string()
         };
-        rscl_runtime::gc::enter_idle();
-        let line = rl.readline(&prompt);
-        rscl_runtime::gc::leave_idle();
+        let line = rscl_runtime::gc::blocking(|| rl.readline(&prompt));
         match line {
             Ok(line) => {
                 buffer.push_str(&line);
@@ -111,8 +109,10 @@ pub fn run(paths: &[String]) -> i32 {
                 buffer.clear();
                 // A Ctrl-C that arrived while nothing ran is not meant for this input.
                 rscl_runtime::native::clear_ctrl_c();
-                for form in forms {
-                    match crate::session::eval_form(&form) {
+                // The forms live in a `Vec` while earlier ones run.
+                let _root = rscl_runtime::gc::root_slice(&forms);
+                for form in &forms {
+                    match crate::session::eval_form(form) {
                         Ok(v) => {
                             println!("{}", pr_str(&v));
                             remember(v);

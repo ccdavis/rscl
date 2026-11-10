@@ -51,10 +51,6 @@ pub struct PendingObj {
     pub cancel_counted: AtomicBool,
     /// The worker is inside a blocking runtime operation (set by the worker).
     pub worker_blocked: AtomicBool,
-    /// Cycle-collector bookkeeping (see `gc.rs`): buffered as a candidate, and a
-    /// counter of writes and lost references.
-    pub buffered: AtomicBool,
-    pub version: std::sync::atomic::AtomicU32,
 }
 
 pub fn new(flavor: Flavor, thunk: Option<Value>) -> Value {
@@ -68,36 +64,23 @@ pub fn new(flavor: Flavor, thunk: Option<Value>) -> Value {
         cancel: AtomicBool::new(false),
         cancel_counted: AtomicBool::new(false),
         worker_blocked: AtomicBool::new(false),
-        buffered: AtomicBool::new(false),
-        version: std::sync::atomic::AtomicU32::new(0),
     })
 }
 
-/// Slots the collector walks: the outcome (or the delay's thunk).
+/// Visit the values a pending object refers to: its outcome and a delay's thunk
+/// (the world is stopped, so the locks are bypassed).
 ///
 /// # Safety
 /// The world is stopped and `p` is a live pending object.
-pub(crate) unsafe fn gc_slots(p: *mut PendingObj) -> Vec<*const Value> {
+pub(crate) unsafe fn gc_trace(p: *mut PendingObj, f: &mut dyn FnMut(&Value)) {
     let o = unsafe { &mut *p };
-    let mut v = Vec::new();
     match o.state.get_mut().unwrap_or_else(|e| e.into_inner()) {
-        State::Done(x) | State::Failed(x) => v.push(x as *const Value),
+        State::Done(x) | State::Failed(x) => f(x),
         _ => {}
     }
     if let Some(t) = o.thunk.get_mut().unwrap_or_else(|e| e.into_inner()) {
-        v.push(t as *const Value);
+        f(t);
     }
-    v
-}
-
-/// Drop every reference a garbage pending object holds.
-///
-/// # Safety
-/// The world is stopped and `p` is an unreachable pending object.
-pub(crate) unsafe fn gc_unlink(p: *mut PendingObj) {
-    let o = unsafe { &mut *p };
-    *o.state.get_mut().unwrap_or_else(|e| e.into_inner()) = State::Cancelled;
-    *o.thunk.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 pub fn get(v: &Value) -> &PendingObj {
@@ -121,14 +104,6 @@ impl PendingObj {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A write may close a reference cycle through this object: make it a candidate.
-    fn noted(&self) {
-        let v = std::mem::ManuallyDrop::new(unsafe {
-            Value::from_raw(self as *const PendingObj as u64)
-        });
-        crate::gc::note_write(&v);
-    }
-
     /// Set the value; false if one is already there (or the future was cancelled).
     pub fn deliver(&self, v: Value) -> bool {
         let mut st = self.lock();
@@ -138,7 +113,6 @@ impl PendingObj {
         *st = State::Done(v);
         self.cv.notify_all();
         drop(st);
-        self.noted();
         true
     }
 
@@ -151,7 +125,6 @@ impl PendingObj {
         *st = State::Failed(e);
         self.cv.notify_all();
         drop(st);
-        self.noted();
         true
     }
 
@@ -165,7 +138,7 @@ impl PendingObj {
             return false;
         }
         *st = State::Cancelled;
-        // Dekker-style with `leave_blocking` (store cancel, then read blocked;
+        // Dekker-style with `native::blocking` (store cancel, then read blocked;
         // the worker stores unblocked, then reads cancel): one side raises the flag.
         self.cancel.store(true, Ordering::SeqCst);
         if !self.worker_blocked.load(Ordering::SeqCst) {
@@ -203,10 +176,7 @@ impl PendingObj {
             return self.finished(st);
         }
         drop(st);
-        crate::native::enter_blocking();
-        let r = self.wait(deadline);
-        crate::native::leave_blocking();
-        r
+        self.wait(deadline)
     }
 
     fn finished(&self, st: std::sync::MutexGuard<'_, State>) -> RtResult<Option<Value>> {
@@ -226,21 +196,12 @@ impl PendingObj {
     }
 
     fn wait(&self, deadline: Option<std::time::Instant>) -> RtResult<Option<Value>> {
-        let mut st = self.lock();
         loop {
-            match &*st {
-                State::Done(v) => return Ok(Some(v.clone())),
-                State::Failed(e) => {
-                    let e = e.clone();
-                    drop(st);
-                    return Err(exc::throw(e));
-                }
-                State::Cancelled => {
-                    drop(st);
-                    return err(CANCELLATION, "future was cancelled");
-                }
-                State::Pending => {}
+            let st = self.lock();
+            if !matches!(*st, State::Pending) {
+                return self.finished(st);
             }
+            drop(st);
             let slice = match deadline {
                 Some(d) => {
                     let now = std::time::Instant::now();
@@ -251,16 +212,18 @@ impl PendingObj {
                 }
                 None => POLL,
             };
-            let (guard, _) = self
-                .cv
-                .wait_timeout(st, slice)
-                .unwrap_or_else(|e| e.into_inner());
-            st = guard;
-            if matches!(*st, State::Pending) {
-                drop(st);
-                crate::native::check_interrupt()?;
-                st = self.lock();
-            }
+            // The wait itself is a blocking region: the thread counts as stopped for
+            // the collector and touches no rscl value until it is back.
+            crate::native::blocking(|| {
+                let st = self.lock();
+                if matches!(*st, State::Pending) {
+                    let _ = self
+                        .cv
+                        .wait_timeout(st, slice)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            });
+            crate::native::check_interrupt()?;
         }
     }
 
@@ -272,9 +235,8 @@ impl PendingObj {
         }
         // Another thread may be forcing it: waiting for the lock is a blocking
         // operation (idle for the collector).
-        crate::native::enter_blocking();
-        let mut slot = self.thunk.lock().unwrap_or_else(|e| e.into_inner());
-        crate::native::leave_blocking();
+        let mut slot =
+            crate::native::blocking(|| self.thunk.lock().unwrap_or_else(|e| e.into_inner()));
         match &*self.lock() {
             State::Done(v) => return Ok(v.clone()),
             State::Failed(e) => return Err(exc::throw(e.clone())),
@@ -286,7 +248,7 @@ impl PendingObj {
         self.forcing.store(me, Ordering::Release);
         let r = thunk.call(&[]);
         self.forcing.store(0, Ordering::Release);
-        let out = match r {
+        match r {
             Ok(v) => {
                 *self.lock() = State::Done(v.clone());
                 Ok(v)
@@ -296,8 +258,6 @@ impl PendingObj {
                 *self.lock() = State::Failed(e.clone());
                 Err(exc::throw(e))
             }
-        };
-        self.noted();
-        out
+        }
     }
 }

@@ -55,7 +55,7 @@ pub fn new_proto(entry: Entry, name: &str, arity_mask: u64, variadic_min: i64) -
         name: name.into(),
         meta: Value::NIL,
     }));
-    crate::value::register_immortal(p as usize);
+    crate::gc::register_proto(p);
     p
 }
 
@@ -67,6 +67,7 @@ pub fn new(proto: *const FnProto, ncaptures: usize) -> Value {
         std::ptr::write(&mut (*p).hdr, ObjHeader::new(Kind::Fn));
         (*p).proto = proto;
         (*p).ncaptures = ncaptures as i64;
+        crate::gc::register(p as *mut ObjHeader);
         Value::from_obj(p)
     }
 }
@@ -74,8 +75,7 @@ pub fn new(proto: *const FnProto, ncaptures: usize) -> Value {
 /// Store a capture (takes ownership of `v`). Only valid before the fn is shared.
 pub unsafe fn set_capture(f: &Value, i: usize, v: Value) {
     unsafe {
-        let slot = capture_ptr(f, i);
-        drop(std::ptr::replace(slot, v));
+        *capture_ptr(f, i) = v;
     }
 }
 
@@ -134,10 +134,6 @@ impl FnProto {
 pub(super) unsafe fn free(p: *mut FnObj) {
     unsafe {
         let n = (*p).ncaptures as usize;
-        let caps = (p as *mut u8).add(OFF_CAPTURES as usize).cast::<Value>();
-        for i in 0..n {
-            std::ptr::drop_in_place(caps.add(i));
-        }
         dealloc(p as *mut u8, layout(n));
     }
 }

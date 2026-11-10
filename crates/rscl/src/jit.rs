@@ -145,9 +145,14 @@ impl Jit {
     }
 
     fn eval_unit(&mut self, form: &Value) -> Result<Value, EvalError> {
-        let mut an = Analyzer::new(ns::current());
-        let node = an.analyze_toplevel(form)?;
-        let unit = self.compile(&node, &an)?;
+        let unit = {
+            // The analyser keeps forms in its own data while it runs macros: no
+            // collection until the unit is compiled.
+            let _no_gc = rscl_runtime::gc::inhibit();
+            let mut an = Analyzer::new(ns::current());
+            let node = an.analyze_toplevel(form)?;
+            self.compile(&node, &an)?
+        };
         Jit::run(unit)
     }
 

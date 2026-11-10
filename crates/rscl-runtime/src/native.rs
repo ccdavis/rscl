@@ -217,7 +217,7 @@ thread_local! {
     static IS_MAIN: Cell<bool> = const { Cell::new(false) };
     /// The future this worker thread is computing (for cancellation).
     static CURRENT_FUTURE: RefCell<Option<Value>> = const { RefCell::new(None) };
-    /// Inside a blocking runtime operation: idle for the collector, and cancellation
+    /// Inside a blocking runtime operation: stopped for the collector, and cancellation
     /// is noticed on the way out instead of through the global flag.
     static BLOCKED: Cell<bool> = const { Cell::new(false) };
 }
@@ -245,27 +245,42 @@ fn with_current_future<R>(f: impl FnOnce(&crate::obj::pending::PendingObj) -> R)
     CURRENT_FUTURE.with(|c| c.borrow().as_ref().map(|v| f(crate::obj::pending::get(v))))
 }
 
-/// Entering a blocking runtime operation (`sleep`, a blocking `deref`, `locking`,
-/// `read-line`): the thread counts as stopped for the collector, and a cancellation
-/// targets it directly.
-pub fn enter_blocking() {
-    BLOCKED.with(|b| b.set(true));
-    with_current_future(|p| p.worker_blocked.store(true, Ordering::Release));
-    crate::gc::enter_idle();
-}
-
-/// Leaving a blocking operation (waits for a collection in progress first). A
-/// cancellation that arrived while blocked is raised now, so the next safepoint
-/// delivers it.
-pub fn leave_blocking() {
-    crate::gc::leave_idle();
-    with_current_future(|p| {
-        p.worker_blocked.store(false, Ordering::SeqCst);
-        if p.cancel.load(Ordering::SeqCst) {
-            p.raise_cancel();
+/// The future this worker computes, as a root for the collector.
+pub(crate) fn future_root(out: &mut Vec<u64>) {
+    let _ = CURRENT_FUTURE.try_with(|c| {
+        if let Ok(c) = c.try_borrow()
+            && let Some(v) = c.as_ref()
+        {
+            out.push(v.bits());
         }
     });
-    BLOCKED.with(|b| b.set(false));
+}
+
+/// Run a blocking runtime operation (`sleep`, a blocking `deref`, `locking`,
+/// `read-line`): the thread counts as stopped for the collector, and a cancellation
+/// targets it directly. `f` must not touch rscl values or allocate objects (see
+/// `gc::blocking`); a cancellation that arrived meanwhile is raised on the way out,
+/// so the next safepoint or `check_interrupt` delivers it.
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    if is_blocked() {
+        return f();
+    }
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            with_current_future(|p| {
+                p.worker_blocked.store(false, Ordering::SeqCst);
+                if p.cancel.load(Ordering::SeqCst) {
+                    p.raise_cancel();
+                }
+            });
+            BLOCKED.with(|b| b.set(false));
+        }
+    }
+    BLOCKED.with(|b| b.set(true));
+    with_current_future(|p| p.worker_blocked.store(true, Ordering::Release));
+    let _leave = Leave;
+    crate::gc::blocking(f)
 }
 
 pub fn is_blocked() -> bool {
@@ -278,12 +293,17 @@ pub fn is_blocked() -> bool {
 /// blocking operation, where it already counts as stopped). The result is the
 /// exception class and message to throw.
 fn take_interrupt() -> Option<(&'static str, String)> {
+    let stress = crate::gc::stress_tick();
     if !is_blocked() && (GC_PENDING.load(Ordering::Acquire) || crate::gc::stopping()) {
         crate::gc::safepoint();
     }
+    if stress {
+        // Stress mode keeps every thread on the slow path.
+        rscl_interrupt_flag.store(1, Ordering::Release);
+    }
     if crate::heap::take_oom(!is_blocked()) {
         refresh_flag();
-        // Cycles may hold the memory: collect once before giving up.
+        // Garbage may hold the memory: collect once before giving up.
         if !is_blocked() {
             crate::gc::collect_now();
         }

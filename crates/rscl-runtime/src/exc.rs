@@ -18,15 +18,10 @@ pub struct Exc;
 
 pub type RtResult<T> = Result<T, Exc>;
 
-/// Make `v` the pending exception (replacing and releasing any previous one).
+/// Make `v` the pending exception (replacing any previous one).
 pub fn throw(v: Value) -> Exc {
     exception::fill_trace(&v);
-    PENDING.with(|p| {
-        let old = p.replace(v.into_raw());
-        if old != 0 {
-            unsafe { Value::release_raw(old) }
-        }
-    });
+    PENDING.with(|p| p.set(v.into_raw()));
     Exc
 }
 
@@ -42,6 +37,15 @@ pub fn throw_new(class: &str, message: impl AsRef<str>) -> Exc {
 /// Convenience: `return err(CLASS, "message")`.
 pub fn err<T>(class: &str, message: impl AsRef<str>) -> RtResult<T> {
     Err(throw_new(class, message))
+}
+
+/// The pending exception, as a root for the collector.
+pub(crate) fn pending_root(out: &mut Vec<u64>) {
+    if let Ok(bits) = PENDING.try_with(|p| p.get())
+        && bits != 0
+    {
+        out.push(bits);
+    }
 }
 
 /// Claim the pending exception, clearing the slot.

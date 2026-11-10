@@ -25,17 +25,13 @@ unsafe fn args_slice<'a>(argv: *const Value, argc: i64) -> &'a [VRef] {
     }
 }
 
-// ---- refcounting -------------------------------------------------------------------
+// ---- former refcounting entry points (no-ops; kept until the ABI drops them) --------
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_retain(v: VRef) {
-    std::mem::forget(v.retain());
-}
+pub unsafe extern "C" fn rt_retain(_v: VRef) {}
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_release(v: Value) {
-    drop(v);
-}
+pub unsafe extern "C" fn rt_release(_v: Value) {}
 
 // ---- primitives --------------------------------------------------------------------
 
@@ -232,6 +228,9 @@ pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
             } else {
                 args.as_ptr() as *const Value
             };
+            // The callee reaches a safepoint before it has loaded its arguments, and
+            // they may live nowhere but in this slice (a `Vec` built by a native).
+            let _root = unsafe { crate::gc::root_words(args.as_ptr() as *const u64, args.len()) };
             let r = unsafe { (proto.entry)(f.ptr() as *const FnObj, args.len() as i64, argv, 0) };
             exc::check(r)
         }
@@ -253,7 +252,6 @@ pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
         Some(Kind::Var) => {
             let root = obj::var::get(f).root();
             if root.is_unbound() {
-                std::mem::forget(root);
                 return exc::err(
                     exception::ILLEGAL_STATE,
                     format!(
@@ -345,9 +343,9 @@ pub unsafe extern "C" fn rt_set_from_slice(items: *const Value, n: i64, owned: u
     set::new(s)
 }
 
-/// Mark a compile-time constant (and everything it contains) immortal: the unit's
-/// constant table references it forever, so refcounting it is pure overhead and it
-/// must not count as a live object in leak checks.
+/// Make a compile-time constant permanent: the unit's constant table refers to it
+/// for the rest of the process, so it is a root. Everything it contains is flagged
+/// too (the reader does not attach positions to shared constants).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_make_immortal(v: VRef) {
     make_immortal(&v);
@@ -358,50 +356,60 @@ pub fn make_immortal(v: &Value) {
     if h.is_immortal() {
         return;
     }
-    h.rc.store(crate::value::IMMORTAL, std::sync::atomic::Ordering::Relaxed);
-    crate::value::note_freed(h.kind);
-    crate::value::register_immortal(v.bits() as usize);
+    crate::gc::make_permanent(v);
+    flag_contents(v);
+}
+
+fn flag(v: &Value) {
+    let Some(h) = v.header() else { return };
+    if h.is_immortal() {
+        return;
+    }
+    h.flags
+        .fetch_or(crate::value::PERMANENT, std::sync::atomic::Ordering::Relaxed);
+    flag_contents(v);
+}
+
+fn flag_contents(v: &Value) {
     match v.kind() {
         Some(Kind::List) => {
-            // Each cons cell is its own object: mark the chain iteratively.
+            // Each cons cell is its own object: walk the chain iteratively.
             let mut cell = list::get(v);
             loop {
-                make_immortal(&cell.first);
-                make_immortal(&cell.meta);
+                flag(&cell.first);
+                flag(&cell.meta);
                 if !cell.rest.is_kind(Kind::List) {
                     break;
                 }
-                let next = list::get(&cell.rest);
                 let h = cell.rest.header().unwrap();
                 if h.is_immortal() {
                     break;
                 }
-                h.rc.store(crate::value::IMMORTAL, std::sync::atomic::Ordering::Relaxed);
-                crate::value::note_freed(h.kind);
-                crate::value::register_immortal(cell.rest.bits() as usize);
-                cell = next;
+                h.flags
+                    .fetch_or(crate::value::PERMANENT, std::sync::atomic::Ordering::Relaxed);
+                cell = list::get(&cell.rest);
             }
         }
         Some(Kind::Vector) => {
             for x in vector::get(v).v.iter() {
-                make_immortal(x);
+                flag(x);
             }
-            make_immortal(&vector::get(v).meta);
+            flag(&vector::get(v).meta);
         }
         Some(Kind::Map) => {
             for (k, x) in map::get(v).m.iter() {
-                make_immortal(k);
-                make_immortal(x);
+                flag(k);
+                flag(x);
             }
-            make_immortal(&map::get(v).meta);
+            flag(&map::get(v).meta);
         }
         Some(Kind::Set) => {
             for x in set::get(v).s.iter() {
-                make_immortal(x);
+                flag(x);
             }
-            make_immortal(&set::get(v).meta);
+            flag(&set::get(v).meta);
         }
-        Some(Kind::Symbol) => make_immortal(&symbol::get(v).meta),
+        Some(Kind::Symbol) => flag(&symbol::get(v).meta),
         _ => {}
     }
 }

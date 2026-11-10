@@ -91,41 +91,12 @@ impl Kind {
     }
 }
 
-/// Free an object whose refcount just reached zero.
+/// Free an object the collector found unreachable. Its fields are dropped as plain
+/// Rust data; the values it referred to are not touched (they are the collector's).
 ///
 /// # Safety
-/// `p` must point at a live heap object with no remaining references.
+/// `p` must point at a heap object nothing refers to any more.
 pub(crate) unsafe fn free(p: *mut ObjHeader) {
-    // Freeing an object releases what it holds, which may free more objects: those
-    // are queued and freed from this loop instead of recursively, so dropping a
-    // structure nested millions deep cannot overflow the stack.
-    let Ok(outermost) = FREEING.try_with(|f| !f.replace(true)) else {
-        // The thread's locals are gone (it is exiting): recurse.
-        return unsafe { free_one(p) };
-    };
-    if !outermost {
-        if PENDING_FREE
-            .try_with(|q| q.borrow_mut().push(p as usize))
-            .is_err()
-        {
-            unsafe { free_one(p) };
-        }
-        return;
-    }
-    unsafe { free_one(p) };
-    while let Ok(Some(next)) = PENDING_FREE.try_with(|q| q.borrow_mut().pop()) {
-        unsafe { free_one(next as *mut ObjHeader) };
-    }
-    let _ = FREEING.try_with(|f| f.set(false));
-}
-
-thread_local! {
-    static FREEING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static PENDING_FREE: std::cell::RefCell<Vec<usize>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-unsafe fn free_one(p: *mut ObjHeader) {
     unsafe {
         match (*p).kind {
             Kind::Long => drop(Box::from_raw(p as *mut long::LongObj)),
@@ -145,74 +116,64 @@ unsafe fn free_one(p: *mut ObjHeader) {
             Kind::SortedSet => drop(Box::from_raw(p as *mut sorted::SortedSetObj)),
             Kind::Pending => drop(Box::from_raw(p as *mut pending::PendingObj)),
             Kind::BigInt => drop(Box::from_raw(p as *mut bigint::BigIntObj)),
-            // Sequence cells are dismantled iteratively: a long realised chain would
-            // otherwise recurse once per element while dropping.
-            Kind::List | Kind::Cons | Kind::LazySeq => {
-                let tail = dismantle(p);
-                free_tail(tail);
-            }
-            Kind::Keyword => keyword::free(p as *mut keyword::KwObj),
-            // Immortal kinds never reach a zero refcount.
+            Kind::List => drop(Box::from_raw(p as *mut list::ListObj)),
+            Kind::Cons => drop(Box::from_raw(p as *mut cons::ConsObj)),
+            Kind::LazySeq => drop(Box::from_raw(p as *mut lazyseq::LazySeqObj)),
+            Kind::Keyword => drop(Box::from_raw(p as *mut keyword::KwObj)),
+            // Permanent kinds are never swept.
             Kind::Var | Kind::Namespace | Kind::Type | Kind::Protocol => {
-                unreachable!("attempt to free an immortal object kind")
+                unreachable!("attempt to free a permanent object kind")
             }
         }
     }
 }
 
-/// Free one sequence cell whose last reference is gone and hand back its tail
-/// (still owned by the caller).
-unsafe fn dismantle(p: *mut ObjHeader) -> Value {
+/// Size in bytes of the object at `p` (its own allocation, not what it points at):
+/// the conservative stack scan accepts a pointer anywhere inside it.
+///
+/// # Safety
+/// `p` must point at a live heap object.
+pub(crate) unsafe fn size_of(p: *const ObjHeader) -> usize {
+    use std::mem::size_of;
     unsafe {
         match (*p).kind {
-            Kind::List => {
-                let mut b = Box::from_raw(p as *mut list::ListObj);
-                let t = std::mem::take(&mut b.rest);
-                drop(b);
-                t
+            Kind::Long => size_of::<long::LongObj>(),
+            Kind::Double => size_of::<double::DoubleObj>(),
+            Kind::String => size_of::<string::StrObj>(),
+            Kind::Symbol => size_of::<symbol::SymObj>(),
+            Kind::Vector => size_of::<vector::VecObj>(),
+            Kind::Map => size_of::<map::MapObj>(),
+            Kind::Set => size_of::<set::SetObj>(),
+            Kind::Fn => {
+                func::OFF_CAPTURES as usize + 8 * (*(p as *const func::FnObj)).ncaptures as usize
             }
-            Kind::Cons => {
-                let mut b = Box::from_raw(p as *mut cons::ConsObj);
-                let t = std::mem::take(&mut b.more);
-                drop(b);
-                t
-            }
-            Kind::LazySeq => {
-                let mut b = Box::from_raw(p as *mut lazyseq::LazySeqObj);
-                let t = lazyseq::take_tail(&mut b);
-                drop(b);
-                t
-            }
-            _ => unreachable!(),
+            Kind::Exception => size_of::<exception::ExcObj>(),
+            Kind::Atom => size_of::<atom::AtomObj>(),
+            Kind::Regex => size_of::<regex::RegexObj>(),
+            Kind::Native => size_of::<native::NativeObj>(),
+            Kind::Instance => size_of::<types::InstanceObj>(),
+            Kind::SortedMap => size_of::<sorted::SortedMapObj>(),
+            Kind::SortedSet => size_of::<sorted::SortedSetObj>(),
+            Kind::Pending => size_of::<pending::PendingObj>(),
+            Kind::BigInt => size_of::<bigint::BigIntObj>(),
+            Kind::List => size_of::<list::ListObj>(),
+            Kind::Cons => size_of::<cons::ConsObj>(),
+            Kind::LazySeq => size_of::<lazyseq::LazySeqObj>(),
+            Kind::Keyword => size_of::<keyword::KwObj>(),
+            Kind::Var => size_of::<var::VarObj>(),
+            Kind::Namespace => size_of::<crate::ns::NsObj>(),
+            Kind::Type => size_of::<types::TypeObj>(),
+            Kind::Protocol => size_of::<types::ProtocolObj>(),
         }
     }
 }
 
-/// Release `tail`, walking sequence cells iteratively while this is their last
-/// reference.
-fn free_tail(mut tail: Value) {
-    use std::sync::atomic::{Ordering, fence};
-    loop {
-        let Some(h) = tail.header() else { return };
-        if !matches!(h.kind, Kind::List | Kind::Cons | Kind::LazySeq) {
-            return; // an ordinary value: dropped normally
-        }
-        if h.rc.fetch_sub(1, Ordering::Release) != 1 {
-            std::mem::forget(tail);
-            return;
-        }
-        fence(Ordering::Acquire);
-        crate::value::note_freed(h.kind);
-        let p = tail.ptr() as *mut ObjHeader;
-        std::mem::forget(tail);
-        tail = unsafe { dismantle(p) };
-    }
-}
-
-/// Allocate a boxed object and hand back an owned `Value`.
+/// Allocate a boxed object, hand it to the collector, and return a reference.
 #[inline]
 pub(crate) fn alloc<T>(obj: T) -> Value {
-    Value::from_obj(Box::into_raw(Box::new(obj)))
+    let p = Box::into_raw(Box::new(obj));
+    crate::gc::register(p as *mut ObjHeader);
+    Value::from_obj(p)
 }
 
 /// View a heap value as `&T`. Callers check the kind first.

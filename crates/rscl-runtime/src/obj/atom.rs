@@ -9,10 +9,6 @@ pub struct AtomObj {
     pub hdr: ObjHeader,
     value: Mutex<Value>,
     meta: Mutex<Value>,
-    /// Cycle-collector bookkeeping (see `gc.rs`): buffered as a candidate, and a
-    /// counter of writes and lost references.
-    pub buffered: std::sync::atomic::AtomicBool,
-    pub version: std::sync::atomic::AtomicU32,
 }
 
 pub fn new(v: Value) -> Value {
@@ -20,36 +16,18 @@ pub fn new(v: Value) -> Value {
         hdr: ObjHeader::new(Kind::Atom),
         value: Mutex::new(v),
         meta: Mutex::new(Value::NIL),
-        buffered: std::sync::atomic::AtomicBool::new(false),
-        version: std::sync::atomic::AtomicU32::new(0),
     })
 }
 
-/// A write may close a reference cycle through the atom: make it a candidate.
-fn noted(v: &Value) {
-    crate::gc::note_write(v);
-}
-
-/// Slots the collector walks (the world is stopped).
+/// Visit the values the atom refers to (the world is stopped, so the locks are
+/// bypassed: a parked thread may hold one, but never in the middle of a write).
 ///
 /// # Safety
-/// `p` is a live atom and no other thread runs.
-pub(crate) unsafe fn gc_slots(p: *mut AtomObj) -> Vec<*const Value> {
+/// `p` is a live atom and no other thread runs rscl code.
+pub(crate) unsafe fn gc_trace(p: *mut AtomObj, f: &mut dyn FnMut(&Value)) {
     let o = unsafe { &mut *p };
-    vec![
-        o.value.get_mut().unwrap_or_else(|e| e.into_inner()) as *const Value,
-        o.meta.get_mut().unwrap_or_else(|e| e.into_inner()) as *const Value,
-    ]
-}
-
-/// Drop every reference a garbage atom holds.
-///
-/// # Safety
-/// `p` is an unreachable atom and no other thread runs.
-pub(crate) unsafe fn gc_unlink(p: *mut AtomObj) {
-    let o = unsafe { &mut *p };
-    *o.value.get_mut().unwrap_or_else(|e| e.into_inner()) = Value::NIL;
-    *o.meta.get_mut().unwrap_or_else(|e| e.into_inner()) = Value::NIL;
+    f(o.value.get_mut().unwrap_or_else(|e| e.into_inner()));
+    f(o.meta.get_mut().unwrap_or_else(|e| e.into_inner()));
 }
 
 pub fn get(v: &Value) -> &AtomObj {
@@ -73,31 +51,21 @@ impl AtomObj {
         self.meta.lock().unwrap().clone()
     }
     pub fn set_meta(&self, m: Value) {
-        let old = std::mem::replace(&mut *self.meta.lock().unwrap(), m);
-        drop(old);
+        *self.meta.lock().unwrap() = m;
     }
     /// Store `v`, returning it (+1) like `reset!`.
     pub fn reset(&self, v: Value) -> Value {
         let r = v.clone();
-        let old = std::mem::replace(&mut *self.value.lock().unwrap(), v);
-        drop(old);
-        noted(&self.as_value());
+        *self.value.lock().unwrap() = v;
         r
     }
     pub fn compare_and_set(&self, expected: &Value, new: Value) -> bool {
         let mut g = self.value.lock().unwrap();
         if g.identical(expected) {
-            let old = std::mem::replace(&mut *g, new);
-            drop(g);
-            drop(old);
-            noted(&self.as_value());
+            *g = new;
             true
         } else {
             false
         }
-    }
-    /// A borrowed view of the atom as a value (for the collector's bookkeeping).
-    fn as_value(&self) -> std::mem::ManuallyDrop<Value> {
-        std::mem::ManuallyDrop::new(unsafe { Value::from_raw(self as *const AtomObj as u64) })
     }
 }

@@ -637,7 +637,6 @@ impl<M: Module> Compiler<M> {
             fc.b.ins().brif(is_exc, fail, &[], ok, &[]);
             fc.b.switch_to_block(fail);
             fc.b.seal_block(fail);
-            fc.call_rt(RtFn::ReleaseArgs, &[argv, argc, owned]);
             fc.b.ins().return_(&[guard]);
             fc.b.switch_to_block(ok);
             fc.b.seal_block(ok);
@@ -677,7 +676,6 @@ impl<M: Module> Compiler<M> {
                 fc.b.seal_block(next);
             }
             let r = fc.call_rt(RtFn::ThrowArity, &[fv, argc]).unwrap();
-            fc.call_rt(RtFn::ReleaseArgs, &[argv, argc, owned]);
             fc.b.ins().return_(&[r]);
 
             for (i, a) in f.arities.iter().enumerate() {
@@ -813,9 +811,8 @@ fn run_step<M: Module>(fc: &mut FnCtx<'_, M>, f: FuncId, fail: Block, release_re
     fc.b.ins().brif(is_exc, fail, &[], cont, &[]);
     fc.b.switch_to_block(cont);
     fc.b.seal_block(cont);
-    if release_result {
-        fc.call_rt(RtFn::Release, &[v]);
-    }
+    // (The collector owns lifetimes: an unused result is simply dropped.)
+    let _ = (release_result, v);
 }
 
 /// Largest argument list (call or collection literal) in a function body, not
@@ -1230,52 +1227,12 @@ impl<'a, M: Module> FnCtx<'a, M> {
         }
     }
 
-    /// Branch to a block in which `v` is known to be a mortal heap object (a pointer
-    /// whose refcount is non-negative); immediates and immortals skip it. Returns the
-    /// continuation block; the caller emits the mortal-case code, jumps to the
-    /// continuation and switches to it.
-    fn rc_guard(&mut self, v: Value) -> Block {
-        let low = self.b.ins().band_imm_s(v, 3);
-        let tag_ok = self.b.ins().icmp_imm_s(IntCC::Equal, low, 0);
-        let nonzero = self.b.ins().icmp_imm_s(IntCC::NotEqual, v, 0);
-        let is_ptr = self.b.ins().band(tag_ok, nonzero);
-        let check = self.b.create_block();
-        let mortal = self.b.create_block();
-        let cont = self.b.create_block();
-        self.b.ins().brif(is_ptr, check, &[], cont, &[]);
-        self.b.switch_to_block(check);
-        self.b.seal_block(check);
-        let rc = self
-            .b
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), v, api::consts::OFF_RC);
-        let is_mortal = self
-            .b
-            .ins()
-            .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, rc, 0);
-        self.b.ins().brif(is_mortal, mortal, &[], cont, &[]);
-        self.b.switch_to_block(mortal);
-        self.b.seal_block(mortal);
-        cont
-    }
+    /// Reference counting is gone (the runtime has a tracing collector, see
+    /// `rscl-runtime/src/gc.rs`): the ownership bookkeeping of this module is kept as
+    /// a record of which values are temporaries, but emits no code.
+    fn emit_release(&mut self, _v: Value) {}
 
-    /// Release `v` (+1 → 0): a call only for mortal heap objects.
-    fn emit_release(&mut self, v: Value) {
-        let cont = self.rc_guard(v);
-        self.call_rt(RtFn::Release, &[v]);
-        self.b.ins().jump(cont, &[]);
-        self.b.switch_to_block(cont);
-        self.b.seal_block(cont);
-    }
-
-    /// Retain `v`: a call only for mortal heap objects.
-    fn emit_retain(&mut self, v: Value) {
-        let cont = self.rc_guard(v);
-        self.call_rt(RtFn::Retain, &[v]);
-        self.b.ins().jump(cont, &[]);
-        self.b.switch_to_block(cont);
-        self.b.seal_block(cont);
-    }
+    fn emit_retain(&mut self, _v: Value) {}
 
     /// Like `make_owned` but the result is always tagged `Owned`, for storage in a
     /// slot whose later contents may be heap values (loop variables, var roots).
@@ -1359,85 +1316,11 @@ impl<'a, M: Module> FnCtx<'a, M> {
         var
     }
 
-    /// Release the value held by a cleanup entry.
-    fn release_cleanup(&mut self, c: Cleanup) {
-        match c {
-            Cleanup::Val(v) => self.emit_release(v),
-            Cleanup::Var(var) => {
-                let v = self.b.use_var(var);
-                self.emit_release(v);
-            }
-            Cleanup::Param(var, bit) => {
-                let v = self.b.use_var(var);
-                let f = self.owned_bit(bit);
-                self.emit_release_if(f, v);
-            }
-            Cleanup::ValIf(v, bit) => {
-                let f = self.owned_bit(bit);
-                self.emit_release_if(f, v);
-            }
-            Cleanup::ValIfFlag(v, flag) => self.emit_release_if(flag, v),
-        }
-    }
+    fn release_cleanups(&mut self, _items: &[Cleanup]) {}
 
-    /// Release a run of cleanup entries (newest first). Parameters are all borrowed
-    /// in the common case, so their conditional releases sit behind one test of the
-    /// whole mask.
-    fn release_cleanups(&mut self, items: &[Cleanup]) {
-        let mut i = 0;
-        while i < items.len() {
-            if let Cleanup::Param(..) | Cleanup::ValIf(..) = items[i] {
-                let mut j = i;
-                while j < items.len() && matches!(items[j], Cleanup::Param(..) | Cleanup::ValIf(..))
-                {
-                    j += 1;
-                }
-                let mask = self.owned_mask.expect("ownership mask");
-                let m = self.b.use_var(mask);
-                let do_b = self.b.create_block();
-                let cont = self.b.create_block();
-                self.b.ins().brif(m, do_b, &[], cont, &[]);
-                self.b.switch_to_block(do_b);
-                self.b.seal_block(do_b);
-                for c in &items[i..j] {
-                    self.release_cleanup(*c);
-                }
-                self.b.ins().jump(cont, &[]);
-                self.b.switch_to_block(cont);
-                self.b.seal_block(cont);
-                i = j;
-            } else {
-                self.release_cleanup(items[i]);
-                i += 1;
-            }
-        }
-    }
+    fn emit_release_if(&mut self, _flag: Value, _v: Value) {}
 
-    /// `emit_release(v)` when `flag` is non-zero.
-    fn emit_release_if(&mut self, flag: Value, v: Value) {
-        let do_b = self.b.create_block();
-        let cont = self.b.create_block();
-        self.b.ins().brif(flag, do_b, &[], cont, &[]);
-        self.b.switch_to_block(do_b);
-        self.b.seal_block(do_b);
-        self.emit_release(v);
-        self.b.ins().jump(cont, &[]);
-        self.b.switch_to_block(cont);
-        self.b.seal_block(cont);
-    }
-
-    /// `emit_retain(v)` when `flag` is zero (a borrowed parameter being taken over).
-    fn emit_retain_if_not(&mut self, flag: Value, v: Value) {
-        let do_b = self.b.create_block();
-        let cont = self.b.create_block();
-        self.b.ins().brif(flag, cont, &[], do_b, &[]);
-        self.b.switch_to_block(do_b);
-        self.b.seal_block(do_b);
-        self.emit_retain(v);
-        self.b.ins().jump(cont, &[]);
-        self.b.switch_to_block(cont);
-        self.b.seal_block(cont);
-    }
+    fn emit_retain_if_not(&mut self, _flag: Value, _v: Value) {}
 
     fn slot(&self, id: LocalId) -> CResult<Slot> {
         self.locals.get(&id).copied().ok_or_else(|| {

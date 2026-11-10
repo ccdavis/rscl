@@ -57,6 +57,7 @@ pub fn find_or_create(name: &str) -> &'static NsObj {
         mappings: RwLock::new(HashMap::new()),
         aliases: RwLock::new(HashMap::new()),
     }));
+    crate::gc::register_permanent(ns as *mut NsObj as *mut ObjHeader);
     w.0.insert(name.to_string(), ns as *const NsObj as usize);
     ns
 }
@@ -360,9 +361,7 @@ pub fn load_lib_opt(key: &str, force: bool) -> crate::exc::RtResult<()> {
             }
         }
         // Another thread is loading: wait until it is done with all of its libs.
-        crate::native::enter_blocking();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        crate::native::leave_blocking();
+        crate::native::blocking(|| std::thread::sleep(std::time::Duration::from_millis(2)));
         crate::native::check_interrupt()?;
     };
     // Loading a lib must not change the caller's current namespace (its `ns` form

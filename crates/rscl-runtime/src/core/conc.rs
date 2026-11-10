@@ -42,9 +42,9 @@ pub fn join_all() {
                     eprintln!("Uncaught exception: {}", crate::exc::format_exception(&e));
                     std::process::exit(1);
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                crate::native::blocking(|| std::thread::sleep(Duration::from_millis(20)));
             }
-            let _ = h.join();
+            let _ = crate::native::blocking(|| h.join());
         }
     }
 }
@@ -65,6 +65,13 @@ fn expect_pending<'a>(v: &'a Value, what: &str) -> RtResult<&'a pending::Pending
 /// The caller's dynamic bindings are conveyed to the thread, as in Clojure.
 pub fn future_call(f: Value) -> RtResult<Value> {
     let fut = pending::new(Flavor::Future, None);
+    // The closure lives on the Rust heap until the thread runs: what it refers to
+    // is pinned until then (and, harmlessly, for the thread's whole life).
+    let pins: Vec<crate::gc::Pinned> = [f.clone(), fut.clone()]
+        .into_iter()
+        .chain(var::snapshot_bindings().into_iter().map(|(_, v)| v))
+        .map(crate::gc::Pinned::new)
+        .collect();
     let fut2 = fut.clone();
     let bindings = var::snapshot_bindings();
     let spawned = std::thread::Builder::new()
@@ -73,6 +80,7 @@ pub fn future_call(f: Value) -> RtResult<Value> {
         .spawn(move || {
             crate::native::set_stack_limit_here(FUTURE_STACK);
             crate::gc::register_thread();
+            let _pins = pins;
             // Leaves the world in order even if something panics: bindings popped
             // and values dropped first, the thread unregistered last.
             let _guard = WorkerGuard {
@@ -100,7 +108,6 @@ pub fn future_call(f: Value) -> RtResult<Value> {
                 crate::native::cancel_consumed();
             }
             crate::native::set_current_future(None);
-            drop(fut2);
         });
     match spawned {
         Ok(handle) => {
@@ -176,17 +183,21 @@ fn lock(v: &Value) -> RtResult<()> {
             st.1 += 1;
             break Ok(());
         }
-        let (guard, _) =
-            l.cv.wait_timeout(st, Duration::from_millis(20))
-                .unwrap_or_else(|e| e.into_inner());
-        st = guard;
-        if st.0 != 0 && st.0 != me {
-            drop(st);
-            let check = crate::native::check_interrupt();
-            st = l.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = check {
-                break Err(e);
+        drop(st);
+        // Waiting is a blocking region (stopped for the collector, interruptible).
+        crate::native::blocking(|| {
+            let st = l.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.0 != 0 && st.0 != me {
+                let _ = l
+                    .cv
+                    .wait_timeout(st, Duration::from_millis(20))
+                    .unwrap_or_else(|e| e.into_inner());
             }
+        });
+        let check = crate::native::check_interrupt();
+        st = l.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = check {
+            break Err(e);
         }
     };
     st.2 -= 1;
@@ -232,19 +243,16 @@ fn unlock(v: &Value) -> RtResult<()> {
 /// Sleep in short slices so an interrupt or cancellation is noticed promptly.
 pub fn sleep_ms(ms: i64) -> RtResult<()> {
     let deadline = std::time::Instant::now() + Duration::from_millis(ms.max(0) as u64);
-    crate::native::enter_blocking();
-    let r = loop {
+    loop {
         let now = std::time::Instant::now();
         if now >= deadline {
-            break Ok(());
+            return Ok(());
         }
-        std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
-        if let Err(e) = crate::native::check_interrupt() {
-            break Err(e);
-        }
-    };
-    crate::native::leave_blocking();
-    r
+        crate::native::blocking(|| {
+            std::thread::sleep((deadline - now).min(Duration::from_millis(10)))
+        });
+        crate::native::check_interrupt()?;
+    }
 }
 
 builtins! {
@@ -284,10 +292,7 @@ builtins! {
         }
     }
     "lock*" => fn cc_lock(args) [1] {
-        crate::native::enter_blocking();
-        let r = lock(&args[0]);
-        crate::native::leave_blocking();
-        r?;
+        lock(&args[0])?;
         Ok(Value::NIL)
     }
     "gc" => fn cc_gc(args) [0] {

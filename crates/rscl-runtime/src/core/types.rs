@@ -435,8 +435,6 @@ fn set_ref_meta(r: &Value, m: Value) -> RtResult<()> {
         }
         Some(Kind::Atom) => {
             atom::get(r).set_meta(m);
-            // Metadata can close a cycle like the value can.
-            crate::gc::note_write(r);
             Ok(())
         }
         _ => err(

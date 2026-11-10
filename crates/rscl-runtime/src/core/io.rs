@@ -8,10 +8,12 @@ use crate::obj::exception::{ILLEGAL_ARGUMENT, RUNTIME};
 use crate::obj::string;
 use crate::value::Value;
 
-fn read_line_blocking() -> crate::exc::RtResult<Value> {
+/// Read a line from stdin as a blocking region; the string object is made after.
+fn read_line() -> crate::exc::RtResult<Value> {
     let _ = std::io::stdout().flush();
     let mut line = String::new();
-    match std::io::stdin().lock().read_line(&mut line) {
+    let read = crate::native::blocking(|| std::io::stdin().lock().read_line(&mut line));
+    match read {
         Ok(0) => Ok(Value::NIL),
         Ok(_) => {
             if line.ends_with('\n') {
@@ -44,10 +46,7 @@ builtins! {
     }
     "read-line" => fn cf_read_line(args) [0] {
         let _ = args;
-        crate::native::enter_blocking();
-        let r = read_line_blocking();
-        crate::native::leave_blocking();
-        r
+        read_line()
     }
     "read-string" => fn cf_read_string(args) [1] {
         let s = args::string(&args[0], "s")?;

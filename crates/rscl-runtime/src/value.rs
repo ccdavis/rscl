@@ -12,13 +12,14 @@
 //! | `0x202` / `0x302`   | `EXC` (exception pending) / `UNBOUND` (var has no root) |
 //! | `0x06 | cp << 8`    | char                                                 |
 //!
-//! Ownership: a `Value` is an owned (+1) reference; dropping it releases. `VRef` is a
-//! borrowed view with the same bit pattern and no `Drop`, used for FFI parameters.
+//! A `Value` is a plain reference: copying and dropping it cost nothing, and the
+//! tracing collector (`gc.rs`) decides when an object dies. `VRef` is the same word,
+//! `Copy`, used for FFI parameters.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicI64, Ordering, fence};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::obj;
 use crate::obj::Kind;
@@ -34,93 +35,51 @@ const IMM_PAYLOAD_SHIFT: u32 = 8;
 pub const FIXNUM_MIN: i64 = -(1 << 62);
 pub const FIXNUM_MAX: i64 = (1 << 62) - 1;
 
-/// Refcount value of objects that are never freed. Retain/release still run their
-/// atomic ops on it; it can never reach the "last reference" state.
-pub const IMMORTAL: i64 = i64::MIN / 2;
+/// Header flag: reached in the collection that is running (see `gc.rs`).
+pub const MARK: u64 = 1;
+/// Header flag: never freed (vars, namespaces, types, compiled constants).
+pub const PERMANENT: u64 = 2;
 
-/// Header shared by every heap object. `pos` is a source-position id (see `pos.rs`),
-/// zero when unknown.
+/// Header shared by every heap object. `flags` belongs to the collector; `pos` is a
+/// source-position id (see `pos.rs`), zero when unknown.
 #[repr(C)]
 pub struct ObjHeader {
-    pub rc: AtomicI64,
+    pub flags: AtomicU64,
     pub kind: Kind,
     pub pos: u32,
 }
 
 impl ObjHeader {
     pub fn new(kind: Kind) -> Self {
-        #[cfg(feature = "live-count")]
-        if counted(kind) {
-            LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
-        }
-        crate::gc::note_alloc();
         ObjHeader {
-            rc: AtomicI64::new(1),
+            flags: AtomicU64::new(0),
             kind,
             pos: 0,
         }
     }
+    /// Header of an object that is never freed. The creator registers the object
+    /// with `gc::register_permanent`.
     pub fn immortal(kind: Kind) -> Self {
         ObjHeader {
-            rc: AtomicI64::new(IMMORTAL),
+            flags: AtomicU64::new(PERMANENT),
             kind,
             pos: 0,
         }
     }
     pub fn is_immortal(&self) -> bool {
-        self.rc.load(Ordering::Relaxed) < 0
+        self.flags.load(Ordering::Relaxed) & PERMANENT != 0
     }
 }
 
-#[cfg(feature = "live-count")]
-pub static LIVE_OBJECTS: AtomicI64 = AtomicI64::new(0);
-
-/// Keywords are interned (weakly) and may be promoted to immortal by compiled code
-/// that mentions them; they are not part of the live-object count that the leak
-/// tests compare, which tracks ordinary allocations.
-#[inline]
-#[cfg_attr(not(feature = "live-count"), allow(dead_code))]
-pub(crate) fn counted(kind: Kind) -> bool {
-    kind != Kind::Keyword
-}
-
-/// Bookkeeping hook called whenever a counted heap object is freed or made immortal.
-#[inline]
-pub(crate) fn note_freed(kind: Kind) {
-    #[cfg(feature = "live-count")]
-    if counted(kind) {
-        LIVE_OBJECTS.fetch_sub(1, Ordering::Relaxed);
-    }
-    #[cfg(not(feature = "live-count"))]
-    let _ = kind;
-}
-
-/// Every allocation that is deliberately kept alive forever (immortal objects, fn
-/// prototypes). Leak checkers then see them as reachable even after JIT memory, which
-/// holds the constant tables, has been unmapped.
-static IMMORTALS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-
-pub fn register_immortal(addr: usize) {
-    IMMORTALS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(addr);
-}
-
-/// Number of live, non-immortal heap objects (only with the `live-count` feature;
-/// always 0 otherwise). Tests assert this returns to a baseline.
+/// Number of heap objects the collector knows about (a diagnostic: it only goes
+/// down when a collection runs).
 pub fn live_objects() -> i64 {
-    #[cfg(feature = "live-count")]
-    {
-        LIVE_OBJECTS.load(Ordering::SeqCst)
-    }
-    #[cfg(not(feature = "live-count"))]
-    {
-        0
-    }
+    crate::gc::object_count() as i64
 }
 
-/// An owned reference to an rscl value.
+/// A reference to an rscl value: one word, freely copied. Heap objects are kept
+/// alive by the tracing collector, which finds the references held in machine
+/// stacks conservatively (see `gc.rs`).
 #[repr(transparent)]
 pub struct Value(u64);
 
@@ -337,63 +296,25 @@ impl Value {
         }
     }
 
-    // ---- refcounting -------------------------------------------------------------
-
-    /// +1 on a heap object; no-op for immediates. The result is the same bits, owned.
+    /// Another reference to the same value (kept from the reference-counting days;
+    /// identical to `clone`).
     #[inline]
     pub fn retain(&self) -> Value {
-        if let Some(h) = self.header() {
-            h.rc.fetch_add(1, Ordering::Relaxed);
-        }
         Value(self.0)
     }
 
-    /// Drop one reference without consuming a `Value` wrapper (used by FFI code).
+    /// Formerly dropped a reference; the collector owns lifetimes now.
     ///
     /// # Safety
-    /// `bits` must hold a reference the caller owns.
+    /// None required; kept `unsafe` for source compatibility.
     #[inline]
-    pub unsafe fn release_raw(bits: u64) {
-        drop(Value(bits));
-    }
+    pub unsafe fn release_raw(_bits: u64) {}
 }
 
 impl Clone for Value {
     #[inline]
     fn clone(&self) -> Value {
-        self.retain()
-    }
-}
-
-impl Drop for Value {
-    #[inline]
-    fn drop(&mut self) {
-        if let Some(h) = self.header() {
-            // An atom or pending value losing a reference may be the root of a
-            // cycle: the collector's buffer takes this reference over (once) and
-            // decides later.
-            if matches!(h.kind, Kind::Atom | Kind::Pending)
-                && unsafe { crate::gc::take_candidate(self.0 as *const ObjHeader) }
-            {
-                return;
-            }
-            // SAFETY: `self` holds one reference.
-            unsafe { release_raw(self.0) }
-        }
-    }
-}
-
-/// Drop one reference without the cycle-candidate hook (the collector's own path).
-///
-/// # Safety
-/// `bits` must hold a reference the caller owns, to a heap object.
-pub(crate) unsafe fn release_raw(bits: u64) {
-    let h = unsafe { &*(bits as *const ObjHeader) };
-    if h.rc.fetch_sub(1, Ordering::Release) == 1 {
-        fence(Ordering::Acquire);
-        note_freed(h.kind);
-        // SAFETY: this was the last reference.
-        unsafe { obj::free(bits as *mut ObjHeader) }
+        Value(self.0)
     }
 }
 

@@ -1,7 +1,6 @@
-//! Vars: immortal, named, mutable roots. One `VarObj` exists per (namespace, name).
-//! Generated code never touches the root directly; it calls `rt_var_root`, which
-//! returns a +1 reference taken under the lock, so a concurrent `def` cannot free a
-//! function while it is running.
+//! Vars: permanent, named, mutable roots. One `VarObj` exists per (namespace, name).
+//! Generated code reads the lock-free `fast` copy of the root; dynamic and unbound
+//! vars go through `rt_var_root`.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,11 +16,10 @@ pub const FLAG_PRIVATE: u32 = 4;
 #[repr(C)]
 pub struct VarObj {
     pub hdr: ObjHeader,
-    /// Lock-free copy of the root for generated code, valid only when the root can
-    /// never be freed (an immediate or an immortal object) and the var is not
-    /// dynamic; `UNBOUND` otherwise, which sends readers to `rt_var_root`. A stale
-    /// read after a `def` still sees a live (immortal) value, like Clojure's volatile
-    /// root read.
+    /// Lock-free copy of the root for generated code, valid when the var is bound and
+    /// not dynamic; `UNBOUND` otherwise, which sends readers to `rt_var_root`. A
+    /// reader that loaded the old root just before a `def` keeps it alive by holding
+    /// it, like Clojure's volatile root read.
     fast: AtomicU64,
     pub ns: Box<str>,
     pub name: Box<str>,
@@ -36,7 +34,7 @@ const _: () = assert!(std::mem::offset_of!(VarObj, fast) == OFF_FAST as usize);
 
 /// Create an immortal var with no root. Only `ns.rs` should call this.
 pub(crate) fn new(ns: &str, name: &str) -> *const VarObj {
-    Box::into_raw(Box::new(VarObj {
+    let p = Box::into_raw(Box::new(VarObj {
         hdr: ObjHeader::immortal(Kind::Var),
         fast: AtomicU64::new(crate::value::UNBOUND),
         ns: ns.into(),
@@ -44,7 +42,30 @@ pub(crate) fn new(ns: &str, name: &str) -> *const VarObj {
         root: Mutex::new(Value::UNBOUND),
         flags: AtomicU32::new(0),
         meta: Mutex::new(Value::NIL),
-    }))
+    }));
+    crate::gc::register_permanent(p as *mut ObjHeader);
+    p
+}
+
+/// Visit the root and metadata (the world is stopped, so the locks are bypassed).
+///
+/// # Safety
+/// `p` is a var and no other thread runs rscl code.
+pub(crate) unsafe fn gc_trace(p: *mut VarObj, f: &mut dyn FnMut(&Value)) {
+    let o = unsafe { &mut *p };
+    f(o.root.get_mut().unwrap_or_else(|e| e.into_inner()));
+    f(o.meta.get_mut().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// Every value in this thread's `binding` frames (roots for the collector).
+pub(crate) fn binding_roots(out: &mut Vec<u64>) {
+    let _ = BINDINGS.try_with(|b| {
+        if let Ok(b) = b.try_borrow() {
+            for frame in b.iter() {
+                out.extend(frame.values().map(Value::bits));
+            }
+        }
+    });
 }
 
 pub fn as_value(p: *const VarObj) -> Value {
@@ -150,19 +171,16 @@ impl VarObj {
     pub fn is_bound(&self) -> bool {
         !self.root().is_unbound()
     }
-    /// Replace the root. The old value is released after the lock is dropped.
+    /// Replace the root.
     pub fn bind_root(&self, v: Value) {
-        let old = std::mem::replace(&mut *self.root.lock().unwrap(), v);
+        *self.root.lock().unwrap() = v;
         self.refresh_fast();
-        drop(old);
     }
 
     /// Recompute `fast` from the root and flags.
     fn refresh_fast(&self) {
         let root = self.root.lock().unwrap();
-        let stable = !root.is_unbound()
-            && !self.has_flag(FLAG_DYNAMIC)
-            && root.header().is_none_or(|h| h.is_immortal());
+        let stable = !root.is_unbound() && !self.has_flag(FLAG_DYNAMIC);
         let bits = if stable {
             root.bits()
         } else {

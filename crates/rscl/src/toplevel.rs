@@ -49,6 +49,8 @@ pub fn eval(
             .is_some_and(|s| s.ns().is_none() && s.name() == "do")
     {
         let mut last = Value::NIL;
+        // The sub-forms live in a `Vec` while earlier ones run.
+        let _root = rscl_runtime::gc::root_slice(&items);
         for sub in &items[1..] {
             last = eval(sub, eval_unit)?;
         }

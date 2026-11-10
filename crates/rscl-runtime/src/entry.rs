@@ -21,8 +21,6 @@ pub fn init() {
             let qualified = format!("{}/{}", d.ns, d.name);
             let proto = func::new_proto(d.entry, &qualified, d.arity_mask, d.variadic_min);
             let f = func::new(proto, 0);
-            // Capture-less fns are shared, never freed: var reads need no refcounting.
-            crate::ffi::make_immortal(&f);
             ns::find_or_create(d.ns).intern(d.name).bind_root(f);
         }
         core.intern("*command-line-args*").bind_root(Value::NIL);
@@ -107,13 +105,13 @@ pub fn run_on_main_thread<F: FnOnce() -> i32 + Send + 'static>(f: F) -> i32 {
             crate::gc::register_thread();
             let code = f();
             // Like non-daemon JVM threads, running futures keep the process alive.
-            crate::native::enter_blocking();
             crate::core::conc::join_all();
-            crate::native::leave_blocking();
             crate::gc::unregister_thread();
             code
         });
-    match handle.map(|h| h.join()) {
+    // The calling thread may have allocated (runtime initialisation), so it is
+    // known to the collector: it waits as a stopped thread.
+    match handle.map(|h| crate::gc::blocking(|| h.join())) {
         Ok(Ok(code)) => code,
         Ok(Err(_)) => {
             eprintln!("internal error: rscl main thread panicked");

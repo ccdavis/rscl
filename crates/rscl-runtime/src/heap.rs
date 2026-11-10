@@ -4,7 +4,7 @@
 //! thread batches its delta and flushes it to a global counter every 64 KB). When
 //! the total crosses the limit, the thread that crossed it is asked to throw an
 //! `OutOfMemoryError` at its next safepoint (fn entry, loop back-edge or a blocking
-//! operation's poll), after one cycle collection has had a chance to bring the heap
+//! operation's poll), after one collection has had a chance to bring the heap
 //! back under the limit. The limit then re-arms a sixteenth of the limit higher, so a
 //! handler can allocate while it reports the error, but a program that keeps
 //! allocating keeps being told.
@@ -27,6 +27,10 @@ static NEXT: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// An error was raised and not yet delivered (`OOM_THREAD` says to whom).
 static OOM_PENDING: AtomicBool = AtomicBool::new(false);
 static OOM_THREAD: AtomicU64 = AtomicU64::new(0);
+/// The byte count at which the next collection is requested.
+static GC_NEXT: AtomicUsize = AtomicUsize::new(GC_MIN);
+/// A collection is not worth its pause below this much heap.
+const GC_MIN: usize = 32 << 20;
 /// When the pending error was raised (milliseconds, see `now_ms`).
 static RAISED_AT: AtomicU64 = AtomicU64::new(0);
 /// How long the thread that crossed the limit has to take its error before any
@@ -116,6 +120,9 @@ fn flush(n: isize) {
     // error that asked for the collection again.
     if crate::gc::collecting() {
         return;
+    }
+    if live >= GC_NEXT.load(Ordering::Relaxed) {
+        crate::gc::request_gc();
     }
     if live >= NEXT.load(Ordering::Relaxed) {
         RAISED_AT.store(now_ms(), Ordering::Relaxed);
@@ -231,6 +238,31 @@ pub fn arm_exit_flush() {
     EXIT_FLUSH.with(|_| {});
 }
 
+/// A collection finished: the next one is due when the heap has doubled.
+pub(crate) fn gc_finished() {
+    let n = DELTA.with(|d| d.replace(0));
+    let live = (LIVE.fetch_add(n, Ordering::Relaxed) + n).max(0) as usize;
+    GC_NEXT.store(live.saturating_mul(2).max(gc_min()), Ordering::Relaxed);
+}
+
+/// A collection could not run (a thread did not stop in time): ask again only
+/// after some more allocation, so a busy thread does not make everyone else wait
+/// for it over and over.
+pub(crate) fn gc_postponed() {
+    let live = used();
+    GC_NEXT.store(live.saturating_add((live / 4).max(8 << 20)), Ordering::Relaxed);
+}
+
+fn gc_min() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("RSCL_GC_MIN_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(GC_MIN, |mb| mb.max(1) << 20)
+    })
+}
+
 pub fn oom_pending() -> bool {
     OOM_PENDING.load(Ordering::Acquire)
 }
@@ -294,6 +326,8 @@ fn cgroup_limit() -> Option<usize> {
 /// Read `RSCL_MAX_HEAP_MB`, or default to half of the memory available to the
 /// process. Called once at runtime start.
 pub fn configure() {
+    GC_NEXT.store(gc_min(), Ordering::Relaxed);
+    crate::gc::configure();
     match std::env::var("RSCL_MAX_HEAP_MB") {
         Ok(s) => match s.trim().parse::<usize>() {
             Ok(0) => set_limit(None),

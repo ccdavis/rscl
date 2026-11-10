@@ -43,7 +43,7 @@ fn type_value(id: u64, name: &str, fields: Vec<String>, is_record: bool) -> Valu
         field_kws,
         is_record,
     }));
-    crate::value::register_immortal(p as usize);
+    crate::gc::register_permanent(p as *mut ObjHeader);
     unsafe { Value::from_raw(p as u64) }
 }
 
@@ -356,8 +356,27 @@ pub fn protocol_new(name: &str, methods: Vec<String>) -> Value {
         methods: methods.into_iter().map(Into::into).collect(),
         impls: RwLock::new(HashMap::new()),
     }));
-    crate::value::register_immortal(p as usize);
+    crate::gc::register_permanent(p as *mut ObjHeader);
     unsafe { Value::from_raw(p as u64) }
+}
+
+/// Visit every method implementation (the world is stopped, so the lock is
+/// bypassed).
+///
+/// # Safety
+/// `p` is a protocol and no other thread runs rscl code.
+pub(crate) unsafe fn gc_trace_protocol(p: *mut ProtocolObj, f: &mut dyn FnMut(&Value)) {
+    let o = unsafe { &mut *p };
+    for methods in o
+        .impls
+        .get_mut()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
+        for v in methods.values() {
+            f(v);
+        }
+    }
 }
 
 pub fn proto(v: &Value) -> &ProtocolObj {

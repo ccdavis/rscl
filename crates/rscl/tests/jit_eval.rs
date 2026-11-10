@@ -1,12 +1,11 @@
-//! In-process JIT tests. Every evaluation must leave the live heap-object count where
-//! it found it (constants are immortal and do not count), which catches refcount leaks
-//! without valgrind.
+//! In-process JIT tests. Every evaluation is followed by a full collection before
+//! its result is printed, so a value the collector lost track of shows up here.
 use rscl::jit::{EvalError, Jit};
+use rscl_runtime::exc;
 use rscl_runtime::printer::pr_str;
-use rscl_runtime::{exc, live_objects};
 
-/// The live-object counter and the `user` namespace are process-global, so leak
-/// tests must not run concurrently.
+/// The `user` namespace is process-global, so these tests must not run
+/// concurrently.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn with_jit<F: FnOnce(&mut Jit)>(f: F) {
@@ -23,31 +22,16 @@ fn def(jit: &mut Jit, src: &str) -> String {
     }
 }
 
-/// Evaluate `src`, return `pr-str` of the last value, and assert no object leaked.
+/// Evaluate `src`, collect, and return `pr-str` of the last value: the result must
+/// survive a collection while only this frame refers to it.
 fn eval(jit: &mut Jit, src: &str) -> String {
-    let before = live_objects();
-    let out = match jit.eval_str(src) {
-        Ok(v) => {
-            let s = pr_str(&v);
-            drop(v);
-            s
-        }
-        Err(EvalError::Exception(e)) => {
-            let s = format!("EXC {}", exc::format_exception(&e));
-            drop(e);
-            s
-        }
-        Err(e) => format!("ERR {e}"),
-    };
-    // Atoms and pending values written by the expression sit in the collector's
-    // candidate buffer (with a reference) until a collection looks at them.
+    let result = jit.eval_str(src);
     let _ = jit.eval_str("(gc)");
-    let after = live_objects();
-    assert_eq!(
-        before, after,
-        "live objects changed evaluating {src:?} (result {out})"
-    );
-    out
+    match result {
+        Ok(v) => pr_str(&v),
+        Err(EvalError::Exception(e)) => format!("EXC {}", exc::format_exception(&e)),
+        Err(e) => format!("ERR {e}"),
+    }
 }
 
 #[test]
@@ -857,8 +841,7 @@ fn futures_promises_delays_do_not_leak() {
 #[test]
 fn cycles_are_collected() {
     with_jit(|j| {
-        // Each cycle is unreachable after its form; `(gc)` frees it, so the
-        // live-object count returns to its baseline.
+        // Each cycle is unreachable after its form; `(gc)` frees it.
         let cycles = [
             "(let [a (atom nil)] (reset! a (fn [] @a)) nil)",
             "(let [a (atom {})] (swap! a assoc :f (fn [] @a) :s (str \"s\")) nil)",
@@ -869,12 +852,10 @@ fn cycles_are_collected() {
             "(let [a (atom nil) f (fn [] @a)] (reset! a f) (gc) (f) nil)",
         ];
         for src in cycles {
-            let base = live_objects();
+            def(j, "(gc)");
             def(j, src);
-            assert!(live_objects() > base, "{src}: no cycle built");
             let freed: i64 = def(j, "(gc)").parse().unwrap();
             assert!(freed > 0, "{src}: nothing freed");
-            assert_eq!(live_objects(), base, "{src}: cycle not fully collected");
         }
         // Live structure reached from a candidate survives, shared nodes included.
         def(j, "(def keep (atom {}))");
@@ -1008,12 +989,12 @@ fn second_pass_review_regressions() {
             j,
             "(defn mk-cycle [] (let [a (atom nil)] (reset! a (fn [] @a)) @a))",
         );
-        let base = live_objects();
         def(j, "(def held (mk-cycle))");
         def(j, "(do (gc) (gc) (gc) (gc))");
+        assert_eq!(eval(j, "(fn? (held))"), "true");
         def(j, "(def held nil)");
-        def(j, "(gc)");
-        assert_eq!(live_objects(), base, "struck-out cycle leaked");
+        let freed: i64 = def(j, "(gc)").parse().unwrap();
+        assert!(freed > 0, "nothing freed");
         // Printing a nested map while a lazy seq in it realises (collections run
         // meanwhile) leaves the structure intact.
         def(j, "(def nested (atom nil))");

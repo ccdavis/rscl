@@ -1,10 +1,9 @@
 //! Keywords are interned, so equality is pointer equality, but the table only holds
-//! weak references: a keyword nobody references any more is freed and removed, so
-//! `(keyword untrusted-string)` cannot grow memory without bound (Clojure uses weak
-//! references for the same reason). Keywords that appear in compiled code are made
-//! immortal by their unit's constant table and stay interned for the process.
+//! weak references: a keyword nothing refers to any more is removed when the
+//! collector frees it, so `(keyword untrusted-string)` cannot grow memory without
+//! bound (Clojure uses weak references for the same reason). Keywords that appear in
+//! compiled code are kept by their unit's constant table.
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::{OnceLock, RwLock};
 
 use super::{Kind, cast};
@@ -18,44 +17,29 @@ pub struct KwObj {
     pub hash: u64,
 }
 
-/// Live keyword objects by name (weak: the objects own themselves) and by address,
-/// so a thread that comes to free an object another thread already freed can tell
-/// without touching the memory.
+/// Live keyword objects by name (weak: the collector removes the dead ones).
 struct Table {
     names: HashMap<(Option<String>, String), usize>,
-    live: std::collections::HashSet<usize>,
 }
-// SAFETY: the table stores addresses; every access retains or frees under the lock.
-unsafe impl Send for Table {}
-unsafe impl Sync for Table {}
 
 fn table() -> &'static RwLock<Table> {
     static T: OnceLock<RwLock<Table>> = OnceLock::new();
     T.get_or_init(|| {
         RwLock::new(Table {
             names: HashMap::new(),
-            live: std::collections::HashSet::new(),
         })
     })
 }
 
-/// Retain the keyword at `p` (+1). Done under a table lock, so `free` (which runs
-/// under the write lock) sees either the old count or the incremented one.
-unsafe fn retain(p: usize) -> Value {
-    let h = unsafe { &*(p as *const ObjHeader) };
-    h.rc.fetch_add(1, Ordering::Relaxed);
-    unsafe { Value::from_raw(p as u64) }
-}
-
-/// Intern a keyword: the one live object for this name (+1).
+/// Intern a keyword: the one live object for this name.
 pub fn intern(ns: Option<&str>, name: &str) -> Value {
     let key = (ns.map(str::to_owned), name.to_owned());
     if let Some(&p) = table().read().unwrap().names.get(&key) {
-        return unsafe { retain(p) };
+        return unsafe { Value::from_raw(p as u64) };
     }
     let mut w = table().write().unwrap();
     if let Some(&p) = w.names.get(&key) {
-        return unsafe { retain(p) };
+        return unsafe { Value::from_raw(p as u64) };
     }
     let hash = crate::equiv::hash_named(ns, name) ^ 0x9e37_79b9_7f4a_7c15;
     let obj = Box::new(KwObj {
@@ -65,31 +49,25 @@ pub fn intern(ns: Option<&str>, name: &str) -> Value {
         hash,
     });
     let p = Box::into_raw(obj) as usize;
+    crate::gc::register(p as *mut ObjHeader);
     w.names.insert(key, p);
-    w.live.insert(p);
     unsafe { Value::from_raw(p as u64) }
 }
 
-/// A reference count reached zero. Several threads can get here for one object (a
-/// resurrection by `intern` followed by another drop), so the first one to claim it
-/// under the write lock frees it; the others find it gone and never touch it. An
-/// object resurrected meanwhile (count back above zero) is left alone.
-pub(super) unsafe fn free(p: *mut KwObj) {
-    let mut w = table().write().unwrap();
-    if !w.live.contains(&(p as usize)) {
+/// The collector is about to free these keywords: forget them (the world is
+/// stopped, so nobody can be interning one of them right now).
+pub(crate) fn forget(dead: &[usize]) {
+    if dead.is_empty() {
         return;
     }
-    let kw = unsafe { &*p };
-    if kw.hdr.rc.load(Ordering::Acquire) != 0 {
-        return;
+    let mut w = table().write().unwrap_or_else(|e| e.into_inner());
+    for &p in dead {
+        let kw = unsafe { &*(p as *const KwObj) };
+        let key = (kw.ns.as_deref().map(str::to_owned), kw.name.to_string());
+        if w.names.get(&key) == Some(&p) {
+            w.names.remove(&key);
+        }
     }
-    let key = (kw.ns.as_deref().map(str::to_owned), kw.name.to_string());
-    if w.names.get(&key) == Some(&(p as usize)) {
-        w.names.remove(&key);
-    }
-    w.live.remove(&(p as usize));
-    drop(w);
-    drop(unsafe { Box::from_raw(p) });
 }
 
 /// Number of interned keywords (for diagnostics).
@@ -142,21 +120,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn weak_interning() {
-        // Other tests intern keywords concurrently, so only this name is inspected.
+    fn interning() {
         let (ns, name) = (Some("weak-test"), "one");
-        assert!(!is_interned(ns, name));
         let a = intern(ns, name);
         let b = intern(ns, name);
         assert!(a.identical(&b));
         assert!(is_interned(ns, name));
-        drop(a);
-        assert!(is_interned(ns, name), "still referenced by b");
-        drop(b);
-        assert!(!is_interned(ns, name), "freed and forgotten");
-        let c = intern(ns, name);
         let d = parse("weak-test/one");
-        assert!(c.identical(&d));
-        assert!(is_interned(ns, name));
+        assert!(a.identical(&d));
     }
 }

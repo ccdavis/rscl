@@ -33,25 +33,18 @@ pub fn new(thunk: Value) -> Value {
     })
 }
 
-/// Slots the collector walks (the world is stopped).
+/// Visit the value the lazy seq refers to: its thunk or its realised seq (the world
+/// is stopped, so the lock is bypassed). While it is being realised the thunk lives
+/// on the realising thread's stack.
 ///
 /// # Safety
-/// `p` is a live lazy seq and no other thread runs.
-pub(crate) unsafe fn gc_slots(p: *mut LazySeqObj) -> Vec<*const Value> {
+/// `p` is a live lazy seq and no other thread runs rscl code.
+pub(crate) unsafe fn gc_trace(p: *mut LazySeqObj, f: &mut dyn FnMut(&Value)) {
     let o = unsafe { &mut *p };
     match o.state.get_mut().unwrap_or_else(|e| e.into_inner()) {
-        State::Unrealized(v) | State::Realized(v) => vec![v as *const Value],
-        State::Realizing(_) => Vec::new(),
+        State::Unrealized(v) | State::Realized(v) => f(v),
+        State::Realizing(_) => {}
     }
-}
-
-/// Drop every reference a garbage lazy seq holds.
-///
-/// # Safety
-/// `p` is an unreachable lazy seq and no other thread runs.
-pub(crate) unsafe fn gc_unlink(p: *mut LazySeqObj) {
-    let o = unsafe { &mut *p };
-    *o.state.get_mut().unwrap_or_else(|e| e.into_inner()) = State::Realized(Value::NIL);
 }
 
 pub fn get(v: &Value) -> &LazySeqObj {
@@ -85,11 +78,10 @@ pub fn realize(v: &Value) -> RtResult<Value> {
                 // Another thread is realising it: wait as a blocking operation (idle
                 // for the collector, interruptible).
                 drop(g);
-                crate::native::enter_blocking();
-                std::thread::sleep(std::time::Duration::from_micros(200));
-                let check = crate::native::check_interrupt();
-                crate::native::leave_blocking();
-                check?;
+                crate::native::blocking(|| {
+                    std::thread::sleep(std::time::Duration::from_micros(200))
+                });
+                crate::native::check_interrupt()?;
                 continue;
             }
             State::Unrealized(_) => {
@@ -112,16 +104,5 @@ pub fn realize(v: &Value) -> RtResult<Value> {
             *g = State::Unrealized(thunk);
             Err(e)
         }
-    }
-}
-
-/// Take the realised value out for iterative freeing (see `obj::free_tail`).
-pub(super) fn take_tail(obj: &mut LazySeqObj) -> Value {
-    match std::mem::replace(
-        obj.state.get_mut().unwrap_or_else(|e| e.into_inner()),
-        State::Realized(Value::NIL),
-    ) {
-        State::Realized(s) => s,
-        _ => Value::NIL,
     }
 }

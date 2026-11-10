@@ -1,201 +1,301 @@
-//! Cycle collection for reference-counted objects (synchronous trial deletion, after
-//! Bacon and Rajan's "Recycler").
+//! The garbage collector: stop-the-world mark and sweep over a non-moving heap.
 //!
-//! Every object except atoms and pending values (futures, promises, delays) is
-//! immutable once it is shared, so it can only point at objects created before it:
-//! a reference cycle must pass through an atom or a pending value. Those are the
-//! candidates. One is buffered when it is written (the write may close a cycle) and
-//! when it loses a reference without dying (the reference being dropped is handed
-//! to the buffer instead, so the object stays valid without any decrement that could
-//! race with a concurrent free). When enough new candidates have accumulated, or on
-//! `(gc)`, the world is stopped and trial deletion runs from the buffered objects:
+//! Every heap object is registered here when it is allocated and stays at its
+//! address until a collection finds it unreachable. A `Value` is a plain word that
+//! is copied freely; nothing counts references.
 //!
-//! 1. Mark: walk everything reachable from the candidates, counting for each object
-//!    how many of its references come from inside the walked subgraph.
-//! 2. Scan: an object with references from outside (its count stays positive) is
-//!    live, and so is everything it reaches; the rest is garbage.
-//! 3. Collect: garbage objects have their outgoing references cleared (which breaks
-//!    the cycles) and are released.
+//! # Roots
 //!
-//! Persistent collections share tree nodes between versions, so a slot inside one
-//! may be owned by collections the walk never sees. A collection reached by the walk
-//! is therefore only counted through when it is the sole owner of its node tree,
-//! which the collector guarantees by rebuilding it (same contents, fresh nodes) when
-//! the collection object itself has a single reference; any other collection is a
-//! leaf whose contents count as external references. Immortal objects (vars, types,
-//! protocols, constants) are never entered.
+//! * **Machine stacks and registers**, scanned *conservatively*: any word that is
+//!   the address of a registered object (or points inside one) keeps that object
+//!   alive. This covers the frames of compiled code and of the Rust runtime alike,
+//!   so neither needs stack maps or handles. Objects never move, so a word that
+//!   merely looks like a pointer costs nothing but some retention.
+//! * **Constant tables** of compiled units (registered ranges, scanned the same way).
+//! * **Permanent objects**: vars (and through them every root value), namespaces,
+//!   types, protocols, fn prototypes' metadata.
+//! * **Thread-local runtime state**: the pending exception, `binding` frames, the
+//!   future a worker computes, and argument slices handed to rscl functions by
+//!   natives ([`root_slice`]).
+//! * **Pins**: values that live only in Rust heap data for a while (the closure of a
+//!   thread being started, values held by a native library): [`Pinned`].
 //!
-//! The collector needs every other rscl thread stopped at a safepoint (fn entry, loop
-//! header, or a blocking runtime operation), since trial deletion reads and adjusts
-//! counts non-atomically. Threads waiting for input or on a future declare
-//! themselves idle, which counts as stopped.
+//! From the roots, objects are traced precisely: each kind knows the values it
+//! holds (`trace`).
+//!
+//! # When a collection may run
+//!
+//! Only at a *safepoint*: fn entry and loop headers of compiled code, and explicit
+//! blocking regions of the runtime ([`blocking`]). A native function is never
+//! interrupted by a collection unless it calls back into rscl code, so values it
+//! holds in Rust heap containers (a `Vec<Value>` being built, say) are safe as long
+//! as it does not call rscl functions meanwhile; one that does keeps such values
+//! reachable through a root ([`root_slice`], [`Pinned`]). The compiler holds forms
+//! in its own data structures while it runs macros, so it defers collections for
+//! the duration with [`inhibit`].
+//!
+//! All other rscl threads must be stopped (parked at a safepoint or inside a
+//! blocking region) while a collection runs; their stacks are scanned from the
+//! stack pointer they published when they stopped.
+//!
+//! # Design notes
+//!
+//! The approach borrows from `gc-arena` (collections happen only at points where
+//! the mutator's state is known, and each object type has a trace method) and from
+//! `shredder` (a non-moving collector that traces through ordinary Rust data), but
+//! neither crate can see references held by JIT-compiled machine code, which is why
+//! the stack scan is conservative.
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::obj::{
-    self, Kind, atom, cons, exception, func, list, map, pending, set, sorted, symbol, types, vector,
+    self, Kind, atom, cons, exception, func, lazyseq, list, map, pending, set, sorted, symbol,
+    types, var, vector,
 };
-use crate::value::{ObjHeader, Value};
+use crate::value::{MARK, ObjHeader, PERMANENT, Value};
 
-/// A buffered candidate: the buffer holds one reference to it.
-#[derive(Clone, Copy)]
-struct Candidate {
-    addr: usize,
-    /// The object's version (writes and decrements) when it was last examined.
-    version: u32,
-    /// Consecutive collections that found it live and unchanged.
-    strikes: u8,
+// ---- the object registry -------------------------------------------------------------
+
+/// Hasher for object addresses (already unique; one multiplication spreads them).
+#[derive(Default)]
+struct AddrHasher(u64);
+
+impl Hasher for AddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8) | b as u64;
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.0 = ((n as u64) >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
 }
 
-struct Buffer {
-    objs: Vec<Candidate>,
-    set: HashSet<usize>,
-    /// Candidates added since the last collection.
-    fresh: usize,
-    /// Fresh candidates that request a collection (grows with the work of the last
-    /// one, so the cost stays proportional to the candidates).
-    trigger: usize,
+type AddrSet = HashSet<usize, BuildHasherDefault<AddrHasher>>;
+
+struct Heap {
+    /// Every object, permanent ones included.
+    objects: AddrSet,
+    /// Objects handed over by threads since the last collection.
+    incoming: Vec<usize>,
+    /// Objects that are roots and never freed.
+    permanent: Vec<usize>,
+    /// Fn prototypes (not objects; their metadata is a root).
+    protos: Vec<usize>,
+    /// Constant tables of compiled units: (address, words).
+    ranges: Vec<(usize, usize)>,
+    /// Pinned values and how many pins each has.
+    pins: HashMap<u64, usize>,
+    /// Lowest and highest object address (a cheap filter for the stack scan).
+    lo: usize,
+    hi: usize,
 }
 
-fn buffer() -> &'static Mutex<Buffer> {
-    static B: OnceLock<Mutex<Buffer>> = OnceLock::new();
-    B.get_or_init(|| {
-        Mutex::new(Buffer {
-            objs: Vec::new(),
-            set: HashSet::new(),
-            fresh: 0,
-            trigger: TRIGGER,
+fn heap() -> MutexGuard<'static, Heap> {
+    static H: OnceLock<Mutex<Heap>> = OnceLock::new();
+    H.get_or_init(|| {
+        Mutex::new(Heap {
+            objects: AddrSet::default(),
+            incoming: Vec::new(),
+            permanent: Vec::new(),
+            protos: Vec::new(),
+            ranges: Vec::new(),
+            pins: HashMap::new(),
+            lo: usize::MAX,
+            hi: 0,
         })
     })
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Fresh candidates before a collection is requested, at least.
-const TRIGGER: usize = 1024;
-
-/// A survivor found live and unchanged this many times in a row leaves the buffer
-/// (its next write or lost reference brings it back).
-const MAX_STRIKES: u8 = 3;
-
-/// Allocations per thread between checks that a quiet program with buffered
-/// candidates still collects now and then.
-const ALLOC_CHECK: u32 = 1 << 20;
-
-/// The object's version counter and buffered flag (atoms and pending values).
-fn marks(addr: usize) -> (&'static std::sync::atomic::AtomicU32, &'static AtomicBool) {
-    let p = addr as *mut ObjHeader;
-    unsafe {
-        match header(addr).kind {
-            Kind::Atom => {
-                let o = &*(p as *const atom::AtomObj);
-                (&o.version, &o.buffered)
-            }
-            _ => {
-                let o = &*(p as *const pending::PendingObj);
-                (&o.version, &o.buffered)
-            }
-        }
-    }
+/// Per-thread collector state.
+struct Local {
+    /// Objects this thread allocated and has not handed to the registry yet.
+    new: RefCell<Vec<usize>>,
+    registered: Cell<bool>,
+    /// Highest address of this thread's stack.
+    stack_base: Cell<usize>,
+    /// Inside a blocking region (already counted as stopped).
+    stopped: Cell<bool>,
+    /// This thread runs the collection.
+    collecting: Cell<bool>,
+    /// Depth of `inhibit` guards.
+    inhibit: Cell<u32>,
+    /// A collection was wanted while inhibited.
+    deferred: Cell<bool>,
+    /// Argument slices of calls into rscl code in progress: (address, values).
+    slices: RefCell<Vec<(usize, usize)>>,
 }
 
-/// `None` if already buffered; otherwise whether a collection should be requested.
-fn push_candidate(b: &mut Buffer, addr: usize, version: u32) -> Option<bool> {
-    if !b.set.insert(addr) {
-        return None;
-    }
-    b.objs.push(Candidate {
-        addr,
-        version,
-        strikes: 0,
-    });
-    b.fresh += 1;
-    Some(b.fresh >= b.trigger)
-}
-
-/// Called by `release_raw` for an atom or pending value: if it is not buffered yet,
-/// the buffer takes over the reference being dropped and the drop is done; returns
-/// false when the caller must decrement normally.
-///
-/// # Safety
-/// `p` must point at a live atom or pending object the caller holds a reference to.
-pub(crate) unsafe fn take_candidate(p: *const ObjHeader) -> bool {
-    if collecting() {
-        return false;
-    }
-    let addr = p as usize;
-    let (version, buffered) = marks(addr);
-    let v = version.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-    if buffered.swap(true, Ordering::AcqRel) {
-        return false;
-    }
-    let request = {
-        let mut b = buffer().lock().unwrap_or_else(|e| e.into_inner());
-        push_candidate(&mut b, addr, v.wrapping_sub(1))
-    };
-    match request {
-        Some(true) => {
-            request_gc();
-            true
-        }
-        Some(false) => true,
-        None => false,
+impl Drop for Local {
+    fn drop(&mut self) {
+        leave_world(self);
     }
 }
 
 thread_local! {
-    static ALLOCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-/// Called on every allocation: a quiet program still collects its candidates.
-#[inline]
-pub(crate) fn note_alloc() {
-    let n = ALLOCS.with(|a| {
-        let n = a.get().wrapping_add(1);
-        a.set(n);
-        n
-    });
-    if n.is_multiple_of(ALLOC_CHECK)
-        && !buffer()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .objs
-            .is_empty()
-    {
-        request_gc();
-    }
-}
-
-static GC_WANTED: AtomicBool = AtomicBool::new(false);
-
-/// Collections so far.
-static COLLECTIONS: Mutex<u64> = Mutex::new(0);
-
-/// An atom or pending value was written: buffer it as a candidate (the caller holds
-/// a reference, so retaining it here cannot race with a free). The object's own flag
-/// keeps the common case to one atomic swap.
-pub fn note_write(v: &Value) {
-    if collecting() {
-        return;
-    }
-    let addr = v.bits() as usize;
-    let (version, buffered) = marks(addr);
-    let ver = version.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-    if buffered.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let request = {
-        let mut b = buffer().lock().unwrap_or_else(|e| e.into_inner());
-        match push_candidate(&mut b, addr, ver.wrapping_sub(1)) {
-            Some(r) => r,
-            None => return,
+    static LOCAL: Local = const {
+        Local {
+            new: RefCell::new(Vec::new()),
+            registered: Cell::new(false),
+            stack_base: Cell::new(0),
+            stopped: Cell::new(false),
+            collecting: Cell::new(false),
+            inhibit: Cell::new(0),
+            deferred: Cell::new(false),
+            slices: RefCell::new(Vec::new()),
         }
     };
-    std::mem::forget(v.clone());
-    if request {
-        request_gc();
+}
+
+/// Hand a freshly allocated object to the collector.
+#[inline]
+pub(crate) fn register(p: *mut ObjHeader) {
+    let done = LOCAL.try_with(|l| {
+        if !l.registered.get() {
+            join_world(l);
+        }
+        l.new.borrow_mut().push(p as usize);
+    });
+    if done.is_err() {
+        // The thread's locals are gone (it is exiting).
+        heap().incoming.push(p as usize);
     }
 }
+
+/// Register an object that is never freed and is a root (its header is permanent).
+pub(crate) fn register_permanent(p: *mut ObjHeader) {
+    let mut h = heap();
+    h.incoming.push(p as usize);
+    h.permanent.push(p as usize);
+}
+
+/// Register a fn prototype: its metadata is a root.
+pub(crate) fn register_proto(p: *const func::FnProto) {
+    heap().protos.push(p as usize);
+}
+
+/// Make an existing object permanent: it becomes a root and is never freed.
+pub fn make_permanent(v: &Value) {
+    let Some(h) = v.header() else { return };
+    if h.flags.fetch_or(PERMANENT, Ordering::Relaxed) & PERMANENT == 0 {
+        heap().permanent.push(v.bits() as usize);
+    }
+}
+
+/// Register a table of values as roots (a compiled unit's constant table). The
+/// memory must stay valid for the rest of the process.
+pub fn add_root_range(addr: *const u64, words: usize) {
+    if words > 0 {
+        heap().ranges.push((addr as usize, words));
+    }
+}
+
+/// Keep `v` alive until a matching `unpin`.
+pub fn pin(v: &Value) {
+    if v.is_ptr() {
+        *heap().pins.entry(v.bits()).or_insert(0) += 1;
+    }
+}
+
+pub fn unpin(v: &Value) {
+    if !v.is_ptr() {
+        return;
+    }
+    let mut h = heap();
+    if let Some(n) = h.pins.get_mut(&v.bits()) {
+        *n -= 1;
+        if *n == 0 {
+            h.pins.remove(&v.bits());
+        }
+    }
+}
+
+/// A value kept alive while this handle exists: for values that live in Rust heap
+/// data the collector cannot see (a closure handed to a new thread, a native
+/// library's own storage).
+pub struct Pinned(Value);
+
+impl Pinned {
+    pub fn new(v: Value) -> Pinned {
+        pin(&v);
+        Pinned(v)
+    }
+    pub fn get(&self) -> Value {
+        self.0.clone()
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        unpin(&self.0);
+    }
+}
+
+/// Keeps a slice of values reachable while it exists (see [`root_slice`]).
+pub struct SliceRoot<'a>(std::marker::PhantomData<&'a [Value]>);
+
+/// Root the values of `s` for the lifetime of the guard: for natives that call rscl
+/// code while they hold values in a `Vec` or another heap container. Guards must be
+/// dropped in the reverse order of their creation (as scopes do).
+pub fn root_slice(s: &[Value]) -> SliceRoot<'_> {
+    unsafe { root_words(s.as_ptr() as *const u64, s.len()) }
+}
+
+/// # Safety
+/// `ptr` must point at `len` values that stay valid while the guard exists.
+pub(crate) unsafe fn root_words<'a>(ptr: *const u64, len: usize) -> SliceRoot<'a> {
+    let _ = LOCAL.try_with(|l| l.slices.borrow_mut().push((ptr as usize, len)));
+    SliceRoot(std::marker::PhantomData)
+}
+
+impl Drop for SliceRoot<'_> {
+    fn drop(&mut self) {
+        let _ = LOCAL.try_with(|l| l.slices.borrow_mut().pop());
+    }
+}
+
+/// Number of objects the collector knows about.
+pub fn object_count() -> usize {
+    let h = heap();
+    h.objects.len() + h.incoming.len()
+}
+
+// ---- deferring collections -------------------------------------------------------------
+
+/// While this guard exists, the calling thread neither collects nor stops for a
+/// collection. For code that holds values where the collector cannot see them
+/// across calls into rscl code (the compiler, while it expands macros).
+pub struct Inhibit(());
+
+pub fn inhibit() -> Inhibit {
+    let _ = LOCAL.try_with(|l| l.inhibit.set(l.inhibit.get() + 1));
+    Inhibit(())
+}
+
+impl Drop for Inhibit {
+    fn drop(&mut self) {
+        let _ = LOCAL.try_with(|l| {
+            l.inhibit.set(l.inhibit.get() - 1);
+            if l.inhibit.get() == 0 && l.deferred.replace(false) {
+                request_gc();
+            }
+        });
+    }
+}
+
+// ---- requests ----------------------------------------------------------------------------
+
+static GC_WANTED: AtomicBool = AtomicBool::new(false);
+static COLLECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Mirror of `World::phase != Idle` for the slow path, so threads that hit the
 /// interrupt flag for another reason do not serialise on the world lock.
@@ -206,18 +306,13 @@ pub fn stopping() -> bool {
     STOPPING.load(Ordering::Acquire)
 }
 
-thread_local! {
-    /// Set while this thread runs a collection: its own drops must not buffer
-    /// candidates (they are the collector's bookkeeping, not program activity).
-    static COLLECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
+/// This thread is running a collection (its allocations are the collector's own).
 pub(crate) fn collecting() -> bool {
-    COLLECTING.with(|c| c.get())
+    LOCAL.try_with(|l| l.collecting.get()).unwrap_or(false)
 }
 
-/// Ask for a collection at the next safepoint. Always raises the flag: an earlier
-/// request may have been consumed, deferred or finished since.
+/// Ask for a collection at the next safepoint. Only touches atomics: the allocator
+/// calls this.
 pub fn request_gc() {
     GC_WANTED.store(true, Ordering::Release);
     crate::native::request_safepoint();
@@ -227,7 +322,142 @@ pub fn gc_wanted() -> bool {
     GC_WANTED.load(Ordering::Acquire)
 }
 
-// ---- stopping the world ---------------------------------------------------------------
+pub fn collections() -> u64 {
+    COLLECTIONS.load(Ordering::Relaxed)
+}
+
+struct Config {
+    /// Collect at every n-th safepoint (0: off). For testing.
+    stress: u64,
+    debug: bool,
+    /// Check every traced reference against the registry.
+    verify: bool,
+}
+
+fn config() -> &'static Config {
+    static C: OnceLock<Config> = OnceLock::new();
+    C.get_or_init(|| {
+        let num = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        Config {
+            stress: num("RSCL_GC_STRESS").unwrap_or(0),
+            debug: std::env::var_os("RSCL_GC_DEBUG").is_some(),
+            verify: std::env::var_os("RSCL_GC_VERIFY").is_some(),
+        }
+    })
+}
+
+/// Read the collector's environment settings (call once at startup).
+pub fn configure() {
+    if config().stress > 0 {
+        crate::native::request_safepoint();
+    }
+}
+
+/// Stress mode: every n-th safepoint poll asks for a collection. True if stress
+/// mode is on (the interrupt flag then stays raised).
+pub(crate) fn stress_tick() -> bool {
+    let n = config().stress;
+    if n == 0 {
+        return false;
+    }
+    static TICKS: AtomicU64 = AtomicU64::new(0);
+    if TICKS.fetch_add(1, Ordering::Relaxed).is_multiple_of(n) {
+        GC_WANTED.store(true, Ordering::Release);
+    }
+    true
+}
+
+// ---- stopping the world ------------------------------------------------------------------
+
+/// Callee-saved registers captured when a thread stops.
+#[cfg(target_arch = "x86_64")]
+const NREGS: usize = 6;
+#[cfg(target_arch = "aarch64")]
+const NREGS: usize = 12;
+
+/// Where a stopped thread's live state is: its stack from `sp` up, and the
+/// callee-saved registers it had when it stopped.
+#[derive(Clone, Copy)]
+struct Frame {
+    sp: usize,
+    regs: [usize; NREGS],
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn capture() -> Frame {
+    let mut regs = [0usize; NREGS];
+    let sp: usize;
+    unsafe {
+        std::arch::asm!(
+            "mov [{b}], rbx",
+            "mov [{b} + 8], rbp",
+            "mov [{b} + 16], r12",
+            "mov [{b} + 24], r13",
+            "mov [{b} + 32], r14",
+            "mov [{b} + 40], r15",
+            "mov {sp}, rsp",
+            b = in(reg) regs.as_mut_ptr(),
+            sp = out(reg) sp,
+            options(nostack, preserves_flags),
+        );
+    }
+    Frame { sp, regs }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn capture() -> Frame {
+    let mut regs = [0usize; NREGS];
+    let sp: usize;
+    unsafe {
+        std::arch::asm!(
+            "stp x19, x20, [{b}]",
+            "stp x21, x22, [{b}, #16]",
+            "stp x23, x24, [{b}, #32]",
+            "stp x25, x26, [{b}, #48]",
+            "stp x27, x28, [{b}, #64]",
+            "str x29, [{b}, #80]",
+            "mov {sp}, sp",
+            b = in(reg) regs.as_mut_ptr(),
+            sp = out(reg) sp,
+            options(nostack, preserves_flags),
+        );
+    }
+    Frame { sp, regs }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("the collector's stack scan supports x86-64 and aarch64 only");
+
+/// Run `f` with the calling thread's stack pointer and callee-saved registers
+/// recorded. The frame of this function stays on the stack while `f` runs, so every
+/// value its callers hold is either in a frame above `sp` or in `regs`.
+#[inline(never)]
+fn with_frame<R>(f: impl FnOnce(&Frame) -> R) -> R {
+    let frame = capture();
+    let r = f(&frame);
+    std::hint::black_box(&frame);
+    r
+}
+
+/// What the collector needs from a stopped thread.
+#[derive(Clone)]
+struct Stopped {
+    frame: Frame,
+    /// Thread-local roots (see `thread_roots`).
+    roots: Vec<u64>,
+}
+
+struct ThreadRec {
+    id: u64,
+    stack_base: usize,
+    stopped: Option<Stopped>,
+}
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Phase {
@@ -239,8 +469,9 @@ enum Phase {
 
 struct World {
     phase: Phase,
-    /// Registered rscl threads that are not idle or parked.
+    /// Registered threads that are not stopped.
     running: usize,
+    threads: Vec<ThreadRec>,
 }
 
 struct Sync {
@@ -254,70 +485,160 @@ fn world() -> &'static Sync {
         world: Mutex::new(World {
             phase: Phase::Idle,
             running: 0,
+            threads: Vec::new(),
         }),
         cv: Condvar::new(),
     })
 }
 
-thread_local! {
-    /// Whether this thread is counted in `World::running` (test harnesses and
-    /// embedders may run rscl code on threads that never registered).
-    static REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+fn lock_world() -> MutexGuard<'static, World> {
+    world().world.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn registered() -> bool {
-    REGISTERED.with(|r| r.get())
-}
-
-/// A thread that runs rscl code registers itself; it must call `unregister_thread`
-/// before it exits.
-pub fn register_thread() {
-    let w = world();
-    let mut g = w.world.lock().unwrap_or_else(|e| e.into_inner());
-    // Join the world only between collections.
+fn wait_idle(mut g: MutexGuard<'static, World>) -> MutexGuard<'static, World> {
     while g.phase != Phase::Idle {
-        g = w.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        g = world().cv.wait(g).unwrap_or_else(|e| e.into_inner());
     }
-    g.running += 1;
-    crate::heap::arm_exit_flush();
-    REGISTERED.with(|r| r.set(true));
+    g
 }
 
-pub fn unregister_thread() {
-    if !registered() {
+/// Add the calling thread to the set the collector stops and scans.
+fn join_world(l: &Local) {
+    let (_, top) = crate::native::thread_stack_bounds();
+    // Unknown bounds (not a pthread stack): scan from here up to the page end at
+    // least; better than nothing, and unknown on no supported platform.
+    let marker = 0usize;
+    let base = if top != 0 {
+        top
+    } else {
+        (&marker as *const usize as usize | 0xfff) + 1
+    };
+    l.stack_base.set(base);
+    let mut g = wait_idle(lock_world());
+    g.running += 1;
+    g.threads.push(ThreadRec {
+        id: crate::native::thread_id(),
+        stack_base: base,
+        stopped: None,
+    });
+    drop(g);
+    l.registered.set(true);
+    crate::heap::arm_exit_flush();
+}
+
+/// Remove the calling thread: its unregistered objects go to the registry first,
+/// while no collection can be running.
+fn leave_world(l: &Local) {
+    if !l.registered.get() {
         return;
     }
-    let w = world();
-    let mut g = w.world.lock().unwrap_or_else(|e| e.into_inner());
-    g.running -= 1;
-    REGISTERED.with(|r| r.set(false));
-    w.cv.notify_all();
+    flush_new(l);
+    let id = crate::native::thread_id();
+    let mut g = lock_world();
+    if let Some(i) = g.threads.iter().position(|t| t.id == id) {
+        if g.threads[i].stopped.is_none() {
+            g.running -= 1;
+        }
+        g.threads.swap_remove(i);
+    }
+    world().cv.notify_all();
     drop(g);
+    l.registered.set(false);
+}
+
+fn flush_new(l: &Local) {
+    let mut new = l.new.borrow_mut();
+    if !new.is_empty() {
+        heap().incoming.append(&mut new);
+    }
+}
+
+/// A thread that runs rscl code. Registration also happens by itself on the first
+/// allocation; calling this early makes the whole stack visible from the start.
+pub fn register_thread() {
+    let _ = LOCAL.try_with(|l| {
+        if !l.registered.get() {
+            join_world(l);
+        }
+    });
+}
+
+/// Leave the set of rscl threads (also done when the thread exits).
+pub fn unregister_thread() {
+    let _ = LOCAL.try_with(leave_world);
     crate::heap::thread_exit();
 }
 
-/// The thread is about to block outside rscl code (reading input, waiting): it
-/// counts as stopped until `leave_idle`.
-pub fn enter_idle() {
-    if !registered() {
-        return;
+/// Values held in this thread's runtime state rather than on its stack.
+fn thread_roots(l: &Local) -> Vec<u64> {
+    let mut out = Vec::new();
+    crate::exc::pending_root(&mut out);
+    var::binding_roots(&mut out);
+    crate::native::future_root(&mut out);
+    if let Ok(slices) = l.slices.try_borrow() {
+        for &(p, n) in slices.iter() {
+            for i in 0..n {
+                out.push(unsafe { *(p as *const u64).add(i) });
+            }
+        }
     }
-    let w = world();
-    let mut g = w.world.lock().unwrap_or_else(|e| e.into_inner());
-    g.running -= 1;
-    w.cv.notify_all();
+    out
 }
 
-pub fn leave_idle() {
-    if !registered() {
-        return;
+/// Publish this thread as stopped. Its new objects are handed over first.
+fn stop_here(l: &Local, frame: &Frame) -> MutexGuard<'static, World> {
+    flush_new(l);
+    let roots = thread_roots(l);
+    let id = crate::native::thread_id();
+    let mut g = lock_world();
+    if let Some(t) = g.threads.iter_mut().find(|t| t.id == id) {
+        t.stopped = Some(Stopped {
+            frame: *frame,
+            roots,
+        });
     }
-    let w = world();
-    let mut g = w.world.lock().unwrap_or_else(|e| e.into_inner());
-    while g.phase != Phase::Idle {
-        g = w.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    g.running -= 1;
+    world().cv.notify_all();
+    g
+}
+
+/// Back from being stopped (waits for a collection in progress first).
+fn resume(g: MutexGuard<'static, World>) {
+    let id = crate::native::thread_id();
+    let mut g = wait_idle(g);
+    if let Some(t) = g.threads.iter_mut().find(|t| t.id == id) {
+        t.stopped = None;
     }
     g.running += 1;
+}
+
+/// Run a blocking operation (sleeping, waiting for a lock or for input). The thread
+/// counts as stopped for the collector meanwhile, so `f` must not touch rscl values
+/// or allocate objects; whatever it returns is used only after a collection in
+/// progress has finished.
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    let direct = LOCAL
+        .try_with(|l| l.stopped.get() || l.collecting.get() || l.inhibit.get() > 0)
+        .unwrap_or(true);
+    if direct {
+        return f();
+    }
+    register_thread();
+    with_frame(|frame| {
+        struct Back;
+        impl Drop for Back {
+            fn drop(&mut self) {
+                resume(lock_world());
+                let _ = LOCAL.try_with(|l| l.stopped.set(false));
+            }
+        }
+        LOCAL.with(|l| {
+            drop(stop_here(l, frame));
+            l.stopped.set(true);
+        });
+        let _back = Back;
+        f()
+    })
 }
 
 /// How long a collector waits for the other threads to reach a safepoint before
@@ -328,24 +649,44 @@ const STOP_TIMEOUT: Duration = Duration::from_millis(200);
 /// collection is over, or, if nobody is collecting yet, become the collector.
 /// Returns the number of objects freed when this thread collected.
 pub fn safepoint() -> Option<usize> {
+    let skip = LOCAL
+        .try_with(|l| {
+            if l.inhibit.get() > 0 {
+                // Not now: ask again when the last guard goes, and stop sending this
+                // thread to the slow path meanwhile.
+                if GC_WANTED.swap(false, Ordering::AcqRel) || stopping() {
+                    l.deferred.set(true);
+                }
+                if !stopping() {
+                    crate::native::safepoint_done();
+                }
+                return true;
+            }
+            l.stopped.get() || l.collecting.get()
+        })
+        .unwrap_or(true);
+    if skip {
+        return None;
+    }
+    register_thread();
+    with_frame(safepoint_at)
+}
+
+fn safepoint_at(frame: &Frame) -> Option<usize> {
     let w = world();
-    let mut g = w.world.lock().unwrap_or_else(|e| e.into_inner());
-    let me = usize::from(registered());
+    let g = lock_world();
     match g.phase {
         Phase::Requested | Phase::Running => {
-            if me == 1 {
-                g.running -= 1;
-                w.cv.notify_all();
-            }
-            while g.phase != Phase::Idle {
-                g = w.cv.wait(g).unwrap_or_else(|e| e.into_inner());
-            }
-            g.running += me;
+            drop(g);
+            let g = LOCAL.with(|l| stop_here(l, frame));
+            resume(g);
             None
         }
         Phase::Idle => {
+            let mut g = g;
             if !GC_WANTED.swap(false, Ordering::AcqRel) {
                 // Nothing to do (a request already served): lower the flag.
+                drop(g);
                 crate::native::safepoint_done();
                 return None;
             }
@@ -356,16 +697,17 @@ pub fn safepoint() -> Option<usize> {
             STOPPING.store(true, Ordering::Release);
             w.cv.notify_all();
             let deadline = Instant::now() + STOP_TIMEOUT;
-            while g.running > me {
+            while g.running > 1 {
                 let now = Instant::now();
                 if now >= deadline {
-                    // Someone is stuck in native code: try again at a later request.
+                    // Someone is busy in native code or compiling: try again after
+                    // some more allocation.
                     g.phase = Phase::Idle;
                     STOPPING.store(false, Ordering::Release);
                     w.cv.notify_all();
                     drop(g);
                     crate::native::safepoint_done();
-                    GC_WANTED.store(true, Ordering::Release);
+                    crate::heap::gc_postponed();
                     return None;
                 }
                 let (guard, _) =
@@ -374,482 +716,343 @@ pub fn safepoint() -> Option<usize> {
                 g = guard;
             }
             g.phase = Phase::Running;
+            let me = crate::native::thread_id();
+            let others: Vec<(usize, Stopped)> = g
+                .threads
+                .iter()
+                .filter(|t| t.id != me)
+                .filter_map(|t| t.stopped.clone().map(|s| (t.stack_base, s)))
+                .collect();
             drop(g);
-            COLLECTING.with(|c| c.set(true));
-            let freed = collect();
-            COLLECTING.with(|c| c.set(false));
-            let mut g = w.world.lock().unwrap_or_else(|e| e.into_inner());
+            let freed = LOCAL.with(|l| {
+                l.collecting.set(true);
+                let freed = collect(l, frame, &others);
+                l.collecting.set(false);
+                freed
+            });
+            let mut g = lock_world();
             g.phase = Phase::Idle;
             STOPPING.store(false, Ordering::Release);
             w.cv.notify_all();
             drop(g);
             crate::native::safepoint_done();
-            // Candidates that piled up during the collection want another one.
-            if GC_WANTED.load(Ordering::Acquire) {
-                crate::native::request_safepoint();
-            }
             Some(freed)
         }
     }
 }
 
 /// `(gc)`: collect now, on the calling thread. `None` if the other threads could not
-/// be stopped in time.
+/// be stopped in time (or collections are deferred on this thread).
 pub fn collect_now() -> Option<usize> {
     GC_WANTED.store(true, Ordering::Release);
     safepoint()
 }
 
-pub fn collections() -> u64 {
-    *COLLECTIONS.lock().unwrap_or_else(|e| e.into_inner())
+// ---- marking -----------------------------------------------------------------------------
+
+/// Largest distance, in words, between an object's address and a pointer into it
+/// that the conservative scan still recognises.
+const INTERIOR_WORDS: usize = 16;
+
+pub(crate) struct Marker<'a> {
+    objects: &'a AddrSet,
+    lo: usize,
+    hi: usize,
+    stack: Vec<usize>,
+    verify: bool,
 }
 
-// ---- trial deletion -----------------------------------------------------------------
-
-struct Info {
-    /// Refcount minus the references found inside the walked subgraph (complete
-    /// after `settle`).
-    count: i64,
-    black: bool,
-}
-
-struct Walk {
-    info: HashMap<usize, Info>,
-    slots: HashSet<usize>,
-    /// Objects in visiting order, for the scan and collect phases.
-    order: Vec<usize>,
-}
-
+#[inline]
 fn header(addr: usize) -> &'static ObjHeader {
     unsafe { &*(addr as *const ObjHeader) }
 }
 
-/// A heap object that refcounting may free (not immortal).
-fn mortal(v: &Value) -> Option<usize> {
-    let h = v.header()?;
-    if h.rc.load(Ordering::Relaxed) < 0 {
-        return None;
+impl Marker<'_> {
+    /// Mark the object at `addr` (known to be one) and queue it for tracing.
+    #[inline]
+    fn object(&mut self, addr: usize) {
+        let h = header(addr);
+        let f = h.flags.load(Ordering::Relaxed);
+        if f & MARK == 0 {
+            h.flags.store(f | MARK, Ordering::Relaxed);
+            self.stack.push(addr);
+        }
     }
-    Some(v.bits() as usize)
+
+    /// A reference held by a traced object (or another precise root).
+    #[inline]
+    pub(crate) fn value(&mut self, v: &Value) {
+        if v.is_ptr() {
+            let addr = v.bits() as usize;
+            if self.verify && !self.objects.contains(&addr) {
+                panic!("gc: traced reference {addr:#x} is not a live object");
+            }
+            self.object(addr);
+        }
+    }
+
+    /// A word that is a reference if it is the address of an object.
+    #[inline]
+    fn word(&mut self, w: usize) {
+        if w >= self.lo && w <= self.hi && w & 7 == 0 && self.objects.contains(&w) {
+            self.object(w);
+        }
+    }
+
+    /// A word from a stack or register: a reference if it is the address of an
+    /// object or points inside one.
+    #[inline]
+    fn stack_word(&mut self, w: usize) {
+        if w < self.lo || w > self.hi.saturating_add(8 * INTERIOR_WORDS) || w & 7 != 0 {
+            return;
+        }
+        if self.objects.contains(&w) {
+            self.object(w);
+            return;
+        }
+        for back in 1..=INTERIOR_WORDS {
+            let Some(a) = w.checked_sub(8 * back) else {
+                return;
+            };
+            if a < self.lo {
+                return;
+            }
+            if self.objects.contains(&a) {
+                if 8 * back < unsafe { obj::size_of(a as *const ObjHeader) } {
+                    self.object(a);
+                }
+                return;
+            }
+        }
+    }
+
+    fn drain(&mut self) {
+        while let Some(addr) = self.stack.pop() {
+            unsafe { trace(addr, self) };
+        }
+    }
 }
 
-/// Addresses of the value slots an object holds. A collection is counted through
-/// only when it is uniquely referenced (then its node tree is made unique first).
-/// Replacing the tree is safe because a native that iterates a collection it merely
-/// borrows, and may reach a safepoint meanwhile (the printer, `=`, `hash`,
-/// `compare`), iterates its own O(1) clone, which keeps the old nodes alive;
-/// any other collection, and opaque objects, hold their contents as external
-/// references.
-unsafe fn child_slots(addr: usize) -> Vec<*const Value> {
-    let h = header(addr);
-    let rc = h.rc.load(Ordering::Relaxed);
+/// Scan `[from, to)` word by word. The memory may hold anything (dead stack slots
+/// included), which is why this function has a name tools can suppress on.
+#[inline(never)]
+fn scan_conservative(m: &mut Marker<'_>, from: usize, to: usize) {
+    let mut p = (from + 7) & !7;
+    while p + 8 <= to {
+        let w = unsafe { std::ptr::read_volatile(p as *const usize) };
+        m.stack_word(w);
+        p += 8;
+    }
+}
+
+/// Visit every value the object at `addr` holds.
+unsafe fn trace(addr: usize, m: &mut Marker<'_>) {
     let p = addr as *mut ObjHeader;
     unsafe {
-        match h.kind {
+        match (*p).kind {
             Kind::List => {
                 let o = &*(p as *const list::ListObj);
-                vec![&o.first, &o.rest, &o.meta]
+                m.value(&o.first);
+                m.value(&o.rest);
+                m.value(&o.meta);
             }
             Kind::Cons => {
                 let o = &*(p as *const cons::ConsObj);
-                vec![&o.first, &o.more]
+                m.value(&o.first);
+                m.value(&o.more);
             }
-            Kind::Symbol => vec![&(*(p as *const symbol::SymObj)).meta],
-            Kind::Fn => {
-                let o = &*(p as *const func::FnObj);
-                (0..o.ncaptures as usize)
-                    .map(|i| func::capture_ptr_raw(p as *const func::FnObj, i) as *const Value)
-                    .collect()
-            }
-            Kind::Exception => {
-                let o = &*(p as *const exception::ExcObj);
-                vec![&o.message, &o.data, &o.cause]
-            }
-            Kind::Instance => {
-                let o = &*(p as *const types::InstanceObj);
-                let mut v: Vec<*const Value> = o.fields.iter().map(|f| f as *const Value).collect();
-                v.push(&o.ext);
-                v.push(&o.meta);
-                v
-            }
-            Kind::Atom => atom::gc_slots(p as *mut atom::AtomObj),
-            Kind::Pending => pending::gc_slots(p as *mut pending::PendingObj),
-            Kind::LazySeq => obj::lazyseq::gc_slots(p as *mut obj::lazyseq::LazySeqObj),
-            Kind::Vector if rc == 1 => {
-                let o = &mut *(p as *mut vector::VecObj);
-                o.v = o.v.iter().cloned().collect();
-                let mut v: Vec<*const Value> = o.v.iter().map(|x| x as *const Value).collect();
-                v.push(&o.meta);
-                v
-            }
-            Kind::Map if rc == 1 => {
-                let o = &mut *(p as *mut map::MapObj);
-                o.m = o.m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                let mut v: Vec<*const Value> = Vec::new();
-                for (k, x) in o.m.iter() {
-                    v.push(k as *const Value);
-                    v.push(x as *const Value);
-                }
-                v.push(&o.meta);
-                v
-            }
-            Kind::Set if rc == 1 => {
-                let o = &mut *(p as *mut set::SetObj);
-                o.s = o.s.iter().cloned().collect();
-                let mut v: Vec<*const Value> = o.s.iter().map(|x| x as *const Value).collect();
-                v.push(&o.meta);
-                v
-            }
-            Kind::SortedMap if rc == 1 => {
-                let o = &mut *(p as *mut sorted::SortedMapObj);
-                o.m = o.m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                let mut v: Vec<*const Value> = Vec::new();
-                for (k, x) in o.m.iter() {
-                    v.push(&k.0 as *const Value);
-                    v.push(x as *const Value);
-                }
-                v.push(&o.meta);
-                v
-            }
-            Kind::SortedSet if rc == 1 => {
-                let o = &mut *(p as *mut sorted::SortedSetObj);
-                o.s = o.s.iter().cloned().collect();
-                let mut v: Vec<*const Value> = o.s.iter().map(|x| &x.0 as *const Value).collect();
-                v.push(&o.meta);
-                v
-            }
-            // Shared collections, strings, numbers, keywords, regexes, natives, and
-            // the immortal kinds: nothing to walk through.
-            _ => Vec::new(),
-        }
-    }
-}
-
-/// Clear every outgoing reference of a garbage object (releasing what it held).
-unsafe fn unlink(addr: usize) {
-    let p = addr as *mut ObjHeader;
-    unsafe {
-        match header(addr).kind {
-            Kind::List => {
-                let o = &mut *(p as *mut list::ListObj);
-                o.first = Value::NIL;
-                o.rest = Value::NIL;
-                o.meta = Value::NIL;
-            }
-            Kind::Cons => {
-                let o = &mut *(p as *mut cons::ConsObj);
-                o.first = Value::NIL;
-                o.more = Value::NIL;
-            }
-            Kind::Symbol => (*(p as *mut symbol::SymObj)).meta = Value::NIL,
+            Kind::Symbol => m.value(&(*(p as *const symbol::SymObj)).meta),
             Kind::Fn => {
                 let o = &*(p as *const func::FnObj);
                 for i in 0..o.ncaptures as usize {
-                    let slot = func::capture_ptr_raw(p as *const func::FnObj, i);
-                    drop(std::ptr::replace(slot, Value::NIL));
+                    m.value(&*func::capture_ptr_raw(p as *const func::FnObj, i));
                 }
             }
             Kind::Exception => {
-                let o = &mut *(p as *mut exception::ExcObj);
-                o.message = Value::NIL;
-                o.data = Value::NIL;
-                o.cause = Value::NIL;
+                let o = &*(p as *const exception::ExcObj);
+                m.value(&o.message);
+                m.value(&o.data);
+                m.value(&o.cause);
             }
             Kind::Instance => {
-                let o = &mut *(p as *mut types::InstanceObj);
-                for f in o.fields.iter_mut() {
-                    *f = Value::NIL;
+                let o = &*(p as *const types::InstanceObj);
+                for f in o.fields.iter() {
+                    m.value(f);
                 }
-                o.ext = Value::NIL;
-                o.meta = Value::NIL;
+                m.value(&o.ext);
+                m.value(&o.meta);
             }
-            Kind::Atom => atom::gc_unlink(p as *mut atom::AtomObj),
-            Kind::Pending => pending::gc_unlink(p as *mut pending::PendingObj),
-            Kind::LazySeq => obj::lazyseq::gc_unlink(p as *mut obj::lazyseq::LazySeqObj),
+            Kind::Atom => atom::gc_trace(p as *mut atom::AtomObj, &mut |v| m.value(v)),
+            Kind::Pending => pending::gc_trace(p as *mut pending::PendingObj, &mut |v| m.value(v)),
+            Kind::LazySeq => lazyseq::gc_trace(p as *mut lazyseq::LazySeqObj, &mut |v| m.value(v)),
             Kind::Vector => {
-                let o = &mut *(p as *mut vector::VecObj);
-                o.v = vector::Vec_::new();
-                o.meta = Value::NIL;
+                let o = &*(p as *const vector::VecObj);
+                for x in o.v.iter() {
+                    m.value(x);
+                }
+                m.value(&o.meta);
             }
             Kind::Map => {
-                let o = &mut *(p as *mut map::MapObj);
-                o.m = map::empty_map();
-                o.meta = Value::NIL;
+                let o = &*(p as *const map::MapObj);
+                for (k, x) in o.m.iter() {
+                    m.value(k);
+                    m.value(x);
+                }
+                if let Some(order) = &o.order {
+                    for x in order.iter() {
+                        m.value(x);
+                    }
+                }
+                m.value(&o.meta);
             }
             Kind::Set => {
-                let o = &mut *(p as *mut set::SetObj);
-                o.s = set::empty_set();
-                o.meta = Value::NIL;
+                let o = &*(p as *const set::SetObj);
+                for x in o.s.iter() {
+                    m.value(x);
+                }
+                if let Some(order) = &o.order {
+                    for x in order.iter() {
+                        m.value(x);
+                    }
+                }
+                m.value(&o.meta);
             }
             Kind::SortedMap => {
-                let o = &mut *(p as *mut sorted::SortedMapObj);
-                o.m = sorted::OMap::new();
-                o.meta = Value::NIL;
+                let o = &*(p as *const sorted::SortedMapObj);
+                for (k, x) in o.m.iter() {
+                    m.value(&k.0);
+                    m.value(x);
+                }
+                m.value(&o.meta);
             }
             Kind::SortedSet => {
-                let o = &mut *(p as *mut sorted::SortedSetObj);
-                o.s = sorted::OSet::new();
-                o.meta = Value::NIL;
-            }
-            _ => {}
-        }
-    }
-}
-
-impl Walk {
-    fn discover(&mut self, addr: usize, buffered: &HashSet<usize>) {
-        // Starts as minus the references accounted for (the buffer's own); `mark`
-        // subtracts one per slot found, and `settle` adds the refcount once the
-        // whole graph is walked.
-        let count = if buffered.contains(&addr) { -1 } else { 0 };
-        self.info.insert(
-            addr,
-            Info {
-                count,
-                black: false,
-            },
-        );
-        self.order.push(addr);
-    }
-
-    /// Turn "minus the internal references" into "references from outside". The
-    /// refcount is read only now: making a collection's node tree unique during
-    /// `mark` adds references to its elements (and drops the old tree's, if nothing
-    /// else shares it), so a count taken when an object was first met could be
-    /// lower than the number of slots that end up referring to it, and a live
-    /// object would look unreferenced.
-    fn settle(&mut self) {
-        for (addr, i) in self.info.iter_mut() {
-            i.count += header(*addr).rc.load(Ordering::Relaxed);
-        }
-    }
-
-    /// First phase: count internal references over everything reachable from `root`.
-    fn mark(&mut self, root: usize, buffered: &HashSet<usize>) {
-        if self.info.contains_key(&root) {
-            return;
-        }
-        self.discover(root, buffered);
-        let mut stack = vec![root];
-        let mut expanded: HashSet<usize> = HashSet::new();
-        while let Some(addr) = stack.pop() {
-            if !expanded.insert(addr) {
-                continue;
-            }
-            for slot in unsafe { child_slots(addr) } {
-                if !self.slots.insert(slot as usize) {
-                    continue;
-                }
-                let child = unsafe { &*slot };
-                let Some(c) = mortal(child) else { continue };
-                if !self.info.contains_key(&c) {
-                    self.discover(c, buffered);
-                    stack.push(c);
-                }
-                self.info.get_mut(&c).expect("discovered").count -= 1;
-            }
-        }
-    }
-
-    /// Second phase: externally referenced objects, and all they reach, are live.
-    fn scan(&mut self) {
-        let roots: Vec<usize> = self
-            .order
-            .iter()
-            .copied()
-            .filter(|a| self.info[a].count > 0)
-            .collect();
-        let mut stack = roots;
-        while let Some(addr) = stack.pop() {
-            let i = self.info.get_mut(&addr).expect("walked");
-            if i.black {
-                continue;
-            }
-            i.black = true;
-            for slot in unsafe { child_slots_no_rebuild(addr) } {
-                let child = unsafe { &*slot };
-                if let Some(c) = mortal(child)
-                    && self.info.contains_key(&c)
-                {
-                    stack.push(c);
-                }
-            }
-        }
-    }
-}
-
-/// Children for the scan phase: the same slots as the mark phase, but collections
-/// were already rebuilt, so read them as they are.
-unsafe fn child_slots_no_rebuild(addr: usize) -> Vec<*const Value> {
-    // After `mark`, a collection that was rebuilt still has rc 1 and `child_slots`
-    // would rebuild it again (harmless but wasteful); read the slots directly.
-    let h = header(addr);
-    let p = addr as *mut ObjHeader;
-    unsafe {
-        match h.kind {
-            Kind::Vector if h.rc.load(Ordering::Relaxed) == 1 => {
-                let o = &*(p as *const vector::VecObj);
-                let mut v: Vec<*const Value> = o.v.iter().map(|x| x as *const Value).collect();
-                v.push(&o.meta);
-                v
-            }
-            Kind::Map if h.rc.load(Ordering::Relaxed) == 1 => {
-                let o = &*(p as *const map::MapObj);
-                let mut v: Vec<*const Value> = Vec::new();
-                for (k, x) in o.m.iter() {
-                    v.push(k as *const Value);
-                    v.push(x as *const Value);
-                }
-                v.push(&o.meta);
-                v
-            }
-            Kind::Set if h.rc.load(Ordering::Relaxed) == 1 => {
-                let o = &*(p as *const set::SetObj);
-                let mut v: Vec<*const Value> = o.s.iter().map(|x| x as *const Value).collect();
-                v.push(&o.meta);
-                v
-            }
-            Kind::SortedMap if h.rc.load(Ordering::Relaxed) == 1 => {
-                let o = &*(p as *const sorted::SortedMapObj);
-                let mut v: Vec<*const Value> = Vec::new();
-                for (k, x) in o.m.iter() {
-                    v.push(&k.0 as *const Value);
-                    v.push(x as *const Value);
-                }
-                v.push(&o.meta);
-                v
-            }
-            Kind::SortedSet if h.rc.load(Ordering::Relaxed) == 1 => {
                 let o = &*(p as *const sorted::SortedSetObj);
-                let mut v: Vec<*const Value> = o.s.iter().map(|x| &x.0 as *const Value).collect();
-                v.push(&o.meta);
-                v
+                for x in o.s.iter() {
+                    m.value(&x.0);
+                }
+                m.value(&o.meta);
             }
-            _ => child_slots(addr),
+            Kind::Var => var::gc_trace(p as *mut var::VarObj, &mut |v| m.value(v)),
+            Kind::Type => {
+                let o = &*(p as *const types::TypeObj);
+                for k in o.field_kws.iter() {
+                    m.value(k);
+                }
+            }
+            Kind::Protocol => {
+                types::gc_trace_protocol(p as *mut types::ProtocolObj, &mut |v| m.value(v))
+            }
+            // Leaves: numbers, strings, keywords, regexes, native handles; a
+            // namespace maps names to vars, which are permanent themselves.
+            Kind::Long
+            | Kind::Double
+            | Kind::String
+            | Kind::Keyword
+            | Kind::Regex
+            | Kind::Native
+            | Kind::BigInt
+            | Kind::Namespace => {}
         }
     }
 }
 
-/// Run one collection (the world is stopped). Returns the number of objects freed.
-fn collect() -> usize {
-    let (cands, buffered): (Vec<Candidate>, HashSet<usize>) = {
-        let mut b = buffer().lock().unwrap_or_else(|e| e.into_inner());
-        let objs = std::mem::take(&mut b.objs);
-        let set = std::mem::take(&mut b.set);
-        b.fresh = 0;
-        (objs, set)
+// ---- a collection ------------------------------------------------------------------------
+
+/// Mark from the roots and free what was not reached. The world is stopped;
+/// `others` are the other threads' published states.
+fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
+    let started = Instant::now();
+    flush_new(l);
+    let own_roots = thread_roots(l);
+    let mut guard = heap();
+    let h = &mut *guard;
+    // New objects join the registry. A mark left on one (it was reached by an
+    // earlier collection before its thread handed it over) is cleared.
+    for p in h.incoming.drain(..) {
+        let hd = header(p);
+        hd.flags.fetch_and(!MARK, Ordering::Relaxed);
+        h.lo = h.lo.min(p);
+        h.hi = h.hi.max(p);
+        h.objects.insert(p);
+    }
+    let before = h.objects.len();
+    let mut m = Marker {
+        objects: &h.objects,
+        lo: h.lo,
+        hi: h.hi,
+        stack: Vec::new(),
+        verify: config().verify,
     };
-    // A candidate that only the buffer still references is plain garbage, not a
-    // cycle: release it without walking anything. Short-lived atoms (an
-    // interpreter's environments, loop-local state) are nearly all of this kind.
-    let (dead, cands): (Vec<Candidate>, Vec<Candidate>) = cands
-        .into_iter()
-        .partition(|c| header(c.addr).rc.load(Ordering::Relaxed) == 1);
-    let mut buffered = buffered;
-    let early = dead.len();
-    for c in &dead {
-        buffered.remove(&c.addr);
-        marks(c.addr).1.store(false, Ordering::Release);
+    for &p in &h.permanent {
+        m.object(p);
     }
-    for c in dead {
-        unsafe { crate::value::release_raw(c.addr as u64) };
+    for &p in &h.protos {
+        m.value(unsafe { &(*(p as *const func::FnProto)).meta });
     }
-    let roots: Vec<usize> = cands.iter().map(|c| c.addr).collect();
-    *COLLECTIONS.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-    let mut walk = Walk {
-        info: HashMap::new(),
-        slots: HashSet::new(),
-        order: Vec::new(),
-    };
-    for &r in &roots {
-        walk.mark(r, &buffered);
+    for &bits in h.pins.keys() {
+        m.word(bits as usize);
     }
-    walk.settle();
-    walk.scan();
-    if std::env::var_os("RSCL_GC_DEBUG").is_some() {
-        eprintln!("gc: {} roots, {} walked", roots.len(), walk.order.len());
-        for a in &walk.order {
-            let i = &walk.info[a];
-            eprintln!(
-                "  {:?} rc={} count={} black={} root={}",
-                header(*a).kind,
-                header(*a).rc.load(Ordering::Relaxed),
-                i.count,
-                i.black,
-                buffered.contains(a)
-            );
+    for &(addr, words) in &h.ranges {
+        for i in 0..words {
+            m.word(unsafe { *(addr as *const usize).add(i) });
         }
     }
-    let whites: Vec<usize> = walk
-        .order
-        .iter()
-        .copied()
-        .filter(|a| !walk.info[a].black)
-        .collect();
-    // Keep the garbage alive while its references are cleared, then let it go.
-    for &w in &whites {
-        header(w).rc.fetch_add(1, Ordering::Relaxed);
+    // This thread, then the stopped ones.
+    scan_conservative(&mut m, frame.sp, l.stack_base.get());
+    for &r in &frame.regs {
+        m.stack_word(r);
     }
-    for &w in &whites {
-        unsafe { unlink(w) };
+    for &r in &own_roots {
+        m.word(r as usize);
     }
-    // Live candidates stay buffered (keeping their reference) for a few rounds, in
-    // case a reference from outside the cycle goes away soon; ones that stay live
-    // and unchanged leave the buffer until their next write or lost reference.
-    let freed = whites.len() + early;
-    let white_set: HashSet<usize> = whites.iter().copied().collect();
-    // Releasing may free objects whose drops reach the buffer: do it after the lock.
-    let mut to_release: Vec<usize> = Vec::new();
-    {
-        let mut b = buffer().lock().unwrap_or_else(|e| e.into_inner());
-        // Amortise re-walking live survivors: the more live objects a collection
-        // walks, the more fresh candidates the next one waits for.
-        b.trigger = TRIGGER.max(walk.order.len() - whites.len());
-        for c in cands {
-            if white_set.contains(&c.addr) {
-                continue;
+    for (base, s) in others {
+        scan_conservative(&mut m, s.frame.sp, *base);
+        for &r in &s.frame.regs {
+            m.stack_word(r);
+        }
+        for &r in &s.roots {
+            m.word(r as usize);
+        }
+    }
+    m.drain();
+
+    // Sweep.
+    let mut dead: Vec<usize> = Vec::new();
+    let mut dead_keywords: Vec<usize> = Vec::new();
+    h.objects.retain(|&p| {
+        let hd = header(p);
+        let f = hd.flags.load(Ordering::Relaxed);
+        if f & MARK != 0 {
+            hd.flags.store(f & !MARK, Ordering::Relaxed);
+            true
+        } else if f & PERMANENT != 0 {
+            true
+        } else {
+            if hd.kind == Kind::Keyword {
+                dead_keywords.push(p);
             }
-            let (version, buffered) = marks(c.addr);
-            let now = version.load(Ordering::Acquire);
-            // Referenced from inside its own graph (beyond the buffer's own
-            // reference, which the walk already subtracted): it may sit on a cycle
-            // that dies when some other member loses its last outside reference,
-            // which no write or decrement of this object announces. Such a
-            // candidate stays under watch.
-            let h = header(c.addr);
-            let cyclic = walk
-                .info
-                .get(&c.addr)
-                .is_some_and(|i| i.count < h.rc.load(Ordering::Relaxed) - 1);
-            let strikes = if now != c.version || cyclic {
-                0
-            } else {
-                c.strikes + 1
-            };
-            if strikes < MAX_STRIKES && b.set.insert(c.addr) {
-                b.objs.push(Candidate {
-                    addr: c.addr,
-                    version: now,
-                    strikes,
-                });
-            } else {
-                buffered.store(false, Ordering::Release);
-                to_release.push(c.addr);
-            }
+            dead.push(p);
+            false
         }
+    });
+    obj::keyword::forget(&dead_keywords);
+    for &p in &dead {
+        unsafe { obj::free(p as *mut ObjHeader) };
     }
-    for addr in to_release {
-        unsafe { crate::value::release_raw(addr as u64) };
+    let after = h.objects.len();
+    drop(guard);
+    COLLECTIONS.fetch_add(1, Ordering::Relaxed);
+    crate::heap::gc_finished();
+    if config().debug {
+        eprintln!(
+            "[gc] {} objects, {} freed, {} live, {} threads, {:.2} ms, heap {} KB",
+            before,
+            dead.len(),
+            after,
+            others.len() + 1,
+            started.elapsed().as_secs_f64() * 1e3,
+            crate::heap::used() >> 10,
+        );
     }
-    // The buffer's references to the garbage (released directly: a `Value` drop
-    // would buffer them again).
-    for &w in &whites {
-        if buffered.contains(&w) {
-            unsafe { crate::value::release_raw(w as u64) };
-        }
-    }
-    for &w in &whites {
-        unsafe { crate::value::release_raw(w as u64) };
-    }
-    freed
+    dead.len()
 }

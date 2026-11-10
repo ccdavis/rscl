@@ -71,6 +71,7 @@ pub fn start(cfg: SessionConfig) -> Result<(), String> {
     if let Some(mut compiler) = cfg.aot {
         let mut core_units = Vec::new();
         let forms = crate::boot::in_core(crate::boot::core_forms).map_err(|e| e.to_string())?;
+        let _no_gc = rscl_runtime::gc::inhibit();
         crate::boot::in_core(|| -> Result<(), String> {
             for form in &forms {
                 for unit_form in split_do(form) {
@@ -150,6 +151,9 @@ fn eval_unit(form: &Value) -> Result<Value, EvalError> {
     let run = !no_eval || is_ns_directive(form);
     // Analysis runs macros, and a macro may `require` a lib, which re-enters the
     // session: analyse without holding the borrow. Compilation itself runs no code.
+    // The analyser keeps forms in its own data meanwhile: no collection until the
+    // unit is compiled.
+    let no_gc = rscl_runtime::gc::inhibit();
     let mut an = Analyzer::new(ns::current());
     let node = an.analyze_toplevel(form)?;
     let unit = with(|s| -> Result<Option<CompiledUnit>, EvalError> {
@@ -167,6 +171,8 @@ fn eval_unit(form: &Value) -> Result<Value, EvalError> {
         }
         Ok(compiled)
     })?;
+    drop(node);
+    drop(no_gc);
     // Run outside the borrow: the code may `require` other libs through the hook.
     match unit {
         Some(u) => Jit::run(u),
