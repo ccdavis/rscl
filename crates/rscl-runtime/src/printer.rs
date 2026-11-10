@@ -71,6 +71,9 @@ pub fn write_str(out: &mut String, v: &Value) {
 }
 
 pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
+    // Printing may run rscl code (a lazy seq realising, a `print-method`) while the
+    // walk holds entries it made: no collection under it.
+    let _hold = crate::gc::hold();
     if depth > MAX_DEPTH {
         out.push_str("...");
         return;

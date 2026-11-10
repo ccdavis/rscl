@@ -3,7 +3,7 @@
 //! Layout is ABI: generated code reads `proto` at `OFF_PROTO`, `entry` at
 //! `PROTO_OFF_ENTRY` inside the proto, and capture `i` at `OFF_CAPTURES + 8*i`.
 //! A `FnObj` is a single allocation with the captures stored inline after the header.
-use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::alloc::Layout;
 
 use super::{Kind, cast};
 use crate::value::{ObjHeader, Value};
@@ -62,12 +62,12 @@ pub fn new_proto(entry: Entry, name: &str, arity_mask: u64, variadic_min: i64) -
 /// Allocate a function object with `ncaptures` capture slots, all `nil`.
 pub fn new(proto: *const FnProto, ncaptures: usize) -> Value {
     unsafe {
-        let p = alloc_zeroed(layout(ncaptures)) as *mut FnObj;
-        assert!(!p.is_null(), "out of memory");
+        let p = super::raw_alloc(layout(ncaptures));
+        std::ptr::write_bytes(p, 0, layout(ncaptures).size());
+        let p = p as *mut FnObj;
         std::ptr::write(&mut (*p).hdr, ObjHeader::new(Kind::Fn));
         (*p).proto = proto;
         (*p).ncaptures = ncaptures as i64;
-        crate::gc::register(p as *mut ObjHeader);
         Value::from_obj(p)
     }
 }
@@ -128,12 +128,5 @@ impl FnProto {
     }
     pub fn is_variadic(&self) -> bool {
         self.variadic_min >= 0
-    }
-}
-
-pub(super) unsafe fn free(p: *mut FnObj) {
-    unsafe {
-        let n = (*p).ncaptures as usize;
-        dealloc(p as *mut u8, layout(n));
     }
 }

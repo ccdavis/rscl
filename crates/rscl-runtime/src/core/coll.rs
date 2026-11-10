@@ -21,7 +21,7 @@ pub fn call(f: &Value, args: &[Value]) -> RtResult<Value> {
 builtins! {
     "list" => fn cf_list(args) [; 0] { Ok(list::from_iter(owned_vec(args))) }
     "vector" => fn cf_vector(args) [; 0] { Ok(vector::from_iter(owned_vec(args))) }
-    "vec" => fn cf_vec(args) [1] { Ok(vector::from_iter(coll::to_vec(&args[0])?)) }
+    "vec" => @gc fn cf_vec(args) [1] { Ok(vector::from_iter(coll::to_vec(&args[0])?)) }
     "set" => fn cf_set(args) [1] {
         let mut s = set::empty_set();
         for x in coll::to_vec(&args[0])? { if !s.contains(&x) { s.insert(x); } }
@@ -38,13 +38,13 @@ builtins! {
         for x in args { let x = x.owned(); if !s.contains(&x) { s.insert(x); } }
         Ok(set::new(s))
     }
-    "count" => fn cf_count(args; owned = taker) [1] { Ok(Value::int(coll::count_owned(taker.take(0))?)) }
-    "seq" => fn cf_seq(args) [1] { coll::seq(&args[0]) }
-    "first" => fn cf_first(args) [1] { coll::first(&args[0]) }
-    "second" => fn cf_second(args) [1] { coll::second(&args[0]) }
-    "rest" => fn cf_rest(args) [1] { coll::rest(&args[0]) }
-    "next" => fn cf_next(args) [1] { coll::next(&args[0]) }
-    "last" => fn cf_last(args; owned = taker) [1] { coll::last_owned(taker.take(0)) }
+    "count" => @gc fn cf_count(args; owned = taker) [1] { Ok(Value::int(coll::count_owned(taker.cursor(0))?)) }
+    "seq" => @gc fn cf_seq(args) [1] { coll::seq(&args[0]) }
+    "first" => @gc fn cf_first(args) [1] { coll::first(&args[0]) }
+    "second" => @gc fn cf_second(args) [1] { coll::second(&args[0]) }
+    "rest" => @gc fn cf_rest(args) [1] { coll::rest(&args[0]) }
+    "next" => @gc fn cf_next(args) [1] { coll::next(&args[0]) }
+    "last" => @gc fn cf_last(args; owned = taker) [1] { coll::last_owned(taker.cursor(0)) }
     "butlast" => fn cf_butlast(args) [1] {
         let mut v = coll::to_vec(&args[0])?;
         v.pop();
@@ -67,9 +67,9 @@ builtins! {
         }
         Ok(cur)
     }
-    "nth" => fn cf_nth(args; owned = taker) [2, 3] {
+    "nth" => @gc fn cf_nth(args; owned = taker) [2, 3] {
         let i = args::int(&args[1], "index")?;
-        coll::nth_owned(taker.take(0), i, args.get(2).map(|v| &**v))
+        coll::nth_owned(taker.cursor(0), i, args.get(2).map(|v| &**v))
     }
     "assoc" => fn cf_assoc(args) [; 3] {
         if !(args.len() - 1).is_multiple_of(2) { return err(ILLEGAL_ARGUMENT, "assoc expects even number of arguments after map/vector"); }
@@ -112,17 +112,17 @@ builtins! {
     "peek" => fn cf_peek(args) [1] { coll::peek(&args[0]) }
     "pop" => fn cf_pop(args) [1] { coll::pop(&args[0]) }
     "empty" => fn cf_empty(args) [1] { Ok(coll::empty(&args[0])) }
-    "empty?" => fn cf_empty_p(args) [1] { Ok(Value::bool(coll::seq(&args[0])?.is_nil())) }
-    "not-empty" => fn cf_not_empty(args) [1] { Ok(if coll::seq(&args[0])?.is_nil() { Value::NIL } else { args[0].owned() }) }
+    "empty?" => @gc fn cf_empty_p(args) [1] { Ok(Value::bool(coll::seq(&args[0])?.is_nil())) }
+    "not-empty" => @gc fn cf_not_empty(args) [1] { Ok(if coll::seq(&args[0])?.is_nil() { Value::NIL } else { args[0].owned() }) }
     "reverse" => fn cf_reverse(args) [1] {
         let mut v = coll::to_vec(&args[0])?;
         v.reverse();
         Ok(list::from_iter(v))
     }
-    "into" => fn cf_into(args; owned = taker) [1, 2] {
+    "into" => @gc fn cf_into(args; owned = taker) [1, 2] {
         if args.len() == 1 { return Ok(args[0].owned()); }
         let mut c = args[0].owned();
-        for x in coll::iter_owned(taker.take(1))? { c = coll::conj(&c, x?)?; }
+        for x in coll::iter_owned(taker.cursor(1))? { c = coll::conj(&c, x?)?; }
         Ok(c)
     }
     "concat" => fn cf_concat(args) [; 0] {
@@ -130,17 +130,24 @@ builtins! {
         for a in args { out.extend(coll::to_vec(a)?); }
         Ok(if out.is_empty() { Value::NIL } else { list::from_iter(out) })
     }
-    "reduce" => fn cf_reduce(args; owned = taker) [2, 3] {
+    "reduce" => @gc fn cf_reduce(args; owned = taker) [2, 3] {
         // A lazy sequence is taken over and walked cell by cell; a collection is
         // materialised once.
-        let mut it = coll::iter_owned(taker.take(args.len() - 1))?;
-        let mut acc = if args.len() == 3 { args[1].owned() } else {
-            match it.next() { Some(x) => x?, None => return call(&args[0], &[]) }
-        };
-        for x in it {
-            acc = call(&args[0], &[acc, x?])?;
+        // One loop with one call site of `next`: a separate "first element" step
+        // would leave its copy of the first cell in this frame for the whole walk,
+        // and with it every cell of a lazy sequence (see `gc::clear_dead_stack`).
+        let mut acc = if args.len() == 3 { Some(args[1].owned()) } else { None };
+        for x in coll::iter_owned(taker.cursor(args.len() - 1))? {
+            let x = x?;
+            acc = Some(match acc {
+                Some(a) => call(&args[0], &[a, x])?,
+                None => x,
+            });
         }
-        Ok(acc)
+        match acc {
+            Some(a) => Ok(a),
+            None => call(&args[0], &[]),
+        }
     }
     "reduce-kv" => fn cf_reduce_kv(args) [3] {
         let mut acc = args[1].owned();
@@ -151,7 +158,7 @@ builtins! {
     }
     "frequencies" => fn cf_frequencies(args; owned = taker) [1] {
         let mut m = map::empty_map();
-        for x in coll::iter_owned(taker.take(0))? {
+        for x in coll::iter_owned(taker.cursor(0))? {
             let x = x?;
             let n = m.get(&x).and_then(|v| v.as_int()).unwrap_or(0);
             map::put(&mut m, x, Value::int(n + 1));
@@ -205,7 +212,7 @@ builtins! {
         })?;
         Ok(if keyed.is_empty() { list::empty() } else { list::from_iter(keyed.into_iter().map(|(_, x)| x).collect::<Vec<_>>()) })
     }
-    "apply" => fn cf_apply(args) [; 2] {
+    "apply" => @gc fn cf_apply(args) [; 2] {
         let mut fargs: Vec<Value> = args[1..args.len() - 1].iter().map(|a| a.owned()).collect();
         fargs.extend(coll::to_vec(&args[args.len() - 1])?);
         call(&args[0], &fargs)

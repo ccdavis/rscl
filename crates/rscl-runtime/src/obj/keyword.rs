@@ -42,14 +42,13 @@ pub fn intern(ns: Option<&str>, name: &str) -> Value {
         return unsafe { Value::from_raw(p as u64) };
     }
     let hash = crate::equiv::hash_named(ns, name) ^ 0x9e37_79b9_7f4a_7c15;
-    let obj = Box::new(KwObj {
+    let obj = super::alloc_raw(KwObj {
         hdr: ObjHeader::new(Kind::Keyword),
         ns: ns.map(Into::into),
         name: name.into(),
         hash,
     });
-    let p = Box::into_raw(obj) as usize;
-    crate::gc::register(p as *mut ObjHeader);
+    let p = obj as usize;
     w.names.insert(key, p);
     unsafe { Value::from_raw(p as u64) }
 }

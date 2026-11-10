@@ -46,20 +46,20 @@ static EVERY_PRED: OnceLock<usize> = OnceLock::new();
 static SOME_FN: OnceLock<usize> = OnceLock::new();
 
 native_fns! {
-    "partial" => fn nf_partial(args, this) [; 0] {
+    "partial" => @gc fn nf_partial(args, this) [; 0] {
         let f = cap(this, 0);
         let mut v = coll::to_vec(&cap(this, 1))?;
         v.extend(all_args(args));
         f.call(&v)
     }
-    "comp" => fn nf_comp(args, this) [; 0] {
+    "comp" => @gc fn nf_comp(args, this) [; 0] {
         let fs = coll::to_vec(&cap(this, 0))?;
         let mut it = fs.iter().rev();
         let mut acc = match it.next() { Some(f) => f.call(&all_args(args))?, None => return Ok(args.first().map_or(Value::NIL, |a| a.owned())) };
         for f in it { acc = f.call(std::slice::from_ref(&acc))?; }
         Ok(acc)
     }
-    "complement" => fn nf_complement(args, this) [; 0] {
+    "complement" => @gc fn nf_complement(args, this) [; 0] {
         Ok(Value::bool(!cap(this, 0).call(&all_args(args))?.truthy()))
     }
     "constantly" => fn nf_constantly(args, this) [; 0] { let _ = args; Ok(cap(this, 0)) }
@@ -70,18 +70,18 @@ native_fns! {
         for f in &fs { out.push(f.call(&a)?); }
         Ok(vector::from_iter(out))
     }
-    "fnil" => fn nf_fnil(args, this) [; 1] {
+    "fnil" => @gc fn nf_fnil(args, this) [; 1] {
         let f = cap(this, 0);
         let defaults = coll::to_vec(&cap(this, 1))?;
         let mut a = all_args(args);
         for (i, d) in defaults.iter().enumerate() { if i < a.len() && a[i].is_nil() { a[i] = d.clone(); } }
         f.call(&a)
     }
-    "every-pred" => fn nf_every_pred(args, this) [; 1] {
+    "every-pred" => @gc fn nf_every_pred(args, this) [; 1] {
         for p in coll::to_vec(&cap(this, 0))? { for a in args { if !p.call(&[a.owned()])?.truthy() { return Ok(Value::FALSE); } } }
         Ok(Value::TRUE)
     }
-    "some-fn" => fn nf_some_fn(args, this) [; 1] {
+    "some-fn" => @gc fn nf_some_fn(args, this) [; 1] {
         for p in coll::to_vec(&cap(this, 0))? { for a in args { let r = p.call(&[a.owned()])?; if r.truthy() { return Ok(r); } } }
         Ok(Value::NIL)
     }

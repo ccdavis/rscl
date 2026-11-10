@@ -65,6 +65,12 @@ fn lookup(addr: usize, t: &Table) -> Option<(&str, Option<&Line>)> {
     Some((&r.name, line))
 }
 
+/// Name of the compiled fn whose code contains `addr` (collector diagnostics).
+pub(crate) fn fn_at(addr: usize) -> Option<String> {
+    let t = table().read().unwrap_or_else(|e| e.into_inner());
+    lookup(addr, &t).map(|(name, _)| name.to_string())
+}
+
 fn debug_enabled() -> bool {
     static D: OnceLock<bool> = OnceLock::new();
     *D.get_or_init(|| std::env::var_os("RSCL_DEBUG_TRACE").is_some())

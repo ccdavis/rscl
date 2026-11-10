@@ -91,35 +91,36 @@ impl Kind {
     }
 }
 
-/// Free an object the collector found unreachable. Its fields are dropped as plain
-/// Rust data; the values it referred to are not touched (they are the collector's).
+/// Finalise an object the collector found unreachable: its fields are dropped as
+/// plain Rust data (the values it referred to are not touched; they are the
+/// collector's). The sweep then releases its slot.
 ///
 /// # Safety
 /// `p` must point at a heap object nothing refers to any more.
 pub(crate) unsafe fn free(p: *mut ObjHeader) {
     unsafe {
         match (*p).kind {
-            Kind::Long => drop(Box::from_raw(p as *mut long::LongObj)),
-            Kind::Double => drop(Box::from_raw(p as *mut double::DoubleObj)),
-            Kind::String => drop(Box::from_raw(p as *mut string::StrObj)),
-            Kind::Symbol => drop(Box::from_raw(p as *mut symbol::SymObj)),
-            Kind::Vector => drop(Box::from_raw(p as *mut vector::VecObj)),
-            Kind::Map => drop(Box::from_raw(p as *mut map::MapObj)),
-            Kind::Set => drop(Box::from_raw(p as *mut set::SetObj)),
-            Kind::Fn => func::free(p as *mut func::FnObj),
-            Kind::Exception => drop(Box::from_raw(p as *mut exception::ExcObj)),
-            Kind::Atom => drop(Box::from_raw(p as *mut atom::AtomObj)),
-            Kind::Regex => drop(Box::from_raw(p as *mut regex::RegexObj)),
-            Kind::Native => drop(Box::from_raw(p as *mut native::NativeObj)),
-            Kind::Instance => drop(Box::from_raw(p as *mut types::InstanceObj)),
-            Kind::SortedMap => drop(Box::from_raw(p as *mut sorted::SortedMapObj)),
-            Kind::SortedSet => drop(Box::from_raw(p as *mut sorted::SortedSetObj)),
-            Kind::Pending => drop(Box::from_raw(p as *mut pending::PendingObj)),
-            Kind::BigInt => drop(Box::from_raw(p as *mut bigint::BigIntObj)),
-            Kind::List => drop(Box::from_raw(p as *mut list::ListObj)),
-            Kind::Cons => drop(Box::from_raw(p as *mut cons::ConsObj)),
-            Kind::LazySeq => drop(Box::from_raw(p as *mut lazyseq::LazySeqObj)),
-            Kind::Keyword => drop(Box::from_raw(p as *mut keyword::KwObj)),
+            Kind::Long => free_obj(p as *mut long::LongObj),
+            Kind::Double => free_obj(p as *mut double::DoubleObj),
+            Kind::String => free_obj(p as *mut string::StrObj),
+            Kind::Symbol => free_obj(p as *mut symbol::SymObj),
+            Kind::Vector => free_obj(p as *mut vector::VecObj),
+            Kind::Map => free_obj(p as *mut map::MapObj),
+            Kind::Set => free_obj(p as *mut set::SetObj),
+            Kind::Fn => {}
+            Kind::Exception => free_obj(p as *mut exception::ExcObj),
+            Kind::Atom => free_obj(p as *mut atom::AtomObj),
+            Kind::Regex => free_obj(p as *mut regex::RegexObj),
+            Kind::Native => free_obj(p as *mut native::NativeObj),
+            Kind::Instance => free_obj(p as *mut types::InstanceObj),
+            Kind::SortedMap => free_obj(p as *mut sorted::SortedMapObj),
+            Kind::SortedSet => free_obj(p as *mut sorted::SortedSetObj),
+            Kind::Pending => free_obj(p as *mut pending::PendingObj),
+            Kind::BigInt => free_obj(p as *mut bigint::BigIntObj),
+            Kind::List => free_obj(p as *mut list::ListObj),
+            Kind::Cons => free_obj(p as *mut cons::ConsObj),
+            Kind::LazySeq => free_obj(p as *mut lazyseq::LazySeqObj),
+            Kind::Keyword => free_obj(p as *mut keyword::KwObj),
             // Permanent kinds are never swept.
             Kind::Var | Kind::Namespace | Kind::Type | Kind::Protocol => {
                 unreachable!("attempt to free a permanent object kind")
@@ -128,52 +129,28 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
     }
 }
 
-/// Size in bytes of the object at `p` (its own allocation, not what it points at):
-/// the conservative stack scan accepts a pointer anywhere inside it.
-///
-/// # Safety
-/// `p` must point at a live heap object.
-pub(crate) unsafe fn size_of(p: *const ObjHeader) -> usize {
-    use std::mem::size_of;
-    unsafe {
-        match (*p).kind {
-            Kind::Long => size_of::<long::LongObj>(),
-            Kind::Double => size_of::<double::DoubleObj>(),
-            Kind::String => size_of::<string::StrObj>(),
-            Kind::Symbol => size_of::<symbol::SymObj>(),
-            Kind::Vector => size_of::<vector::VecObj>(),
-            Kind::Map => size_of::<map::MapObj>(),
-            Kind::Set => size_of::<set::SetObj>(),
-            Kind::Fn => {
-                func::OFF_CAPTURES as usize + 8 * (*(p as *const func::FnObj)).ncaptures as usize
-            }
-            Kind::Exception => size_of::<exception::ExcObj>(),
-            Kind::Atom => size_of::<atom::AtomObj>(),
-            Kind::Regex => size_of::<regex::RegexObj>(),
-            Kind::Native => size_of::<native::NativeObj>(),
-            Kind::Instance => size_of::<types::InstanceObj>(),
-            Kind::SortedMap => size_of::<sorted::SortedMapObj>(),
-            Kind::SortedSet => size_of::<sorted::SortedSetObj>(),
-            Kind::Pending => size_of::<pending::PendingObj>(),
-            Kind::BigInt => size_of::<bigint::BigIntObj>(),
-            Kind::List => size_of::<list::ListObj>(),
-            Kind::Cons => size_of::<cons::ConsObj>(),
-            Kind::LazySeq => size_of::<lazyseq::LazySeqObj>(),
-            Kind::Keyword => size_of::<keyword::KwObj>(),
-            Kind::Var => size_of::<var::VarObj>(),
-            Kind::Namespace => size_of::<crate::ns::NsObj>(),
-            Kind::Type => size_of::<types::TypeObj>(),
-            Kind::Protocol => size_of::<types::ProtocolObj>(),
-        }
-    }
+/// Memory for a heap object, from the object heap (see `arena.rs`).
+pub(crate) fn raw_alloc(layout: std::alloc::Layout) -> *mut u8 {
+    debug_assert!(layout.align() <= 16);
+    crate::arena::alloc(layout.size())
 }
 
-/// Allocate a boxed object, hand it to the collector, and return a reference.
+/// Drop an object's fields; its slot is released by the sweep.
+unsafe fn free_obj<T>(p: *mut T) {
+    unsafe { std::ptr::drop_in_place(p) };
+}
+
+/// Allocate an object.
+pub(crate) fn alloc_raw<T>(obj: T) -> *mut T {
+    let p = raw_alloc(std::alloc::Layout::new::<T>()) as *mut T;
+    unsafe { std::ptr::write(p, obj) };
+    p
+}
+
+/// Allocate an object and return a reference to it.
 #[inline]
 pub(crate) fn alloc<T>(obj: T) -> Value {
-    let p = Box::into_raw(Box::new(obj));
-    crate::gc::register(p as *mut ObjHeader);
-    Value::from_obj(p)
+    Value::from_obj(alloc_raw(obj))
 }
 
 /// View a heap value as `&T`. Callers check the kind first.

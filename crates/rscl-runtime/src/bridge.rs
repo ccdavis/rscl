@@ -26,12 +26,11 @@ unsafe fn write_str(src: &str, out: *mut *const u8, len: *mut i64) {
     }
 }
 
-unsafe extern "C" fn api_retain(v: u64) {
-    std::mem::forget(borrowed(v).retain());
-}
-unsafe extern "C" fn api_release(v: u64) {
-    unsafe { Value::release_raw(v) }
-}
+// Reference counting is gone: a library's values are found on its stack by the
+// collector, and collections are deferred while a library function calls back into
+// rscl code (`api_invoke`), since it may hold values in its own heap data.
+unsafe extern "C" fn api_retain(_v: u64) {}
+unsafe extern "C" fn api_release(_v: u64) {}
 unsafe extern "C" fn api_type_name(v: u64, out: *mut *const u8, len: *mut i64) {
     unsafe { write_str(crate::core::type_name(&borrowed(v)), out, len) }
 }
@@ -171,6 +170,7 @@ unsafe extern "C" fn api_map_entries(m: u64) -> u64 {
     }
 }
 unsafe extern "C" fn api_invoke(f: u64, argc: i64, argv: *const u64) -> u64 {
+    let _hold = crate::gc::hold();
     unsafe { crate::ffi::rt_invoke(borrowed(f), argc, argv as *const Value, 0) }.into_raw()
 }
 unsafe extern "C" fn api_throw(

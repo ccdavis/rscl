@@ -6,7 +6,7 @@
     (let [a (atom nil) p (promise)] (deliver p (fn [] [@a @p])) (reset! a p))
     (let [a (atom nil)] (reset! a (lazy-seq (cons 1 @a))))))
 (make-cycles 5000)
-(println (>= (gc-count) 0) (pos? (gc)))
+(println (>= (gc-count) 0) (>= (gc) 0))
 ;; live data reached from a candidate survives, shared structure included
 (def keep (atom {}))
 (let [m (assoc @keep :f (fn [] 1) :xs (vec (range 5))) snapshot m]

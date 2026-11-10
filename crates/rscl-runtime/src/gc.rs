@@ -1,6 +1,6 @@
 //! The garbage collector: stop-the-world mark and sweep over a non-moving heap.
 //!
-//! Every heap object is registered here when it is allocated and stays at its
+//! Every heap object lives in the object heap (`arena.rs`) and stays at its
 //! address until a collection finds it unreachable. A `Value` is a plain word that
 //! is copied freely; nothing counts references.
 //!
@@ -46,8 +46,7 @@
 //! neither crate can see references held by JIT-compiled machine code, which is why
 //! the stack scan is conservative.
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -60,31 +59,8 @@ use crate::value::{MARK, ObjHeader, PERMANENT, Value};
 
 // ---- the object registry -------------------------------------------------------------
 
-/// Hasher for object addresses (already unique; one multiplication spreads them).
-#[derive(Default)]
-struct AddrHasher(u64);
-
-impl Hasher for AddrHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0 << 8) | b as u64;
-        }
-    }
-    fn write_usize(&mut self, n: usize) {
-        self.0 = ((n as u64) >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-}
-
-type AddrSet = HashSet<usize, BuildHasherDefault<AddrHasher>>;
-
+/// The collector's root tables (the objects themselves live in `arena.rs`).
 struct Heap {
-    /// Every object, permanent ones included.
-    objects: AddrSet,
-    /// Objects handed over by threads since the last collection.
-    incoming: Vec<usize>,
     /// Objects that are roots and never freed.
     permanent: Vec<usize>,
     /// Fn prototypes (not objects; their metadata is a root).
@@ -93,23 +69,16 @@ struct Heap {
     ranges: Vec<(usize, usize)>,
     /// Pinned values and how many pins each has.
     pins: HashMap<u64, usize>,
-    /// Lowest and highest object address (a cheap filter for the stack scan).
-    lo: usize,
-    hi: usize,
 }
 
 fn heap() -> MutexGuard<'static, Heap> {
     static H: OnceLock<Mutex<Heap>> = OnceLock::new();
     H.get_or_init(|| {
         Mutex::new(Heap {
-            objects: AddrSet::default(),
-            incoming: Vec::new(),
             permanent: Vec::new(),
             protos: Vec::new(),
             ranges: Vec::new(),
             pins: HashMap::new(),
-            lo: usize::MAX,
-            hi: 0,
         })
     })
     .lock()
@@ -118,11 +87,11 @@ fn heap() -> MutexGuard<'static, Heap> {
 
 /// Per-thread collector state.
 struct Local {
-    /// Objects this thread allocated and has not handed to the registry yet.
-    new: RefCell<Vec<usize>>,
     registered: Cell<bool>,
     /// Highest address of this thread's stack.
     stack_base: Cell<usize>,
+    /// Lowest usable address of this thread's stack (0: unknown).
+    stack_floor: Cell<usize>,
     /// Inside a blocking region (already counted as stopped).
     stopped: Cell<bool>,
     /// This thread runs the collection.
@@ -144,9 +113,9 @@ impl Drop for Local {
 thread_local! {
     static LOCAL: Local = const {
         Local {
-            new: RefCell::new(Vec::new()),
             registered: Cell::new(false),
             stack_base: Cell::new(0),
+            stack_floor: Cell::new(0),
             stopped: Cell::new(false),
             collecting: Cell::new(false),
             inhibit: Cell::new(0),
@@ -156,26 +125,9 @@ thread_local! {
     };
 }
 
-/// Hand a freshly allocated object to the collector.
-#[inline]
-pub(crate) fn register(p: *mut ObjHeader) {
-    let done = LOCAL.try_with(|l| {
-        if !l.registered.get() {
-            join_world(l);
-        }
-        l.new.borrow_mut().push(p as usize);
-    });
-    if done.is_err() {
-        // The thread's locals are gone (it is exiting).
-        heap().incoming.push(p as usize);
-    }
-}
-
 /// Register an object that is never freed and is a root (its header is permanent).
 pub(crate) fn register_permanent(p: *mut ObjHeader) {
-    let mut h = heap();
-    h.incoming.push(p as usize);
-    h.permanent.push(p as usize);
+    heap().permanent.push(p as usize);
 }
 
 /// Register a fn prototype: its metadata is a root.
@@ -241,11 +193,14 @@ impl Drop for Pinned {
 }
 
 /// Keeps a slice of values reachable while it exists (see [`root_slice`]).
-pub struct SliceRoot<'a>(std::marker::PhantomData<&'a [Value]>);
+pub struct SliceRoot<'a> {
+    ptr: usize,
+    len: usize,
+    life: std::marker::PhantomData<&'a [Value]>,
+}
 
 /// Root the values of `s` for the lifetime of the guard: for natives that call rscl
-/// code while they hold values in a `Vec` or another heap container. Guards must be
-/// dropped in the reverse order of their creation (as scopes do).
+/// code while they hold values in a `Vec` or another heap container.
 pub fn root_slice(s: &[Value]) -> SliceRoot<'_> {
     unsafe { root_words(s.as_ptr() as *const u64, s.len()) }
 }
@@ -254,19 +209,29 @@ pub fn root_slice(s: &[Value]) -> SliceRoot<'_> {
 /// `ptr` must point at `len` values that stay valid while the guard exists.
 pub(crate) unsafe fn root_words<'a>(ptr: *const u64, len: usize) -> SliceRoot<'a> {
     let _ = LOCAL.try_with(|l| l.slices.borrow_mut().push((ptr as usize, len)));
-    SliceRoot(std::marker::PhantomData)
+    SliceRoot {
+        ptr: ptr as usize,
+        len,
+        life: std::marker::PhantomData,
+    }
 }
 
 impl Drop for SliceRoot<'_> {
     fn drop(&mut self) {
-        let _ = LOCAL.try_with(|l| l.slices.borrow_mut().pop());
+        let _ = LOCAL.try_with(|l| {
+            // Nearly always the newest entry; guards held in struct fields may go
+            // in another order.
+            let mut slices = l.slices.borrow_mut();
+            if let Some(i) = slices.iter().rposition(|&e| e == (self.ptr, self.len)) {
+                slices.remove(i);
+            }
+        });
     }
 }
 
 /// Number of objects the collector knows about.
 pub fn object_count() -> usize {
-    let h = heap();
-    h.objects.len() + h.incoming.len()
+    crate::arena::object_count()
 }
 
 // ---- deferring collections -------------------------------------------------------------
@@ -290,6 +255,38 @@ impl Drop for Inhibit {
             }
         });
     }
+}
+
+thread_local! {
+    /// Number of active native frames that have not declared themselves safe to
+    /// collect under (see `hold`).
+    static HOLD: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Marks a native frame that may hold values where the collector cannot see them
+/// (in a `Vec`, a map under construction, an iterator): while one exists, the
+/// thread does not collect, and a wanted collection waits for the next safepoint
+/// after it is gone. Every builtin takes one on entry unless it is declared `gc`
+/// (see `native_fns!`), so a native that calls back into rscl code is safe by
+/// default and only the audited ones let a collection run under them.
+pub struct Hold(());
+
+#[inline]
+pub fn hold() -> Hold {
+    HOLD.with(|h| h.set(h.get() + 1));
+    Hold(())
+}
+
+impl Drop for Hold {
+    #[inline]
+    fn drop(&mut self) {
+        HOLD.with(|h| h.set(h.get() - 1));
+    }
+}
+
+/// Collections are deferred on this thread right now (a `Hold` or an `Inhibit`).
+pub fn deferred_here() -> bool {
+    HOLD.with(|h| h.get()) > 0 || LOCAL.try_with(|l| l.inhibit.get() > 0).unwrap_or(true)
 }
 
 // ---- requests ----------------------------------------------------------------------------
@@ -332,6 +329,8 @@ struct Config {
     debug: bool,
     /// Check every traced reference against the registry.
     verify: bool,
+    /// Report the stack slots that refer to sequence cells.
+    explain: bool,
 }
 
 fn config() -> &'static Config {
@@ -346,6 +345,7 @@ fn config() -> &'static Config {
             stress: num("RSCL_GC_STRESS").unwrap_or(0),
             debug: std::env::var_os("RSCL_GC_DEBUG").is_some(),
             verify: std::env::var_os("RSCL_GC_VERIFY").is_some(),
+            explain: std::env::var_os("RSCL_GC_EXPLAIN").is_some(),
         }
     })
 }
@@ -445,6 +445,56 @@ fn with_frame<R>(f: impl FnOnce(&Frame) -> R) -> R {
     r
 }
 
+/// Zero the dead part of the calling thread's stack (below the current frame).
+///
+/// Frames do not initialise all of their memory, so a new frame can expose words
+/// left behind by calls that returned long ago; to the conservative scan those are
+/// references, and one of them pointing at (an address later reused for) the head
+/// of a lazy sequence keeps the whole sequence alive. Clearing the dead area before
+/// long-lived frames are pushed, and after every collection, keeps such leftovers
+/// rare. The sweep goes down page by page and stops at the first run of pages that
+/// are already zero (stack never used, or cleared before).
+#[inline(never)]
+pub fn clear_dead_stack() {
+    const PAGE: usize = 4096;
+    /// Stop after this many pages in a row that needed no clearing.
+    const CLEAN_RUN: usize = 4;
+    let floor = LOCAL.try_with(|l| l.stack_floor.get()).unwrap_or(0);
+    if floor == 0 {
+        return;
+    }
+    // Leave room for the guard pages and for whatever is below the limit anyway.
+    let floor = floor + 16 * PAGE;
+    // Calling something makes this a function with a real frame: its own locals are
+    // above the stack pointer (never in the red zone below it), so everything below
+    // the stack pointer is dead and may be zeroed, the frame of that call included.
+    not_a_leaf();
+    let sp = capture().sp;
+    let mut hi = sp.saturating_sub(16) & !7;
+    let mut clean = 0;
+    while hi > floor && clean < CLEAN_RUN {
+        let lo = ((hi - 1) & !(PAGE - 1)).max(floor);
+        let words = (hi - lo) / 8;
+        let mut dirty = false;
+        for i in 0..words {
+            let p = (lo + 8 * i) as *mut usize;
+            unsafe {
+                if std::ptr::read_volatile(p) != 0 {
+                    std::ptr::write_volatile(p, 0);
+                    dirty = true;
+                }
+            }
+        }
+        clean = if dirty { 0 } else { clean + 1 };
+        hi = lo;
+    }
+}
+
+#[inline(never)]
+fn not_a_leaf() {
+    std::hint::black_box(());
+}
+
 /// What the collector needs from a stopped thread.
 #[derive(Clone)]
 struct Stopped {
@@ -504,12 +554,16 @@ fn wait_idle(mut g: MutexGuard<'static, World>) -> MutexGuard<'static, World> {
 
 /// Add the calling thread to the set the collector stops and scans.
 fn join_world(l: &Local) {
-    let (_, top) = crate::native::thread_stack_bounds();
+    let (floor, top) = crate::native::thread_stack_bounds();
+    l.stack_floor.set(floor);
     // Unknown bounds (not a pthread stack): scan from here up to the page end at
     // least; better than nothing, and unknown on no supported platform.
     let marker = 0usize;
     let base = if top != 0 {
-        top
+        // Thread-local storage lives at the top of the stack mapping. It is not
+        // frames, and the allocator's own thread-local state there points at heap
+        // blocks, which the scan would take for references.
+        tls_start(floor, top).unwrap_or(top)
     } else {
         (&marker as *const usize as usize | 0xfff) + 1
     };
@@ -526,13 +580,68 @@ fn join_world(l: &Local) {
     crate::heap::arm_exit_flush();
 }
 
-/// Remove the calling thread: its unregistered objects go to the registry first,
-/// while no collection can be running.
+#[repr(C)]
+struct DlPhdrInfo {
+    addr: usize,
+    name: *const std::ffi::c_char,
+    phdr: *const std::ffi::c_void,
+    phnum: u16,
+    adds: u64,
+    subs: u64,
+    tls_modid: usize,
+    tls_data: *mut std::ffi::c_void,
+}
+
+unsafe extern "C" {
+    fn dl_iterate_phdr(
+        cb: unsafe extern "C" fn(*mut DlPhdrInfo, usize, *mut std::ffi::c_void) -> i32,
+        data: *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+/// The lowest address of the calling thread's thread-local blocks that lies inside
+/// `[floor, top)`, its stack mapping: frames end below it.
+fn tls_start(floor: usize, top: usize) -> Option<usize> {
+    struct Find {
+        floor: usize,
+        top: usize,
+        lowest: usize,
+    }
+    unsafe extern "C" fn each(
+        info: *mut DlPhdrInfo,
+        size: usize,
+        data: *mut std::ffi::c_void,
+    ) -> i32 {
+        // Older loaders pass a shorter struct without the TLS fields.
+        if size < std::mem::size_of::<DlPhdrInfo>() {
+            return 0;
+        }
+        let f = unsafe { &mut *(data as *mut Find) };
+        let p = unsafe { (*info).tls_data } as usize;
+        if p > f.floor && p < f.top && p < f.lowest {
+            f.lowest = p;
+        }
+        0
+    }
+    let mut f = Find {
+        floor,
+        top,
+        lowest: usize::MAX,
+    };
+    unsafe { dl_iterate_phdr(each, &mut f as *mut Find as *mut std::ffi::c_void) };
+    // A thread-local of this crate, in case the loader reported nothing useful.
+    let own = HOLD.with(|h| h as *const Cell<u32> as usize);
+    if own > floor && own < top && own < f.lowest {
+        f.lowest = own;
+    }
+    (f.lowest != usize::MAX).then_some(f.lowest & !7)
+}
+
+/// Remove the calling thread.
 fn leave_world(l: &Local) {
     if !l.registered.get() {
         return;
     }
-    flush_new(l);
     let id = crate::native::thread_id();
     let mut g = lock_world();
     if let Some(i) = g.threads.iter().position(|t| t.id == id) {
@@ -546,15 +655,8 @@ fn leave_world(l: &Local) {
     l.registered.set(false);
 }
 
-fn flush_new(l: &Local) {
-    let mut new = l.new.borrow_mut();
-    if !new.is_empty() {
-        heap().incoming.append(&mut new);
-    }
-}
-
-/// A thread that runs rscl code. Registration also happens by itself on the first
-/// allocation; calling this early makes the whole stack visible from the start.
+/// A thread that runs rscl code registers itself before it allocates or holds
+/// values (stopping at a safepoint or in a blocking region registers too).
 pub fn register_thread() {
     let _ = LOCAL.try_with(|l| {
         if !l.registered.get() {
@@ -585,9 +687,8 @@ fn thread_roots(l: &Local) -> Vec<u64> {
     out
 }
 
-/// Publish this thread as stopped. Its new objects are handed over first.
+/// Publish this thread as stopped.
 fn stop_here(l: &Local, frame: &Frame) -> MutexGuard<'static, World> {
-    flush_new(l);
     let roots = thread_roots(l);
     let id = crate::native::thread_id();
     let mut g = lock_world();
@@ -620,7 +721,7 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
     let direct = LOCAL
         .try_with(|l| l.stopped.get() || l.collecting.get() || l.inhibit.get() > 0)
         .unwrap_or(true);
-    if direct {
+    if direct || HOLD.with(|h| h.get()) > 0 {
         return f();
     }
     register_thread();
@@ -649,6 +750,11 @@ const STOP_TIMEOUT: Duration = Duration::from_millis(200);
 /// collection is over, or, if nobody is collecting yet, become the collector.
 /// Returns the number of objects freed when this thread collected.
 pub fn safepoint() -> Option<usize> {
+    if HOLD.with(|h| h.get()) > 0 {
+        // A native frame below holds values the scan would miss. The request stays
+        // up, so the first safepoint after that frame is gone collects.
+        return None;
+    }
     let skip = LOCAL
         .try_with(|l| {
             if l.inhibit.get() > 0 {
@@ -680,6 +786,7 @@ fn safepoint_at(frame: &Frame) -> Option<usize> {
             drop(g);
             let g = LOCAL.with(|l| stop_here(l, frame));
             resume(g);
+            clear_dead_stack();
             None
         }
         Phase::Idle => {
@@ -736,6 +843,7 @@ fn safepoint_at(frame: &Frame) -> Option<usize> {
             w.cv.notify_all();
             drop(g);
             crate::native::safepoint_done();
+            clear_dead_stack();
             Some(freed)
         }
     }
@@ -744,6 +852,12 @@ fn safepoint_at(frame: &Frame) -> Option<usize> {
 /// `(gc)`: collect now, on the calling thread. `None` if the other threads could not
 /// be stopped in time (or collections are deferred on this thread).
 pub fn collect_now() -> Option<usize> {
+    clear_dead_stack();
+    collect_now_inner()
+}
+
+#[inline(never)]
+fn collect_now_inner() -> Option<usize> {
     GC_WANTED.store(true, Ordering::Release);
     safepoint()
 }
@@ -754,12 +868,12 @@ pub fn collect_now() -> Option<usize> {
 /// that the conservative scan still recognises.
 const INTERIOR_WORDS: usize = 16;
 
-pub(crate) struct Marker<'a> {
-    objects: &'a AddrSet,
-    lo: usize,
-    hi: usize,
+pub(crate) struct Marker {
     stack: Vec<usize>,
     verify: bool,
+    /// `RSCL_GC_EXPLAIN`: who first reached each object (0: a root).
+    parents: Option<HashMap<usize, usize>>,
+    current: usize,
 }
 
 #[inline]
@@ -767,7 +881,7 @@ fn header(addr: usize) -> &'static ObjHeader {
     unsafe { &*(addr as *const ObjHeader) }
 }
 
-impl Marker<'_> {
+impl Marker {
     /// Mark the object at `addr` (known to be one) and queue it for tracing.
     #[inline]
     fn object(&mut self, addr: usize) {
@@ -776,6 +890,9 @@ impl Marker<'_> {
         if f & MARK == 0 {
             h.flags.store(f | MARK, Ordering::Relaxed);
             self.stack.push(addr);
+            if let Some(p) = &mut self.parents {
+                p.insert(addr, self.current);
+            }
         }
     }
 
@@ -784,7 +901,7 @@ impl Marker<'_> {
     pub(crate) fn value(&mut self, v: &Value) {
         if v.is_ptr() {
             let addr = v.bits() as usize;
-            if self.verify && !self.objects.contains(&addr) {
+            if self.verify && crate::arena::find(addr) != Some(addr) {
                 panic!("gc: traced reference {addr:#x} is not a live object");
             }
             self.object(addr);
@@ -794,7 +911,7 @@ impl Marker<'_> {
     /// A word that is a reference if it is the address of an object.
     #[inline]
     fn word(&mut self, w: usize) {
-        if w >= self.lo && w <= self.hi && w & 7 == 0 && self.objects.contains(&w) {
+        if w & 7 == 0 && crate::arena::find(w) == Some(w) {
             self.object(w);
         }
     }
@@ -803,31 +920,36 @@ impl Marker<'_> {
     /// object or points inside one.
     #[inline]
     fn stack_word(&mut self, w: usize) {
-        if w < self.lo || w > self.hi.saturating_add(8 * INTERIOR_WORDS) || w & 7 != 0 {
+        let Some(obj) = crate::arena::find(w) else {
             return;
-        }
-        if self.objects.contains(&w) {
-            self.object(w);
-            return;
-        }
-        for back in 1..=INTERIOR_WORDS {
-            let Some(a) = w.checked_sub(8 * back) else {
-                return;
-            };
-            if a < self.lo {
+        };
+        if obj != w {
+            // A pointer into an object counts only for the kinds whose contents
+            // Rust code borrows (collections, strings, records). For sequence
+            // cells, closures and lock-guarded objects the only inner pointers are
+            // lock guards and field reads by a holder that has the object itself,
+            // and a stale one would keep a whole lazy sequence alive (a thunk's
+            // captures include the sequence it walks).
+            if matches!(
+                header(obj).kind,
+                Kind::LazySeq
+                    | Kind::Cons
+                    | Kind::List
+                    | Kind::Fn
+                    | Kind::Atom
+                    | Kind::Pending
+                    | Kind::Var
+            ) || w - obj > 8 * INTERIOR_WORDS
+            {
                 return;
             }
-            if self.objects.contains(&a) {
-                if 8 * back < unsafe { obj::size_of(a as *const ObjHeader) } {
-                    self.object(a);
-                }
-                return;
-            }
         }
+        self.object(obj);
     }
 
     fn drain(&mut self) {
         while let Some(addr) = self.stack.pop() {
+            self.current = addr;
             unsafe { trace(addr, self) };
         }
     }
@@ -836,17 +958,61 @@ impl Marker<'_> {
 /// Scan `[from, to)` word by word. The memory may hold anything (dead stack slots
 /// included), which is why this function has a name tools can suppress on.
 #[inline(never)]
-fn scan_conservative(m: &mut Marker<'_>, from: usize, to: usize) {
+fn scan_conservative(m: &mut Marker, from: usize, to: usize) {
     let mut p = (from + 7) & !7;
+    let explain = config().explain;
     while p + 8 <= to {
         let w = unsafe { std::ptr::read_volatile(p as *const usize) };
+        if explain {
+            explain_root(m, p, w, to);
+        }
         m.stack_word(w);
         p += 8;
     }
 }
 
+/// Diagnostic landmarks: label an address on the stack (`RSCL_GC_EXPLAIN`).
+pub fn landmark(name: &str) {
+    if config().explain {
+        let m = 0usize;
+        eprintln!("[gc] landmark {name} at {:#x}", &m as *const usize as usize);
+    }
+}
+
+/// `RSCL_GC_EXPLAIN`: report each stack slot that refers to a sequence cell, with
+/// the compiled fns whose return addresses lie above it (the frames it may be in).
+fn explain_root(m: &Marker, slot: usize, w: usize, to: usize) {
+    let _ = m;
+    if w & 7 != 0 || crate::arena::find(w) != Some(w) {
+        return;
+    }
+    let kind = header(w).kind;
+    if !matches!(kind, Kind::LazySeq | Kind::Cons | Kind::List | Kind::Fn) {
+        return;
+    }
+    let mut frames = Vec::new();
+    let mut q = slot + 8;
+    while q + 8 <= to && frames.len() < 3 && q < slot + 4096 {
+        let ra = unsafe { std::ptr::read_volatile(q as *const usize) };
+        if let Some(name) = crate::trace::fn_at(ra) {
+            frames.push(format!("{name}@+{}", q - slot));
+        }
+        q += 8;
+    }
+    let first = if kind == Kind::Cons {
+        unsafe { (*(w as *const cons::ConsObj)).first.bits() as i64 >> 1 }
+    } else {
+        -1
+    };
+    eprintln!(
+        "[gc] root {kind:?} {w:#x} (first {first}) in slot {slot:#x} ({} below base); above: {}",
+        to - slot,
+        frames.join(", ")
+    );
+}
+
 /// Visit every value the object at `addr` holds.
-unsafe fn trace(addr: usize, m: &mut Marker<'_>) {
+unsafe fn trace(addr: usize, m: &mut Marker) {
     let p = addr as *mut ObjHeader;
     unsafe {
         match (*p).kind {
@@ -962,49 +1128,55 @@ unsafe fn trace(addr: usize, m: &mut Marker<'_>) {
 /// `others` are the other threads' published states.
 fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
     let started = Instant::now();
-    flush_new(l);
     let own_roots = thread_roots(l);
     let mut guard = heap();
     let h = &mut *guard;
-    // New objects join the registry. A mark left on one (it was reached by an
-    // earlier collection before its thread handed it over) is cleared.
-    for p in h.incoming.drain(..) {
-        let hd = header(p);
-        hd.flags.fetch_and(!MARK, Ordering::Relaxed);
-        h.lo = h.lo.min(p);
-        h.hi = h.hi.max(p);
-        h.objects.insert(p);
-    }
-    let before = h.objects.len();
+    let before = crate::arena::object_count();
     let mut m = Marker {
-        objects: &h.objects,
-        lo: h.lo,
-        hi: h.hi,
         stack: Vec::new(),
         verify: config().verify,
+        parents: config().explain.then(HashMap::new),
+        current: 0,
     };
+    m.current = 1;
     for &p in &h.permanent {
         m.object(p);
     }
+    m.current = 2;
     for &p in &h.protos {
         m.value(unsafe { &(*(p as *const func::FnProto)).meta });
     }
+    m.current = 3;
     for &bits in h.pins.keys() {
         m.word(bits as usize);
     }
+    m.current = 4;
     for &(addr, words) in &h.ranges {
         for i in 0..words {
             m.word(unsafe { *(addr as *const usize).add(i) });
         }
     }
     // This thread, then the stopped ones.
+    m.current = 5;
     scan_conservative(&mut m, frame.sp, l.stack_base.get());
+    m.current = 6;
     for &r in &frame.regs {
+        if config().explain && crate::arena::find(r) == Some(r) {
+            eprintln!("[gc] root {:?} {r:#x} in a register", header(r).kind);
+        }
         m.stack_word(r);
     }
+    m.current = 7;
     for &r in &own_roots {
+        if config().explain && crate::arena::find(r as usize) == Some(r as usize) {
+            eprintln!(
+                "[gc] root {:?} {r:#x} in thread state",
+                header(r as usize).kind
+            );
+        }
         m.word(r as usize);
     }
+    m.current = 8;
     for (base, s) in others {
         scan_conservative(&mut m, s.frame.sp, *base);
         for &r in &s.frame.regs {
@@ -1015,12 +1187,58 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
         }
     }
     m.drain();
+    if let Some(parents) = &m.parents {
+        // The longest chain of objects, printed from its root end.
+        let mut depth: HashMap<usize, u32> = HashMap::new();
+        let mut best = (0u32, 0usize);
+        for &start in parents.keys() {
+            let mut path = Vec::new();
+            let mut a = start;
+            let base = loop {
+                if let Some(&d) = depth.get(&a) {
+                    break d;
+                }
+                path.push(a);
+                match parents.get(&a) {
+                    Some(&p) if p > 16 => a = p,
+                    _ => break 0,
+                }
+            };
+            for (i, &x) in path.iter().rev().enumerate() {
+                depth.insert(x, base + i as u32 + 1);
+            }
+            let d = base + path.len() as u32;
+            if d > best.0 {
+                best = (d, start);
+            }
+        }
+        let mut chain = Vec::new();
+        let mut a = best.1;
+        let tag = loop {
+            chain.push(a);
+            match parents.get(&a) {
+                Some(&p) if p > 16 => a = p,
+                Some(&p) => break p,
+                None => break 99,
+            }
+        };
+        let tail: Vec<String> = chain
+            .iter()
+            .rev()
+            .take(8)
+            .map(|&a| format!("{:?}@{a:#x}", header(a).kind))
+            .collect();
+        eprintln!(
+            "[gc] longest chain: {} objects, root kind {tag} (1 permanent, 2 proto, 3 pin, 4 table, 5 stack, 6 register, 7 thread state, 8 other thread): {}",
+            best.0,
+            tail.join(" -> ")
+        );
+    }
 
-    // Sweep.
-    let mut dead: Vec<usize> = Vec::new();
-    let mut dead_keywords: Vec<usize> = Vec::new();
-    h.objects.retain(|&p| {
-        let hd = header(p);
+    // Sweep: an unmarked object is finalised (a keyword leaves the intern table
+    // first) and its slot released.
+    let freed = crate::arena::sweep(|p| {
+        let hd = unsafe { &*p };
         let f = hd.flags.load(Ordering::Relaxed);
         if f & MARK != 0 {
             hd.flags.store(f & !MARK, Ordering::Relaxed);
@@ -1029,17 +1247,13 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
             true
         } else {
             if hd.kind == Kind::Keyword {
-                dead_keywords.push(p);
+                obj::keyword::forget(&[p as usize]);
             }
-            dead.push(p);
+            unsafe { obj::free(p) };
             false
         }
     });
-    obj::keyword::forget(&dead_keywords);
-    for &p in &dead {
-        unsafe { obj::free(p as *mut ObjHeader) };
-    }
-    let after = h.objects.len();
+    let after = crate::arena::object_count();
     drop(guard);
     COLLECTIONS.fetch_add(1, Ordering::Relaxed);
     crate::heap::gc_finished();
@@ -1047,12 +1261,12 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
         eprintln!(
             "[gc] {} objects, {} freed, {} live, {} threads, {:.2} ms, heap {} KB",
             before,
-            dead.len(),
+            freed,
             after,
             others.len() + 1,
             started.elapsed().as_secs_f64() * 1e3,
             crate::heap::used() >> 10,
         );
     }
-    dead.len()
+    freed
 }

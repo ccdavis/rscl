@@ -67,99 +67,134 @@ pub fn find(ns: &str, name: &str) -> Option<&'static BuiltinDesc> {
 /// entry is `"display-name" => fn rust_ident(args) [fixed arities ; variadic-min] { body }`
 /// where the body evaluates to `RtResult<Value>`; `this` names the fn object itself,
 /// and `; owned = taker` binds a [`Taker`] for bodies that consume an argument.
-/// Arguments are borrowed views; those the caller handed over (`owned` bits) are
-/// released after the body unless the body took them.
+/// Arguments are borrowed views.
+///
+/// A native defers collections while it runs (it may hold values in Rust heap data
+/// the collector cannot see, and call back into rscl code meanwhile). Writing `@gc
+/// fn` instead of `fn` declares that a collection may run under it: then every
+/// value it holds across a call into rscl code (directly, or by realising a lazy
+/// seq, comparing, hashing or printing) must be on its stack, in its arguments, or
+/// rooted with `gc::root_slice`.
 #[macro_export]
 macro_rules! native_fns {
-    ($( $name:expr => fn $ident:ident ( $args:ident $(, $this:ident)? $(; owned = $taker:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
+    ($( $name:expr => $(@ $safe:ident)? fn $ident:ident ( $args:ident $(, $this:ident)? $(; owned = $taker:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
         $(
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn $ident(
-                _this: *const $crate::obj::func::FnObj,
+                this: *const $crate::obj::func::FnObj,
                 argc: i64,
                 argv: *const $crate::value::Value,
                 owned: u64,
             ) -> $crate::value::Value {
-                const MASK: u64 = 0 $(| (1u64 << $fixed))*;
-                const VMIN: i64 = -1 $(+ 1 + $vmin)?;
-                let __taker = $crate::core::Taker::new(argv, argc, owned);
-                let r: std::thread::Result<$crate::exc::RtResult<$crate::value::Value>> =
-                    if !$crate::core::accepts(MASK, VMIN, argc) {
-                        Ok(Err($crate::exc::Exc_from($crate::core::arity_error($name, argc))))
-                    } else {
-                        let $args: &[$crate::value::VRef] = if argc == 0 {
-                            &[]
+                #[inline(never)]
+                unsafe extern "C" fn body(
+                    _this: *const $crate::obj::func::FnObj,
+                    argc: i64,
+                    argv: *const $crate::value::Value,
+                    owned: u64,
+                ) -> $crate::value::Value {
+                    const MASK: u64 = 0 $(| (1u64 << $fixed))*;
+                    const VMIN: i64 = -1 $(+ 1 + $vmin)?;
+                    let __taker = $crate::core::Taker::new(argv, argc, owned);
+                    $crate::__native_hold!($($safe)?);
+                    let r: std::thread::Result<$crate::exc::RtResult<$crate::value::Value>> =
+                        if !$crate::core::accepts(MASK, VMIN, argc) {
+                            Ok(Err($crate::exc::Exc_from($crate::core::arity_error($name, argc))))
                         } else {
-                            unsafe { std::slice::from_raw_parts(argv as *const $crate::value::VRef, argc as usize) }
+                            let $args: &[$crate::value::VRef] = if argc == 0 {
+                                &[]
+                            } else {
+                                unsafe { std::slice::from_raw_parts(argv as *const $crate::value::VRef, argc as usize) }
+                            };
+                            let _ = &$args;
+                            $( let $this = $crate::value::VRef::from_raw(_this as u64); )?
+                            $( let $taker = &__taker; )?
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                || -> $crate::exc::RtResult<$crate::value::Value> { $body },
+                            ))
                         };
-                        let _ = &$args;
-                        $( let $this = $crate::value::VRef::from_raw(_this as u64); )?
-                        $( let $taker = &__taker; )?
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            || -> $crate::exc::RtResult<$crate::value::Value> { $body },
-                        ))
-                    };
-                unsafe { $crate::core::release_owned(argv, argc, owned & !__taker.taken()) };
-                $crate::core::finish($name, r)
+                    $crate::core::finish($name, r)
+                }
+                // A native that walks a sequence it was handed gets a clean stack to
+                // work on: its frame is long-lived, and leftovers of the calls that
+                // produced the sequence must not show through it as references.
+                $( let _ = stringify!($taker); $crate::core::clear_stack_for_stream(argv, argc, owned); )?
+                unsafe { body(this, argc, argv, owned) }
             }
         )*
     };
 }
 
-/// Release the arguments a caller handed over (bits of `owned`; the caller clears
-/// the bits of slots a body took).
-///
-/// # Safety
-/// `argv` must point at `argc` values; owned slots must not be used afterwards.
-pub unsafe fn release_owned(argv: *const Value, argc: i64, owned: u64) {
+/// Before a native starts to walk a lazy sequence its caller gave up: zero the dead
+/// stack below (see `gc::clear_dead_stack`).
+#[inline]
+pub fn clear_stack_for_stream(argv: *const Value, argc: i64, owned: u64) {
     if owned == 0 {
         return;
     }
-    for i in 0..argc.min(64) {
-        if owned >> i & 1 == 1 {
-            drop(unsafe { std::ptr::read(argv.add(i as usize)) });
+    for i in 0..argc.clamp(0, 64) as usize {
+        if owned >> i & 1 == 1 && crate::coll::is_lazy_kind(unsafe { &*argv.add(i) }) {
+            crate::gc::clear_dead_stack();
+            return;
         }
     }
 }
 
-/// Lets a builtin take ownership of an argument it will consume (an owned slot's
-/// reference is moved out and the slot is excluded from the release after the body;
-/// a borrowed one is retained), so a sequence passed by a caller that no longer
-/// needs it is freed as the builtin walks it. The slot itself is never written, so
-/// the body's `&[VRef]` view stays valid; a taken slot must not be read again.
+/// Expands to a collection hold for an ordinary native and to nothing for a `gc` one.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __native_hold {
+    () => {
+        let _hold = $crate::gc::hold();
+    };
+    (gc) => {};
+}
+
+/// Lets a builtin take over an argument it will consume. A caller sets a slot's
+/// `owned` bit when it has no further use for that argument; taking such a slot
+/// clears it, so the caller's argument area stops referring to the value. That is
+/// what lets a long lazy sequence be collected while a builtin walks it: otherwise
+/// the slot would keep the head, and with it every realised cell, alive for the
+/// whole call. A taken slot must not be read again through the `args` view.
 pub struct Taker {
     argv: *const Value,
     argc: i64,
     owned: u64,
-    taken: std::cell::Cell<u64>,
 }
 
 impl Taker {
     pub fn new(argv: *const Value, argc: i64, owned: u64) -> Taker {
-        Taker {
-            argv,
-            argc,
-            owned,
-            taken: std::cell::Cell::new(0),
+        Taker { argv, argc, owned }
+    }
+
+    /// A cursor over argument `i` for a sequence walk: the slot itself when the
+    /// caller gave it up, a copy otherwise (the caller keeps the head anyway).
+    pub fn cursor(&self, i: usize) -> crate::coll::Cursor {
+        assert!(
+            (i as i64) < self.argc,
+            "cursor: argument index out of range"
+        );
+        unsafe {
+            let slot = self.argv.add(i) as *mut Value;
+            if i < 64 && self.owned >> i & 1 == 1 {
+                crate::coll::Cursor::Slot(slot)
+            } else {
+                crate::coll::Cursor::Own(std::ptr::read(slot))
+            }
         }
     }
 
     pub fn take(&self, i: usize) -> Value {
         assert!((i as i64) < self.argc, "take: argument index out of range");
         unsafe {
-            let slot = self.argv.add(i);
+            let slot = self.argv.add(i) as *mut Value;
+            let v = std::ptr::read_volatile(slot);
             if i < 64 && self.owned >> i & 1 == 1 {
-                self.taken.set(self.taken.get() | 1 << i);
-                std::ptr::read(slot)
-            } else {
-                (*slot).clone()
+                // The caller gave the slot up: it is writable memory of its frame.
+                std::ptr::write_volatile(slot, Value::NIL);
             }
+            v
         }
-    }
-
-    /// Bits of the owned slots the body took over.
-    pub fn taken(&self) -> u64 {
-        self.taken.get()
     }
 }
 
@@ -168,9 +203,9 @@ impl Taker {
 /// `[1, 2]` accepts 1 or 2 args; `[; 0]` is variadic from 0; `[1; 3]` accepts 1 or 3+.
 #[macro_export]
 macro_rules! builtins {
-    (ns = $ns:literal; $( $name:literal => fn $ident:ident ( $args:ident $(, $this:ident)? $(; owned = $taker:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
+    (ns = $ns:literal; $( $name:literal => $(@ $safe:ident)? fn $ident:ident ( $args:ident $(, $this:ident)? $(; owned = $taker:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
         $crate::native_fns! {
-            $( concat!($ns, "/", $name) => fn $ident ( $args $(, $this)? $(; owned = $taker)? ) [ $($fixed),* $(; $vmin)? ] $body )*
+            $( concat!($ns, "/", $name) => $(@ $safe)? fn $ident ( $args $(, $this)? $(; owned = $taker)? ) [ $($fixed),* $(; $vmin)? ] $body )*
         }
         pub static TABLE: &[$crate::core::BuiltinDesc] = &[
             $( $crate::core::BuiltinDesc {
@@ -183,8 +218,8 @@ macro_rules! builtins {
             }, )*
         ];
     };
-    ($( $name:literal => fn $ident:ident ( $args:ident $(, $this:ident)? $(; owned = $taker:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
-        $crate::builtins! { ns = "clojure.core"; $( $name => fn $ident ( $args $(, $this)? $(; owned = $taker)? ) [ $($fixed),* $(; $vmin)? ] $body )* }
+    ($( $name:literal => $(@ $safe:ident)? fn $ident:ident ( $args:ident $(, $this:ident)? $(; owned = $taker:ident)? ) [ $($fixed:literal),* $(; $vmin:literal)? ] $body:block )*) => {
+        $crate::builtins! { ns = "clojure.core"; $( $name => $(@ $safe)? fn $ident ( $args $(, $this)? $(; owned = $taker)? ) [ $($fixed),* $(; $vmin)? ] $body )* }
     };
 }
 

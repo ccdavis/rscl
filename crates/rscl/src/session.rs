@@ -65,6 +65,15 @@ pub fn is_active() -> bool {
 /// Create the session for this thread: start the JIT (which loads core.clj), compile
 /// core.clj into the AOT module too when building, and install the `require` hook.
 pub fn start(cfg: SessionConfig) -> Result<(), String> {
+    let r = start_session(cfg);
+    // Loading core.clj ran deep; the frames pushed from here on must not find its
+    // leftovers in their uninitialised slots (see `gc::clear_dead_stack`).
+    rscl_runtime::gc::clear_dead_stack();
+    r
+}
+
+#[inline(never)]
+fn start_session(cfg: SessionConfig) -> Result<(), String> {
     rscl_runtime::entry::init();
     let jit = Jit::new()?;
     let mut aot = None;

@@ -34,7 +34,7 @@ const _: () = assert!(std::mem::offset_of!(VarObj, fast) == OFF_FAST as usize);
 
 /// Create an immortal var with no root. Only `ns.rs` should call this.
 pub(crate) fn new(ns: &str, name: &str) -> *const VarObj {
-    let p = Box::into_raw(Box::new(VarObj {
+    let p = super::alloc_raw(VarObj {
         hdr: ObjHeader::immortal(Kind::Var),
         fast: AtomicU64::new(crate::value::UNBOUND),
         ns: ns.into(),
@@ -42,7 +42,7 @@ pub(crate) fn new(ns: &str, name: &str) -> *const VarObj {
         root: Mutex::new(Value::UNBOUND),
         flags: AtomicU32::new(0),
         meta: Mutex::new(Value::NIL),
-    }));
+    });
     crate::gc::register_permanent(p as *mut ObjHeader);
     p
 }

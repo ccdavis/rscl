@@ -10,6 +10,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 pub mod api;
+pub mod arena;
 pub mod bridge;
 pub mod coll;
 pub mod core;

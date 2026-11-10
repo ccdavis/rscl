@@ -294,14 +294,23 @@ pub fn is_blocked() -> bool {
 /// exception class and message to throw.
 fn take_interrupt() -> Option<(&'static str, String)> {
     let stress = crate::gc::stress_tick();
-    if !is_blocked() && (GC_PENDING.load(Ordering::Acquire) || crate::gc::stopping()) {
+    if !is_blocked()
+        && (GC_PENDING.load(Ordering::Acquire)
+            || crate::gc::stopping()
+            || (stress && crate::gc::gc_wanted()))
+    {
         crate::gc::safepoint();
     }
     if stress {
         // Stress mode keeps every thread on the slow path.
         rscl_interrupt_flag.store(1, Ordering::Release);
     }
-    if crate::heap::take_oom(!is_blocked()) {
+    // While collections are deferred here the heap may hold garbage that cannot be
+    // freed yet: the error waits for a safepoint that can collect, unless the heap
+    // is far over its limit.
+    let wait_for_gc = crate::gc::deferred_here()
+        && crate::heap::over_limit().is_none_or(|(used, limit)| used < limit + limit / 4);
+    if !wait_for_gc && crate::heap::take_oom(!is_blocked()) {
         refresh_flag();
         // Garbage may hold the memory: collect once before giving up.
         if !is_blocked() {
@@ -407,6 +416,15 @@ pub unsafe extern "C" fn rt_stack_check(sp: usize) -> Value {
 /// (after taking part in a collection, if one is pending).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_interrupted() -> Value {
+    // Everything below the compiled frame that called this is dead. Clearing it
+    // before the collector's own frames are pushed there keeps what earlier calls
+    // left behind from looking like references (see `gc::clear_dead_stack`).
+    crate::gc::clear_dead_stack();
+    interrupted()
+}
+
+#[inline(never)]
+fn interrupted() -> Value {
     match take_interrupt() {
         Some((class, msg)) => {
             crate::exc::throw_new(class, &msg);

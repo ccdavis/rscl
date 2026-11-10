@@ -111,6 +111,12 @@ fn account(delta: isize) {
     });
 }
 
+/// Bytes of a heap object allocated (or freed) outside the global allocator.
+#[inline]
+pub(crate) fn account_object(delta: isize) {
+    account(delta);
+}
+
 #[cold]
 fn flush(n: isize) {
     let live = LIVE.fetch_add(n, Ordering::Relaxed) + n;
@@ -250,7 +256,10 @@ pub(crate) fn gc_finished() {
 /// for it over and over.
 pub(crate) fn gc_postponed() {
     let live = used();
-    GC_NEXT.store(live.saturating_add((live / 4).max(8 << 20)), Ordering::Relaxed);
+    GC_NEXT.store(
+        live.saturating_add((live / 4).max(8 << 20)),
+        Ordering::Relaxed,
+    );
 }
 
 fn gc_min() -> usize {

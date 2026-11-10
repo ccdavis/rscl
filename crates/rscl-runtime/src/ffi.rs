@@ -181,12 +181,9 @@ pub unsafe extern "C" fn rt_fn_set_capture(f: VRef, i: i64, v: Value) {
     unsafe { func::set_capture(&f, i as usize, v) }
 }
 
-/// Release handed-over arguments on a prologue failure (arity mismatch, stack
-/// overflow, interrupt), before any parameter was bound.
+/// No longer needed (nothing is released); kept until the ABI drops it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_release_args(argv: *const Value, argc: i64, owned: u64) {
-    unsafe { crate::core::release_owned(argv, argc, owned) }
-}
+pub unsafe extern "C" fn rt_release_args(_argv: *const Value, _argc: i64, _owned: u64) {}
 
 /// Arity failure for a compiled function.
 #[unsafe(no_mangle)]
@@ -203,12 +200,11 @@ pub unsafe extern "C" fn rt_throw_arity(f: VRef, argc: i64) -> Value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_invoke(f: VRef, argc: i64, argv: *const Value, owned: u64) -> Value {
     let args = unsafe { args_slice(argv, argc) };
-    let r = match invoke(&f, args) {
+    let _ = owned;
+    match invoke(&f, args) {
         Ok(v) => v,
         Err(_) => Value::EXC,
-    };
-    unsafe { crate::core::release_owned(argv, argc, owned) };
-    r
+    }
 }
 
 /// Invoke any callable from Rust.
@@ -299,7 +295,7 @@ impl Value {
 
 // ---- collections -------------------------------------------------------------------
 
-/// Move the values out of `items` (owned slots are taken, borrowed ones retained).
+/// Copy the values out of `items` (slots the caller gave up are cleared).
 unsafe fn take_slice(items: *const Value, n: i64, owned: u64) -> Vec<Value> {
     let t = crate::core::Taker::new(items, n, owned);
     (0..n.max(0) as usize).map(|i| t.take(i)).collect()
@@ -365,8 +361,10 @@ fn flag(v: &Value) {
     if h.is_immortal() {
         return;
     }
-    h.flags
-        .fetch_or(crate::value::PERMANENT, std::sync::atomic::Ordering::Relaxed);
+    h.flags.fetch_or(
+        crate::value::PERMANENT,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     flag_contents(v);
 }
 
@@ -385,8 +383,10 @@ fn flag_contents(v: &Value) {
                 if h.is_immortal() {
                     break;
                 }
-                h.flags
-                    .fetch_or(crate::value::PERMANENT, std::sync::atomic::Ordering::Relaxed);
+                h.flags.fetch_or(
+                    crate::value::PERMANENT,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 cell = list::get(&cell.rest);
             }
         }
@@ -459,6 +459,7 @@ pub unsafe extern "C" fn rt_run_main(v: *const obj::var::VarObj) -> i32 {
         Some(l) => l.to_vec(),
         None => Vec::new(),
     };
+    crate::gc::clear_dead_stack();
     match root.call(&args) {
         Ok(v) => {
             drop(v);

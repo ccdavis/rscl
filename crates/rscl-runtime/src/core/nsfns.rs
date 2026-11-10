@@ -124,7 +124,7 @@ builtins! {
         ns::set_current(n);
         Ok(n.as_value())
     }
-    "require" => fn cf_require(args) [; 0] {
+    "require" => @gc fn cf_require(args) [; 0] {
         let force = args.iter().any(|a| keyword::as_kw(a).is_some_and(|k| matches!(k.name(), "reload" | "reload-all")));
         for spec in args {
             if let Some(items) = list::as_list(spec).map(|l| l.to_vec()) && items.first().is_some_and(|f| f.is_kind(Kind::Symbol)) {
@@ -158,7 +158,7 @@ builtins! {
         }
         Ok(Value::NIL)
     }
-    "load-file" => fn cf_load_file(args) [1] {
+    "load-file" => @gc fn cf_load_file(args) [1] {
         // Always re-evaluates, like Clojure (the edit-then-load-file REPL workflow).
         let path = args::string(&args[0], "path")?;
         ns::load_lib_opt(&format!("file:{path}"), true)?;

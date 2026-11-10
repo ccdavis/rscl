@@ -63,7 +63,7 @@ impl Jit {
         let flags = [
             ("opt_level", "none"),
             // Fast register allocation: the REPL compiles core.clj at start-up.
-            ("regalloc_algorithm", "single_pass"),
+            // ("regalloc_algorithm", "single_pass"),
             ("use_colocated_libcalls", "false"),
             ("is_pic", "false"),
             ("preserve_frame_pointers", "true"),
@@ -127,6 +127,9 @@ impl Jit {
 
     /// Run a compiled unit: its constant initialiser, then its body.
     pub fn run(unit: CompiledUnit) -> Result<Value, EvalError> {
+        // Whatever earlier work left on the dead stack must not look like
+        // references to the frames this unit is about to push.
+        rscl_runtime::gc::clear_dead_stack();
         let r = unsafe { (unit.init)() };
         if r == value::EXC {
             return Err(EvalError::Exception(exc::take().unwrap_or(Value::NIL)));

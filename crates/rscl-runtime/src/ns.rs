@@ -51,12 +51,14 @@ pub fn find_or_create(name: &str) -> &'static NsObj {
     if let Some(&p) = w.0.get(name) {
         return unsafe { &*(p as *const NsObj) };
     }
-    let ns = Box::leak(Box::new(NsObj {
-        hdr: ObjHeader::immortal(Kind::Namespace),
-        name: name.into(),
-        mappings: RwLock::new(HashMap::new()),
-        aliases: RwLock::new(HashMap::new()),
-    }));
+    let ns: &'static mut NsObj = unsafe {
+        &mut *crate::obj::alloc_raw(NsObj {
+            hdr: ObjHeader::immortal(Kind::Namespace),
+            name: name.into(),
+            mappings: RwLock::new(HashMap::new()),
+            aliases: RwLock::new(HashMap::new()),
+        })
+    };
     crate::gc::register_permanent(ns as *mut NsObj as *mut ObjHeader);
     w.0.insert(name.to_string(), ns as *const NsObj as usize);
     ns

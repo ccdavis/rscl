@@ -44,7 +44,7 @@ builtins! {
             Err(e) => err(RUNTIME, format!("{path}: {e}")),
         }
     }
-    "read-line" => fn cf_read_line(args) [0] {
+    "read-line" => @gc fn cf_read_line(args) [0] {
         let _ = args;
         read_line()
     }

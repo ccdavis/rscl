@@ -2925,6 +2925,30 @@ impl<'a, M: Module> FnCtx<'a, M> {
         for (j, v) in vals.iter().enumerate() {
             self.cleanup.push(Cleanup::ValIf(*v, 1 << j));
         }
+        // An argument the caller gave up (its `owned` bit) is cleared in the
+        // caller's argument area now that it is in a variable here: the slot must
+        // not keep, say, the head of a lazy sequence alive while this function
+        // walks it.
+        if !vals.is_empty() {
+            let clear = self.b.create_block();
+            let cont = self.b.create_block();
+            self.b.ins().brif(owned, clear, &[], cont, &[]);
+            self.b.switch_to_block(clear);
+            self.b.seal_block(clear);
+            for (j, v) in vals.iter().enumerate() {
+                // keep = all ones when the bit is clear, zero when it is set
+                let bit = self.b.ins().ushr_imm_s(owned, j as i64);
+                let bit = self.b.ins().band_imm_s(bit, 1);
+                let keep = self.b.ins().iadd_imm_s(bit, -1);
+                let stored = self.b.ins().band(*v, keep);
+                self.b
+                    .ins()
+                    .store(MemFlagsData::trusted(), stored, argv, 8 * j as i32);
+            }
+            self.b.ins().jump(cont, &[]);
+            self.b.switch_to_block(cont);
+            self.b.seal_block(cont);
+        }
         let rest = a.rest.map(|_| {
             let nfixed = a.params.len() as i64;
             let extra = self.b.ins().iadd_imm_s(argc, -nfixed);

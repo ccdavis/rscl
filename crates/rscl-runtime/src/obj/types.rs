@@ -35,14 +35,14 @@ pub struct TypeObj {
 
 fn type_value(id: u64, name: &str, fields: Vec<String>, is_record: bool) -> Value {
     let field_kws = fields.iter().map(|f| keyword::intern(None, f)).collect();
-    let p = Box::into_raw(Box::new(TypeObj {
+    let p = super::alloc_raw(TypeObj {
         hdr: ObjHeader::immortal(Kind::Type),
         id,
         name: name.into(),
         fields: fields.into_iter().map(Into::into).collect(),
         field_kws,
         is_record,
-    }));
+    });
     crate::gc::register_permanent(p as *mut ObjHeader);
     unsafe { Value::from_raw(p as u64) }
 }
@@ -350,12 +350,12 @@ pub struct ProtocolObj {
 }
 
 pub fn protocol_new(name: &str, methods: Vec<String>) -> Value {
-    let p = Box::into_raw(Box::new(ProtocolObj {
+    let p = super::alloc_raw(ProtocolObj {
         hdr: ObjHeader::immortal(Kind::Protocol),
         name: name.into(),
         methods: methods.into_iter().map(Into::into).collect(),
         impls: RwLock::new(HashMap::new()),
-    }));
+    });
     crate::gc::register_permanent(p as *mut ObjHeader);
     unsafe { Value::from_raw(p as u64) }
 }

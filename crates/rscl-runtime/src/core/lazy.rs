@@ -91,18 +91,18 @@ builtins! {
             _ => Ok(Value::TRUE),
         }
     }
-    "doall" => fn cf_doall(args) [1, 2] {
+    "doall" => @gc fn cf_doall(args) [1, 2] {
         let s = &args[args.len() - 1];
         for x in coll::seq_iter(s) { x?; }
         Ok(s.owned())
     }
-    "dorun" => fn cf_dorun(args; owned = taker) [1, 2] {
-        for x in coll::iter_owned(taker.take(args.len() - 1))? { x?; }
+    "dorun" => @gc fn cf_dorun(args; owned = taker) [1, 2] {
+        for x in coll::iter_owned(taker.cursor(args.len() - 1))? { x?; }
         Ok(Value::NIL)
     }
     "atom" => fn cf_atom(args) [; 1] { Ok(atom::new(args[0].owned())) }
     "atom?" => fn cf_atom_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Atom))) }
-    "deref" => fn cf_deref(args) [1, 3] {
+    "deref" => @gc fn cf_deref(args) [1, 3] {
         if args.len() == 3
             && !crate::obj::pending::as_pending(&args[0])
                 .is_some_and(|p| p.flavor != crate::obj::pending::Flavor::Delay)
@@ -136,8 +136,8 @@ builtins! {
         let new = a.reset(args[1].owned());
         Ok(vector::from_iter(vec![old, new]))
     }
-    "swap!" => fn cf_swap(args) [; 2] { Ok(swap(expect_atom(&args[0])?, &args[1], &args[2..])?.1) }
-    "swap-vals!" => fn cf_swap_vals(args) [; 2] {
+    "swap!" => @gc fn cf_swap(args) [; 2] { Ok(swap(expect_atom(&args[0])?, &args[1], &args[2..])?.1) }
+    "swap-vals!" => @gc fn cf_swap_vals(args) [; 2] {
         let (old, new) = swap(expect_atom(&args[0])?, &args[1], &args[2..])?;
         Ok(vector::from_iter(vec![old, new]))
     }

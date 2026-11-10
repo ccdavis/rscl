@@ -88,7 +88,7 @@ fn expect_var<'a>(v: &'a Value, what: &str) -> RtResult<&'a var::VarObj> {
 
 native_fns! {
     // captures: [protocol, method-name]
-    "protocol-fn" => fn nf_protocol_fn(args, this) [; 0] {
+    "protocol-fn" => @gc fn nf_protocol_fn(args, this) [; 0] {
         if args.is_empty() {
             let name = func::get(&this).proto().name.clone();
             return Err(crate::exc::Exc_from(crate::core::arity_error(&name, 0)));
@@ -112,7 +112,7 @@ native_fns! {
         f.call(&owned)
     }
     // captures: [name, dispatch-fn, methods-atom, default-dispatch-value]
-    "multi-fn" => fn nf_multi_fn(args, this) [; 0] {
+    "multi-fn" => @gc fn nf_multi_fn(args, this) [; 0] {
         let owned: Vec<Value> = args.iter().map(|a| a.owned()).collect();
         let dv = cap(this, 1).call(&owned)?;
         let table = atom::get(&cap(this, 2)).deref();

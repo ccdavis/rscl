@@ -72,23 +72,57 @@ pub fn is_seq(v: &Value) -> bool {
     matches!(v.kind(), Some(Kind::List | Kind::Cons | Kind::LazySeq))
 }
 
+/// Where a sequence walk keeps its position. A caller that hands a sequence over
+/// (see `Taker`) gives up its argument slot, and the walk then uses that very slot
+/// as its cursor: the head is never copied into a native frame, where a stale copy
+/// would keep every cell behind the cursor alive for the conservative stack scan.
+pub enum Cursor {
+    /// The caller's argument slot (it gave the slot up).
+    Slot(*mut Value),
+    Own(Value),
+}
+
+impl Cursor {
+    #[inline]
+    pub fn get(&self) -> Value {
+        match self {
+            Cursor::Slot(p) => unsafe { std::ptr::read_volatile(*p) },
+            Cursor::Own(v) => v.clone(),
+        }
+    }
+    /// Is the value a cons or lazy seq? Looks through the slot without copying the
+    /// value into this frame (a copy of a sequence's head left in a long-lived
+    /// frame would keep the whole sequence alive).
+    #[inline]
+    pub fn is_lazy(&self) -> bool {
+        match self {
+            Cursor::Slot(p) => is_lazy_kind(unsafe { &**p }),
+            Cursor::Own(v) => is_lazy_kind(v),
+        }
+    }
+    #[inline]
+    fn set(&mut self, v: Value) {
+        match self {
+            Cursor::Slot(p) => unsafe { std::ptr::write_volatile(*p, v) },
+            Cursor::Own(slot) => *slot = v,
+        }
+    }
+}
+
 /// Walk any seqable value element by element, realising lazy seqs as it goes.
 pub struct SeqIter {
-    cur: Value,
+    cur: Cursor,
     done: bool,
 }
 
 pub fn seq_iter(v: &Value) -> SeqIter {
-    seq_iter_owned(v.clone())
+    seq_iter_owned(Cursor::Own(v.clone()))
 }
 
 /// Walk a sequence the caller hands over: as the iterator advances, nothing else
-/// references the cells behind it, so a lazy sequence is freed as it is consumed.
-pub fn seq_iter_owned(v: Value) -> SeqIter {
-    SeqIter {
-        cur: v,
-        done: false,
-    }
+/// refers to the cells behind it, so a lazy sequence is collected as it is consumed.
+pub fn seq_iter_owned(cur: Cursor) -> SeqIter {
+    SeqIter { cur, done: false }
 }
 
 /// A cons or lazy seq: walked cell by cell; everything else is a materialised
@@ -101,7 +135,10 @@ pub fn is_lazy_kind(v: &Value) -> bool {
 /// freed as it is walked), any other collection is materialised once.
 pub enum OwnedIter {
     Seq(SeqIter),
-    Vec(std::vec::IntoIter<Value>),
+    /// The materialised elements stay rooted while the iterator exists: some are
+    /// fresh objects (map entries) that nothing else refers to, and the consumer
+    /// may call rscl code between elements.
+    Vec(std::vec::IntoIter<Value>, crate::gc::SliceRoot<'static>),
 }
 
 impl Iterator for OwnedIter {
@@ -109,23 +146,26 @@ impl Iterator for OwnedIter {
     fn next(&mut self) -> Option<RtResult<Value>> {
         match self {
             OwnedIter::Seq(it) => it.next(),
-            OwnedIter::Vec(it) => it.next().map(Ok),
+            OwnedIter::Vec(it, _) => it.next().map(Ok),
         }
     }
 }
 
-pub fn iter_owned(v: Value) -> RtResult<OwnedIter> {
-    Ok(if is_lazy_kind(&v) {
-        OwnedIter::Seq(seq_iter_owned(v))
+pub fn iter_owned(c: Cursor) -> RtResult<OwnedIter> {
+    Ok(if c.is_lazy() {
+        OwnedIter::Seq(seq_iter_owned(c))
     } else {
-        OwnedIter::Vec(to_vec(&v)?.into_iter())
+        let items = to_vec(&c.get())?;
+        // SAFETY: the buffer belongs to the iterator stored next to the guard.
+        let root = unsafe { crate::gc::root_words(items.as_ptr() as *const u64, items.len()) };
+        OwnedIter::Vec(items.into_iter(), root)
     })
 }
 
 /// `count` of a value the caller hands over (streams lazy sequences).
-pub fn count_owned(v: Value) -> RtResult<i64> {
-    if !is_lazy_kind(&v) {
-        return count(&v);
+pub fn count_owned(v: Cursor) -> RtResult<i64> {
+    if !v.is_lazy() {
+        return count(&v.get());
     }
     let mut n = 0;
     for x in seq_iter_owned(v) {
@@ -136,9 +176,13 @@ pub fn count_owned(v: Value) -> RtResult<i64> {
 }
 
 /// `last` of a value the caller hands over (streams lazy sequences).
-pub fn last_owned(v: Value) -> RtResult<Value> {
-    if v.is_kind(Kind::Vector) {
-        return Ok(vector::get(&v).v.back().cloned().unwrap_or(Value::NIL));
+pub fn last_owned(v: Cursor) -> RtResult<Value> {
+    if v.get().is_kind(Kind::Vector) {
+        return Ok(vector::get(&v.get())
+            .v
+            .back()
+            .cloned()
+            .unwrap_or(Value::NIL));
     }
     let mut last = Value::NIL;
     for x in iter_owned(v)? {
@@ -148,9 +192,9 @@ pub fn last_owned(v: Value) -> RtResult<Value> {
 }
 
 /// `nth` of a value the caller hands over (streams lazy sequences).
-pub fn nth_owned(coll: Value, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
-    if !is_lazy_kind(&coll) || i < 0 {
-        return nth(&coll, i, not_found);
+pub fn nth_owned(coll: Cursor, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
+    if !coll.is_lazy() || i < 0 {
+        return nth(&coll.get(), i, not_found);
     }
     let mut n = 0i64;
     for x in seq_iter_owned(coll) {
@@ -176,12 +220,13 @@ impl Iterator for SeqIter {
             return None;
         }
         let step = (|| {
-            let s = seq(&self.cur)?;
+            let s = seq(&self.cur.get())?;
             if s.is_nil() {
+                self.cur.set(Value::NIL);
                 return Ok(None);
             }
             let f = first(&s)?;
-            self.cur = rest(&s)?;
+            self.cur.set(rest(&s)?);
             Ok(Some(f))
         })();
         match step {
@@ -209,7 +254,7 @@ pub fn count(v: &Value) -> RtResult<i64> {
         Some(Kind::SortedMap) => sorted::map_get(v).m.len() as i64,
         Some(Kind::SortedSet) => sorted::set_get(v).s.len() as i64,
         Some(Kind::Instance) if types::is_record(v) => types::inst(v).count() as i64,
-        Some(Kind::Cons | Kind::LazySeq) => count_owned(v.clone())?,
+        Some(Kind::Cons | Kind::LazySeq) => count_owned(Cursor::Own(v.clone()))?,
         _ => {
             return err(
                 UNSUPPORTED,
@@ -311,7 +356,7 @@ pub fn second(v: &Value) -> RtResult<Value> {
 }
 
 pub fn last(v: &Value) -> RtResult<Value> {
-    last_owned(v.clone())
+    last_owned(Cursor::Own(v.clone()))
 }
 
 /// `cons`: onto `nil` or a list gives a list; onto anything else a cons cell whose
@@ -503,7 +548,7 @@ pub fn nth(coll: &Value, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
                 None => oob(l.count as usize),
             }
         }
-        Some(Kind::Cons | Kind::LazySeq) => nth_owned(coll.clone(), i, not_found),
+        Some(Kind::Cons | Kind::LazySeq) => nth_owned(Cursor::Own(coll.clone()), i, not_found),
         _ => err(
             UNSUPPORTED,
             format!("nth not supported on this type: {}", type_name(coll)),

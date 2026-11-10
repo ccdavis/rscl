@@ -188,10 +188,9 @@ fn lock(v: &Value) -> RtResult<()> {
         crate::native::blocking(|| {
             let st = l.state.lock().unwrap_or_else(|e| e.into_inner());
             if st.0 != 0 && st.0 != me {
-                let _ = l
-                    .cv
-                    .wait_timeout(st, Duration::from_millis(20))
-                    .unwrap_or_else(|e| e.into_inner());
+                let _ =
+                    l.cv.wait_timeout(st, Duration::from_millis(20))
+                        .unwrap_or_else(|e| e.into_inner());
             }
         });
         let check = crate::native::check_interrupt();
@@ -256,7 +255,7 @@ pub fn sleep_ms(ms: i64) -> RtResult<()> {
 }
 
 builtins! {
-    "future-call" => fn cc_future_call(args) [1] {
+    "future-call" => @gc fn cc_future_call(args) [1] {
         if func::as_fn(&args[0]).is_none() {
             return err(ILLEGAL_ARGUMENT, "future-call requires a fn");
         }
@@ -285,17 +284,17 @@ builtins! {
     "delay?" => fn cc_delay_p(args) [1] {
         Ok(Value::bool(pending::as_pending(&args[0]).is_some_and(|p| p.flavor == Flavor::Delay)))
     }
-    "force" => fn cc_force(args) [1] {
+    "force" => @gc fn cc_force(args) [1] {
         match pending::as_pending(&args[0]) {
             Some(p) if p.flavor == Flavor::Delay => Ok(p.deref(None)?.unwrap_or(Value::NIL)),
             _ => Ok(args[0].owned()),
         }
     }
-    "lock*" => fn cc_lock(args) [1] {
+    "lock*" => @gc fn cc_lock(args) [1] {
         lock(&args[0])?;
         Ok(Value::NIL)
     }
-    "gc" => fn cc_gc(args) [0] {
+    "gc" => @gc fn cc_gc(args) [0] {
         let _ = args;
         match crate::gc::collect_now() {
             Some(n) => Ok(Value::int(n as i64)),
@@ -304,7 +303,7 @@ builtins! {
     }
     "gc-count" => fn cc_gc_count(args) [0] { let _ = args; Ok(Value::int(crate::gc::collections() as i64)) }
     "unlock*" => fn cc_unlock(args) [1] { unlock(&args[0])?; Ok(Value::NIL) }
-    "sleep" => fn cc_sleep(args) [1] { sleep_ms(args::int(&args[0], "ms")?)?; Ok(Value::NIL) }
+    "sleep" => @gc fn cc_sleep(args) [1] { sleep_ms(args::int(&args[0], "ms")?)?; Ok(Value::NIL) }
     "available-processors" => fn cc_available_processors(args) [0] {
         let _ = args;
         Ok(Value::int(std::thread::available_parallelism().map_or(1, |n| n.get() as i64)))
