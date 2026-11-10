@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 
 use cranelift_object::ObjectModule;
 use rscl_runtime::obj::symbol;
-use rscl_runtime::reader::{DefaultEnv, Reader};
-use rscl_runtime::{Value, exc, ns, pos};
+use rscl_runtime::{Value, exc, ns};
 
 use crate::analyzer::{Analyzer, split_do};
 use crate::codegen::{Compiler, UnitIds};
@@ -177,12 +176,11 @@ fn eval_unit(form: &Value) -> Result<Value, EvalError> {
 
 /// Read and evaluate every form of `src` (positions attributed to `file`).
 pub fn eval_source(src: &str, file: &str) -> Result<Value, EvalError> {
-    let file_id = pos::intern_file(file);
-    let mut reader = Reader::new(src, &DefaultEnv).with_file(file_id);
     let mut last = Value::NIL;
-    while let Some(form) = reader.read()? {
+    crate::boot::each_form(src, file, |form| {
         last = eval_form(&form)?;
-    }
+        Ok(())
+    })?;
     Ok(last)
 }
 

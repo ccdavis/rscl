@@ -1113,3 +1113,76 @@ fn compiler_review_regressions() {
         );
     });
 }
+
+#[test]
+fn third_pass_review_regressions() {
+    with_jit(|j| {
+        // One written atom must not make a native loop collect per element.
+        def(j, "(def storm (atom 0))");
+        def(j, "(reset! storm 1)");
+        let before: i64 = def(j, "(gc-count)").parse().unwrap();
+        assert_eq!(
+            eval(
+                j,
+                "(reduce (fn [acc x] (count [acc x]) (+ acc x)) 0 (range 200000))"
+            ),
+            "19999900000"
+        );
+        let after: i64 = def(j, "(gc-count)").parse().unwrap();
+        assert!(after - before < 20, "{} collections", after - before);
+        // Syntax-quoted and plain map literals evaluate in source order.
+        def(j, "(def order (atom []))");
+        // Settle the collector's candidates before the leak-checked evaluations.
+        def(j, "(gc)");
+        assert_eq!(
+            eval(
+                j,
+                "(do `{:a ~(swap! order conj 1) :b ~(swap! order conj 2) :c ~(swap! order conj 3) :d ~(swap! order conj 4) :e ~(swap! order conj 5) :f ~(swap! order conj 6) :g ~(swap! order conj 7) :h ~(swap! order conj 8) :i ~(swap! order conj 9)} (let [o @order] (reset! order []) o))"
+            ),
+            "[1 2 3 4 5 6 7 8 9]"
+        );
+        // Constants with unreadable metadata, type hints on literals, embedded vars.
+        def(
+            j,
+            "(defmacro unreadable-meta [] (list 'quote (with-meta 's {:f inc})))",
+        );
+        assert_eq!(eval(j, "(unreadable-meta)"), "s");
+        assert_eq!(eval(j, "(let [x 1] (meta ^ints [x]))"), "{:tag ints}");
+        def(j, "(defn embedded-f [] 7)");
+        def(j, "(defmacro call-var [] (list (resolve 'embedded-f)))");
+        assert_eq!(eval(j, "(call-var)"), "7");
+        def(j, "(defmacro live-object [] (atom 1))");
+        assert!(eval(j, "(live-object)").contains("cannot be embedded"));
+        // Equal keys: literals agree with constructors, lookups return what is stored.
+        assert_eq!(
+            eval(
+                j,
+                "(let [a 1 b 1N] [#{a b} {a :x b :y} (find {1 :a} 1N) (#{1} 1N)])"
+            ),
+            "[#{1} {1 :y} [1 :a] 1]"
+        );
+        def(j, "(defrecord MergeRec [a])");
+        assert_eq!(
+            eval(
+                j,
+                "[(merge {:a 1} (sorted-map :b 2)) (merge {:x 1} (->MergeRec 5))]"
+            ),
+            "[{:b 2, :a 1} {:a 5, :x 1}]"
+        );
+        // Deep nesting: a reader error, a catchable overflow, an iterative free.
+        assert_eq!(
+            eval(
+                j,
+                "(try (read-string (apply str (repeat 300000 \"[\"))) (catch Exception e :too-deep))"
+            ),
+            ":too-deep"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [v (loop [v [] i 0] (if (< i 2000000) (recur [v] (inc i)) v))] [(number? (hash v)) (try (= v [v]) (catch StackOverflowError e :so))])"
+            ),
+            "[true :so]"
+        );
+    });
+}

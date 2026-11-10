@@ -415,14 +415,6 @@ impl PrimOp {
     }
 }
 
-/// May a `recur` argument of type `arg` rebind an inferred loop local of type
-/// `var`? Only the same type: a long must stay a long (widening it to the local's
-/// double would change the value the untyped loop computes), so the local is
-/// demoted to a boxed value instead.
-fn recur_compatible(var: Ty, arg: Ty) -> bool {
-    var == arg
-}
-
 struct Frame {
     scopes: Vec<Vec<(String, LocalId)>>,
     captures: Vec<LocalId>,
@@ -438,6 +430,8 @@ pub struct Analyzer {
     fn_counter: u32,
     /// Display name for the fn a `def` is about to analyse as its init.
     fn_name_hint: Option<String>,
+    /// Vars whose `def` is being analysed (innermost last).
+    defining: Vec<VarPtr>,
 }
 
 pub use rscl_runtime::reader::is_special;
@@ -466,6 +460,7 @@ impl Analyzer {
             next_loop: 0,
             fn_counter: 0,
             fn_name_hint: None,
+            defining: Vec::new(),
         }
     }
 
@@ -558,7 +553,11 @@ impl Analyzer {
             let bare = with_meta
                 .call(&[form.clone(), Value::NIL])
                 .or_else(|_| fail(form, "cannot strip literal metadata"))?;
-            let call = list::from_slice(&[symbol::new(Some("clojure.core"), "with-meta"), bare, m]);
+            let call = list::from_slice(&[
+                symbol::new(Some("clojure.core"), "with-meta"),
+                bare,
+                quote_tag(&m),
+            ]);
             return self.analyze_list(&call, tail);
         }
         match form.kind() {
@@ -570,29 +569,23 @@ impl Analyzer {
                 self.analyze_coll(form, CollKind::Vector, &items)
             }
             Some(Kind::Map) => {
-                // The reader's map has no order: restore the source order of the
-                // entries (from the positions of their forms) so the value
-                // expressions run left to right.
-                let mut entries: Vec<(Value, Value)> = map::get(form)
-                    .m
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                entries.sort_by_key(|(k, v)| source_order(k).min(source_order(v)));
+                if is_constant(form) {
+                    return Ok(Node::Const(form.clone()));
+                }
+                // In the order the entries were written (the reader records it), so
+                // the value expressions run left to right.
                 let mut items = Vec::new();
-                for (k, v) in entries {
+                for (k, v) in map::ordered_entries(form) {
                     items.push(k);
                     items.push(v);
                 }
                 self.analyze_coll(form, CollKind::Map, &items)
             }
             Some(Kind::Set) => {
-                let mut items = rscl_runtime::obj::set::get(form)
-                    .s
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                items.sort_by_key(source_order);
+                if is_constant(form) {
+                    return Ok(Node::Const(form.clone()));
+                }
+                let items = rscl_runtime::obj::set::ordered_items(form);
                 self.analyze_coll(form, CollKind::Set, &items)
             }
             // Sorted collections only come from macro expansions (there is no literal
@@ -622,7 +615,12 @@ impl Analyzer {
                     rscl_runtime::core::type_name(form)
                 ),
             ),
-            _ => Ok(Node::Const(form.clone())),
+            // A var object (a macro returned `(resolve 'f)`) evaluates to itself.
+            Some(Kind::Var) => Ok(Node::TheVar(VarPtr(form.ptr() as *const VarObj))),
+            _ => {
+                check_embeddable(form, form)?;
+                Ok(Node::Const(form.clone()))
+            }
         }
     }
 
@@ -728,6 +726,9 @@ impl Analyzer {
             .map(|a| self.analyze(a, false))
             .collect::<CResult<Vec<_>>>()?;
         if let Node::VarRef(v) = &f
+            // A var being defined right now (`(defn count ..)` in clojure.core) still
+            // has the builtin as its root: calls must wait for the new definition.
+            && !self.defining.iter().any(|d| std::ptr::eq(d.0, v.0))
             && let Some(desc) = direct_builtin(v.get())
         {
             return Ok(Node::BuiltinCall {
@@ -793,6 +794,7 @@ impl Analyzer {
                 if items.len() != 2 {
                     return fail(form, "Wrong number of args to quote");
                 }
+                check_embeddable(form, &items[1])?;
                 Ok(Node::Const(items[1].clone()))
             }
             "if" => {
@@ -932,17 +934,9 @@ impl Analyzer {
             m.insert(rscl_runtime::obj::keyword::intern(None, "doc"), d);
             meta = Some(m);
         }
-        // A type hint is kept as written; everything else in the metadata is an
-        // expression, evaluated when the def runs (as in Clojure).
-        if let Some(m) = &mut meta {
-            let tag = rscl_runtime::obj::keyword::intern(None, "tag");
-            if let Some(t) = m.get(&tag).cloned()
-                && t.is_kind(Kind::Symbol)
-            {
-                m.insert(tag, list::from_slice(&[symbol::new(None, "quote"), t]));
-            }
-        }
-        let meta = meta.map(rscl_runtime::obj::map::new);
+        // Everything in the metadata but a type hint is an expression, evaluated
+        // when the def runs (as in Clojure).
+        let meta = meta.map(|m| quote_tag(&rscl_runtime::obj::map::new(m)));
         // Like Clojure, `^:dynamic` takes effect at compile time (a `binding` later in
         // the same form); the rest of the metadata is applied when the def runs, so a
         // throwing init leaves it untouched.
@@ -966,11 +960,14 @@ impl Analyzer {
             })
             .filter(|n| n == "fn" || n == "fn*")
             .map(|_| sym.name().to_string());
+        self.defining.push(VarPtr(var_obj as *const VarObj));
+        let init = init.map(|f| self.analyze(f, false));
+        self.defining.pop();
+        self.fn_name_hint = None;
         let init = match init {
-            Some(f) => Some(Box::new(self.analyze(f, false)?)),
+            Some(n) => Some(Box::new(n?)),
             None => None,
         };
-        self.fn_name_hint = None;
         let meta = match meta {
             Some(m) => Some(Box::new(self.analyze(&m, false)?)),
             None => None,
@@ -1070,7 +1067,10 @@ impl Analyzer {
                 if ty == Ty::Val || hinted[i] {
                     continue;
                 }
-                if !ctx.arg_tys.iter().all(|tys| recur_compatible(ty, tys[i])) {
+                // An inferred local keeps its type only if every `recur` rebinds it
+                // with that same type (a long is not widened to a double: that would
+                // change the value the untyped loop computes).
+                if !ctx.arg_tys.iter().all(|tys| tys[i] == ty) {
                     self.locals[*id as usize].ty = Ty::Val;
                     demoted = true;
                 }
@@ -1426,13 +1426,73 @@ pub fn seq_items(v: &Value) -> Option<Vec<Value>> {
     }
 }
 
-/// Self-evaluating form that needs no code to construct.
-/// Where a form was read, for ordering the entries of a map or set literal; forms
-/// without a position (keywords, numbers, strings: no effects to order) sort last.
-fn source_order(v: &Value) -> (u32, u32) {
-    pos::pos_of(v).map_or((u32::MAX, u32::MAX), |p| (p.line, p.col))
+/// `:tag` in a metadata map is a type hint, kept as written: quote a symbol there so
+/// evaluating the map leaves it alone.
+fn quote_tag(meta: &Value) -> Value {
+    let Some(m) = map::as_map(meta) else {
+        return meta.clone();
+    };
+    let tag = keyword::intern(None, "tag");
+    match m.m.get(&tag) {
+        Some(t) if t.is_kind(Kind::Symbol) => {
+            let mut out = m.m.clone();
+            out.insert(
+                tag,
+                list::from_slice(&[symbol::new(None, "quote"), t.clone()]),
+            );
+            map::new(out)
+        }
+        _ => meta.clone(),
+    }
 }
 
+/// Can `v` be written into compiled code as a constant? Data can (numbers, strings,
+/// keywords, symbols, regexes and collections of those); a fn, atom, namespace or
+/// other live object cannot, and a macro that returns one gets a positioned error.
+fn check_embeddable(form: &Value, v: &Value) -> CResult<()> {
+    let ok = match v.kind() {
+        None => true,
+        Some(
+            Kind::Long
+            | Kind::Double
+            | Kind::BigInt
+            | Kind::String
+            | Kind::Keyword
+            | Kind::Symbol
+            | Kind::Regex,
+        ) => true,
+        Some(Kind::List | Kind::Cons | Kind::LazySeq | Kind::Vector | Kind::Set) => {
+            let Some(items) = seq_items(v).or_else(|| rscl_runtime::coll::to_vec(v).ok()) else {
+                return fail(form, "cannot realise a sequence in a constant");
+            };
+            for x in &items {
+                check_embeddable(form, x)?;
+            }
+            true
+        }
+        Some(Kind::Map) => {
+            for (k, x) in map::get(v).m.iter() {
+                check_embeddable(form, k)?;
+                check_embeddable(form, x)?;
+            }
+            true
+        }
+        Some(_) => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        fail(
+            form,
+            format!(
+                "a {} value cannot be embedded in compiled code; return a form that constructs it (a macro expansion may not contain one)",
+                rscl_runtime::core::type_name(v)
+            ),
+        )
+    }
+}
+
+/// Self-evaluating form that needs no code to construct.
 pub fn is_constant(v: &Value) -> bool {
     // Metadata is part of a literal: a non-constant one makes the literal a runtime
     // construction.

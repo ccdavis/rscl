@@ -360,6 +360,14 @@ fn stack_limit() -> usize {
     limit
 }
 
+/// Is this thread's stack nearly used up? For recursive natives (`=`, `hash`, the
+/// reader), which the fn-entry guard of compiled code does not cover.
+pub fn stack_low() -> bool {
+    let marker = 0u8;
+    let limit = stack_limit();
+    limit != usize::MAX && (&marker as *const u8 as usize) < limit
+}
+
 /// Fn-entry check: stack depth and pending interrupt. Returns `nil` or `EXC`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_stack_check(sp: usize) -> Value {

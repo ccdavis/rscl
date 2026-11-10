@@ -12,6 +12,12 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
     if a.bits() == b.bits() {
         return true;
     }
+    // Too deep to compare: `StackOverflowError` is left pending (the `=` builtin
+    // rethrows it) and the answer is "not equal".
+    if a.kind().is_some() && crate::native::stack_low() {
+        crate::exc::throw_new(crate::obj::exception::STACK_OVERFLOW, "stack overflow");
+        return false;
+    }
     // Immediates (nil, bools, chars, fixnums) are equal only when identical, except
     // that a fixnum may meet a boxed long.
     if a.kind().is_none() && b.kind().is_none() {
@@ -35,9 +41,11 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
             Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq,
             Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq,
         ) => seq_equiv(a, b),
-        (Kind::Map, Kind::Map) => obj::map::get(a).m == obj::map::get(b).m,
+        // Clones (O(1)): comparing elements can run rscl code (lazy seqs), during
+        // which a collection may replace the node trees of `a` and `b` themselves.
+        (Kind::Map, Kind::Map) => obj::map::get(a).m.clone() == obj::map::get(b).m.clone(),
         (Kind::Map | Kind::SortedMap, Kind::Map | Kind::SortedMap) => map_equiv(a, b),
-        (Kind::Set, Kind::Set) => obj::set::get(a).s == obj::set::get(b).s,
+        (Kind::Set, Kind::Set) => obj::set::get(a).s.clone() == obj::set::get(b).s.clone(),
         (Kind::Set | Kind::SortedSet, Kind::Set | Kind::SortedSet) => set_equiv(a, b),
         (Kind::Regex, Kind::Regex) => obj::regex::get(a).source == obj::regex::get(b).source,
         (Kind::Instance, Kind::Instance) => {
@@ -205,6 +213,10 @@ pub fn hasheq(v: &Value) -> u64 {
     if let Some(n) = v.int_value() {
         return mix64(n as u64);
     }
+    // Too deep to walk: stop descending (equal structures still hash alike).
+    if crate::native::stack_low() {
+        return mix64(0x5eed);
+    }
     let Some(kind) = v.kind() else {
         // nil, bools, chars: the bit pattern itself is unique per value.
         return mix64(v.bits() ^ 0xa5a5);
@@ -238,12 +250,16 @@ pub fn hasheq(v: &Value) -> u64 {
         }
         Kind::Regex => mix64(hash_bytes(obj::regex::get(v).source.as_bytes()) ^ 0x5e5e),
         // Sorted and hashed collections with the same contents must hash alike.
-        Kind::Map => hash_map_entries(obj::map::get(v).m.iter()),
-        Kind::SortedMap => {
-            hash_map_entries(obj::sorted::map_get(v).m.iter().map(|(k, val)| (&k.0, val)))
-        }
-        Kind::Set => hash_set_items(obj::set::get(v).s.iter()),
-        Kind::SortedSet => hash_set_items(obj::sorted::set_get(v).s.iter().map(|k| &k.0)),
+        Kind::Map => hash_map_entries(obj::map::get(v).m.clone().iter()),
+        Kind::SortedMap => hash_map_entries(
+            obj::sorted::map_get(v)
+                .m
+                .clone()
+                .iter()
+                .map(|(k, val)| (&k.0, val)),
+        ),
+        Kind::Set => hash_set_items(obj::set::get(v).s.clone().iter()),
+        Kind::SortedSet => hash_set_items(obj::sorted::set_get(v).s.clone().iter().map(|k| &k.0)),
         Kind::Instance => {
             let i = obj::types::inst(v);
             if !i.ty().is_record {

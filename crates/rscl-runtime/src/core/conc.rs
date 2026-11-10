@@ -81,7 +81,7 @@ pub fn future_call(f: Value) -> RtResult<Value> {
             crate::native::set_current_future(Some(fut2.clone()));
             let p = pending::get(&fut2);
             if !p.cancel.load(std::sync::atomic::Ordering::Acquire) {
-                match crate::ffi::invoke_root(&f, &[]) {
+                match f.call(&[]) {
                     Ok(v) => {
                         p.deliver(v);
                     }

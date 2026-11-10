@@ -282,8 +282,12 @@ pub type DynamicLoader = fn(&str) -> crate::exc::RtResult<()>;
 
 struct Loading {
     loaded: HashSet<String>,
-    /// Libs being loaded, with the thread loading each.
-    in_progress: Vec<(String, u64)>,
+    /// Libs being loaded (by `owner`), outermost first.
+    in_progress: Vec<String>,
+    /// The thread that is loading libs. Loading is serialised across threads, as
+    /// Clojure's `require` is: a load switches the process's current namespace
+    /// while it runs, and waiting for each other's libs could deadlock.
+    owner: Option<u64>,
     static_loaders: HashMap<String, usize>,
     dynamic: Option<DynamicLoader>,
 }
@@ -294,6 +298,7 @@ fn loading() -> &'static RwLock<Loading> {
         RwLock::new(Loading {
             loaded: HashSet::from([CORE.to_string()]),
             in_progress: Vec::new(),
+            owner: None,
             static_loaders: HashMap::new(),
             dynamic: None,
         })
@@ -341,29 +346,20 @@ pub fn load_lib_opt(key: &str, force: bool) -> crate::exc::RtResult<()> {
             if !force && l.loaded.contains(key) {
                 return Ok(());
             }
-            match l.in_progress.iter().find(|(k, _)| k == key) {
-                None => {
-                    l.in_progress.push((key.to_string(), me));
-                    break (l.static_loaders.get(key).copied(), l.dynamic);
-                }
-                // A cycle only if this thread is the one loading it.
-                Some((_, t)) if *t == me => {
-                    let chain = l
-                        .in_progress
-                        .iter()
-                        .filter(|(_, t)| *t == me)
-                        .map(|(k, _)| k.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" -> ");
+            if l.owner.is_none_or(|t| t == me) {
+                if l.in_progress.iter().any(|k| k == key) {
+                    let chain = l.in_progress.join(" -> ");
                     return err(
                         ILLEGAL_STATE,
                         format!("Cyclic load dependency: {chain} -> {key}"),
                     );
                 }
-                Some(_) => {}
+                l.owner = Some(me);
+                l.in_progress.push(key.to_string());
+                break (l.static_loaders.get(key).copied(), l.dynamic);
             }
         }
-        // Another thread is loading it: wait for that to finish.
+        // Another thread is loading: wait until it is done with all of its libs.
         crate::native::enter_blocking();
         std::thread::sleep(std::time::Duration::from_millis(2));
         crate::native::leave_blocking();
@@ -385,7 +381,10 @@ pub fn load_lib_opt(key: &str, force: bool) -> crate::exc::RtResult<()> {
     };
     set_current(prev_ns);
     let mut l = loading().write().unwrap();
-    l.in_progress.retain(|(k, t)| !(k == key && *t == me));
+    l.in_progress.retain(|k| k != key);
+    if l.in_progress.is_empty() {
+        l.owner = None;
+    }
     if result.is_ok() {
         l.loaded.insert(key.to_string());
     }

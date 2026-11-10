@@ -56,6 +56,14 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   name and on collection literals is evaluated (`^{:doc (str "a" "b")}`); a `:tag`
   symbol is kept as written.
 - With several arities, an exact fixed arity wins over the variadic one.
+- A macro expansion may contain data and vars, but not live objects (a fn, an
+  atom): that is a compile error at the macro call. Metadata that cannot be read
+  back is dropped from an embedded constant.
+- `require` is serialised across threads: while one thread loads libs, another's
+  `require` waits. A lib whose top level waits for a future that requires
+  something therefore deadlocks, as in Clojure.
+- Input nested too deeply for the native stack is a reader error, `=` on such a
+  structure throws `StackOverflowError`, and freeing one is iterative.
 
 ## Exceptions
 
@@ -140,6 +148,13 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   which requires the default `panic = "unwind"` (the `exports!` macro refuses to
   compile under `panic = "abort"`). `Vec<T>` and `HashMap<String, T>` parameters
   accept `nil` as empty; a returned `HashMap` has string keys.
+- A bridge library's values (`Val`) and pending-exception markers (`Exc`) are tied
+  to the thread rscl called it on (neither is `Send`), and a `Native<T>` payload
+  must be `Send + Sync`, since any rscl thread may use and drop it. Its type is
+  checked by `TypeId`. A map argument converted to `HashMap<String, V>` keeps a
+  keyword's namespace in the key (`user/id`) and rejects two keys with the same
+  name. `clear_exception` drops an error the library handles itself. An export
+  takes at most 63 parameters. The ABI is at version 4.
 - Native objects (`Native<T>`) print as `#object[type 0x...]`, compare by identity,
   and are dropped (running `T`'s destructor in the library) when unreferenced. They
   belong to the library instance that created them: after a reload, a handle made by
@@ -291,9 +306,9 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   own graph refers back to them (then they stay, since the cycle can die without
   the candidate itself changing). A persistent collection on
   the way is counted through only when it is the sole owner of its node tree (the
-  collector rebuilds it, which can unshare structure; it does not do so while a
-  native fn that called back into rscl code is on some thread's stack, since that
-  fn may be iterating the collection, and runs again once none is); a collection with more than
+  collector rebuilds it, which can unshare structure; the natives that walk a
+  borrowed collection while rscl code may run, such as the printer, `=`, `hash`
+  and `compare`, walk their own O(1) clone, so this is safe); a collection with more than
   one reference is treated as holding its contents from outside. Cycles through a
   native object's payload are not seen. A thread stuck in a long native call delays
   a collection; `(gc)` throws if the others cannot be stopped within 200 ms.

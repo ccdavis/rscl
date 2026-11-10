@@ -38,9 +38,23 @@ pub fn api() -> &'static RtApi {
         .expect("rscl bridge used before rscl_module_register")
 }
 
-/// An exception is pending in the runtime (already thrown through the API).
+/// An exception is pending in the runtime (already thrown through the API). The only
+/// way to get one is from `throw` or a failed API call, so holding an `Exc` means the
+/// runtime has something pending; it is tied to the thread it was thrown on.
 #[derive(Debug, Clone, Copy)]
-pub struct Exc;
+pub struct Exc(std::marker::PhantomData<*const ()>);
+
+impl Exc {
+    fn pending() -> Exc {
+        Exc(std::marker::PhantomData)
+    }
+}
+
+/// Drop the pending exception: for code that handles an `Err(Exc)` itself (falls
+/// back to a default, retries) instead of returning it to rscl.
+pub fn clear_exception(_handled: Exc) {
+    unsafe { (api().exc_clear)() }
+}
 
 pub type Result<T> = std::result::Result<T, Exc>;
 
@@ -54,12 +68,18 @@ pub fn throw(class: &str, message: &str) -> Exc {
             message.len() as i64,
         )
     };
-    Exc
+    Exc::pending()
 }
 
-/// An owned reference to an rscl value.
+/// An owned reference to an rscl value. It must stay on the thread rscl called the
+/// library on (it is neither `Send` nor `Sync`): the runtime's collector and its
+/// pending-exception slot only know about threads the runtime itself started.
 #[repr(transparent)]
-pub struct Val(u64);
+pub struct Val(u64, std::marker::PhantomData<*const ()>);
+
+const fn val(bits: u64) -> Val {
+    Val(bits, std::marker::PhantomData)
+}
 
 impl Val {
     /// Wrap raw bits, taking over one reference.
@@ -68,7 +88,7 @@ impl Val {
     /// `bits` must be a value word the caller owns one reference to (as returned by
     /// an `RtApi` function that hands out `+1` results).
     pub unsafe fn from_raw(bits: u64) -> Val {
-        Val(bits)
+        val(bits)
     }
     pub fn into_raw(self) -> u64 {
         let b = self.0;
@@ -79,7 +99,7 @@ impl Val {
         self.0
     }
     pub fn nil() -> Val {
-        Val(api().nil)
+        val(api().nil)
     }
     pub fn is_nil(&self) -> bool {
         unsafe { (api().is_nil)(self.0) != 0 }
@@ -132,7 +152,7 @@ impl Val {
     }
     /// `pr-str`.
     pub fn pr_str(&self) -> String {
-        let s = unsafe { Val((api().pr_str)(self.0)) };
+        let s = unsafe { val((api().pr_str)(self.0)) };
         s.as_str().unwrap_or("").to_string()
     }
     /// Materialise a seqable value as a vector of owned elements.
@@ -140,20 +160,22 @@ impl Val {
         let v = check(unsafe { (api().to_vector)(self.0) })?;
         let n = unsafe { (api().vector_len)(v.0) };
         Ok((0..n)
-            .map(|i| unsafe { Val((api().vector_get)(v.0, i)) })
+            .map(|i| unsafe { val((api().vector_get)(v.0, i)) })
             .collect())
     }
     pub fn vector(items: Vec<Val>) -> Val {
-        let raw: Vec<u64> = items.into_iter().map(Val::into_raw).collect();
-        let v = unsafe { Val((api().vector_new)(raw.as_ptr(), raw.len() as i64)) };
-        for r in raw {
-            unsafe { (api().release)(r) }; // vector_new retained its elements
+        // `vector_new` retains its elements; `items` releases its own references
+        // when it drops. `Val` is a transparent `u64`.
+        unsafe {
+            val((api().vector_new)(
+                items.as_ptr() as *const u64,
+                items.len() as i64,
+            ))
         }
-        v
     }
     pub fn keyword(ns: Option<&str>, name: &str) -> Val {
         unsafe {
-            Val((api().keyword_new)(
+            val((api().keyword_new)(
                 ns.map_or(std::ptr::null(), str::as_ptr),
                 ns.map_or(0, |s| s.len() as i64),
                 name.as_ptr(),
@@ -162,23 +184,23 @@ impl Val {
         }
     }
     pub fn string(s: &str) -> Val {
-        unsafe { Val((api().string_new)(s.as_ptr(), s.len() as i64)) }
+        unsafe { val((api().string_new)(s.as_ptr(), s.len() as i64)) }
     }
     pub fn int(n: i64) -> Val {
-        unsafe { Val((api().int_new)(n)) }
+        unsafe { val((api().int_new)(n)) }
     }
     pub fn double(d: f64) -> Val {
-        unsafe { Val((api().double_new)(d)) }
+        unsafe { val((api().double_new)(d)) }
     }
     pub fn boolean(b: bool) -> Val {
-        unsafe { Val((api().bool_new)(b as i32)) }
+        unsafe { val((api().bool_new)(b as i32)) }
     }
 }
 
 impl Clone for Val {
     fn clone(&self) -> Val {
         unsafe { (api().retain)(self.0) };
-        Val(self.0)
+        val(self.0)
     }
 }
 
@@ -189,7 +211,11 @@ impl Drop for Val {
 }
 
 fn check(r: u64) -> Result<Val> {
-    if r == api().exc { Err(Exc) } else { Ok(Val(r)) }
+    if r == api().exc {
+        Err(Exc::pending())
+    } else {
+        Ok(val(r))
+    }
 }
 
 /// Convert an rscl argument into a Rust value. `'a` is the lifetime of the argument,
@@ -308,15 +334,31 @@ impl<'a, V: for<'b> FromVal<'b>> FromVal<'a> for HashMap<String, V> {
         if v.is_nil() {
             return Ok(HashMap::new());
         }
+        // `map_entries` gives a vector of `[key value]` vectors: read it in place.
         let entries = check(unsafe { (api().map_entries)(v.0) })?;
-        let mut out = HashMap::new();
-        for e in entries.to_vec()? {
-            let kv = e.to_vec()?;
-            let key = match kv[0].as_str().or_else(|| kv[0].named()) {
-                Some(k) => k.to_string(),
-                None => return cast_err(&kv[0], what, "String or Keyword key"),
+        let n = unsafe { (api().vector_len)(entries.0) };
+        let mut out = HashMap::with_capacity(n.max(0) as usize);
+        for i in 0..n {
+            let (k, x) = unsafe {
+                let e = val((api().vector_get)(entries.0, i));
+                (
+                    val((api().vector_get)(e.0, 0)),
+                    val((api().vector_get)(e.0, 1)),
+                )
             };
-            out.insert(key, V::from_val(&kv[1], what)?);
+            let key = match k.as_str() {
+                Some(s) => s.to_string(),
+                // A keyword or symbol with its namespace (`user/id`), so distinct
+                // keys stay distinct.
+                None if k.named().is_some() => k.pr_str().trim_start_matches(':').to_string(),
+                None => return cast_err(&k, what, "String or Keyword key"),
+            };
+            if out.insert(key, V::from_val(&x, what)?).is_some() {
+                return Err(throw(
+                    "IllegalArgumentException",
+                    &format!("{what}: two keys of the map have the same name"),
+                ));
+            }
         }
         Ok(out)
     }
@@ -349,7 +391,13 @@ impl IntoVal for u32 {
 }
 impl IntoVal for usize {
     fn into_val(self) -> Result<Val> {
-        Ok(Val::int(self as i64))
+        match i64::try_from(self) {
+            Ok(n) => Ok(Val::int(n)),
+            Err(_) => Err(throw(
+                "IllegalArgumentException",
+                &format!("Value out of range for long: {self}"),
+            )),
+        }
     }
 }
 impl IntoVal for f64 {
@@ -397,16 +445,18 @@ impl<T: IntoVal> IntoVal for Vec<T> {
 /// Keys stay strings, so a map round-trips through Rust unchanged.
 impl<V: IntoVal> IntoVal for HashMap<String, V> {
     fn into_val(self) -> Result<Val> {
-        let mut raw: Vec<u64> = Vec::with_capacity(self.len() * 2);
+        // Owned `Val`s: a conversion that fails part-way releases what was built.
+        let mut kvs: Vec<Val> = Vec::with_capacity(self.len() * 2);
         for (k, v) in self {
-            raw.push(Val::string(&k).into_raw());
-            raw.push(v.into_val()?.into_raw());
+            kvs.push(Val::string(&k));
+            kvs.push(v.into_val()?);
         }
-        let m = unsafe { Val((api().map_new)(raw.as_ptr(), raw.len() as i64)) };
-        for r in raw {
-            unsafe { (api().release)(r) };
-        }
-        Ok(m)
+        Ok(unsafe {
+            val((api().map_new)(
+                kvs.as_ptr() as *const u64,
+                kvs.len() as i64,
+            ))
+        })
     }
 }
 /// `Err(message)` becomes a `RuntimeException`.
@@ -435,16 +485,29 @@ impl<T> std::ops::Deref for Native<T> {
     }
 }
 
-unsafe extern "C" fn drop_native<T>(data: *mut c_void) {
-    unsafe { drop(Box::from_raw(data as *mut Native<T>)) }
+/// What a native value's payload points at: the object behind its `TypeId`, which
+/// is what identifies the type (two types can share a `type_name`).
+#[repr(C)]
+struct NativeBox<T> {
+    id: std::any::TypeId,
+    value: Native<T>,
 }
 
-impl<T: 'static> IntoVal for Native<T> {
+unsafe extern "C" fn drop_native<T>(data: *mut c_void) {
+    unsafe { drop(Box::from_raw(data as *mut NativeBox<T>)) }
+}
+
+/// The payload is shared with every rscl thread that gets hold of the value, and is
+/// dropped on whichever releases it last: it must be `Send + Sync`.
+impl<T: Send + Sync + 'static> IntoVal for Native<T> {
     fn into_val(self) -> Result<Val> {
         let name = std::any::type_name::<T>();
-        let data = Box::into_raw(Box::new(self)) as *mut c_void;
+        let data = Box::into_raw(Box::new(NativeBox {
+            id: std::any::TypeId::of::<T>(),
+            value: self,
+        })) as *mut c_void;
         Ok(unsafe {
-            Val((api().native_new)(
+            val((api().native_new)(
                 name.as_ptr(),
                 name.len() as i64,
                 lib_token(),
@@ -454,14 +517,20 @@ impl<T: 'static> IntoVal for Native<T> {
         })
     }
 }
-impl<'a, T: 'static> FromVal<'a> for &'a Native<T> {
+impl<'a, T: Send + Sync + 'static> FromVal<'a> for &'a Native<T> {
     fn from_val(v: &'a Val, what: &str) -> Result<Self> {
         let name = std::any::type_name::<T>();
         let p = unsafe { (api().native_get)(v.0, name.as_ptr(), name.len() as i64, lib_token()) };
         if p.is_null() {
             return cast_err(v, what, name);
         }
-        Ok(unsafe { &*(p as *const Native<T>) })
+        // Same library and same name; the `TypeId` (first field of every payload
+        // this library creates) settles that it is the same type.
+        let id = unsafe { *(p as *const std::any::TypeId) };
+        if id != std::any::TypeId::of::<T>() {
+            return cast_err(v, what, name);
+        }
+        Ok(unsafe { &(*(p as *const NativeBox<T>)).value })
     }
 }
 
@@ -494,7 +563,8 @@ pub unsafe fn register(api: *const RtApi, ns: &str, exports: &[Export]) -> i32 {
                 name.as_ptr(),
                 name.len() as i64,
                 e.entry,
-                1u64 << e.arity,
+                // `exports!` rejects 64 or more parameters at compile time.
+                1u64.checked_shl(e.arity as u32).unwrap_or(0),
                 -1,
             );
         }
@@ -545,7 +615,7 @@ fn wrap_borrowed(
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(args))) {
         Ok(Ok(v)) => v.into_raw(),
-        Ok(Err(Exc)) => api().exc,
+        Ok(Err(_)) => api().exc,
         Err(payload) => {
             let msg = payload
                 .downcast_ref::<&str>()
@@ -596,11 +666,16 @@ macro_rules! exports {
         $( $(#[$meta])* pub fn $name($($arg: $ty),*) $(-> $ret)? $body )*
 
         #[doc(hidden)]
+        #[allow(deprecated, dead_code, clippy::items_after_statements)]
         pub mod __rscl_exports {
             use super::*;
             $(
+                // The export's attributes apply to its wrapper too (`#[cfg(..)]`
+                // removes both).
+                $(#[$meta])*
                 pub unsafe extern "C" fn $name(_f: *const ::std::ffi::c_void, argc: i64, argv: *const u64, owned: u64) -> u64 {
                     const ARITY: i64 = $crate::__count!($($arg)*);
+                    const _: () = assert!(ARITY < 64, "an export takes at most 63 parameters");
                     unsafe { $crate::wrap(stringify!($name), argc, argv, owned, ARITY, |args| {
                         #[allow(unused_variables, unused_mut)]
                         let mut i = 0usize;
@@ -613,9 +688,24 @@ macro_rules! exports {
                     }) }
                 }
             )*
-            pub static EXPORTS: &[$crate::Export] = &[
-                $( $crate::Export { name: stringify!($name), entry: $name, arity: $crate::__count!($($arg)*) as u64 }, )*
-            ];
+            pub fn exports() -> ::std::vec::Vec<$crate::Export> {
+                let mut all = ::std::vec::Vec::new();
+                $(
+                    {
+                        // Used when the export's attributes remove it: the inner
+                        // `__rscl_push` below, when present, shadows this one.
+                        fn __rscl_push(_all: &mut ::std::vec::Vec<$crate::Export>) {}
+                        {
+                            $(#[$meta])*
+                            fn __rscl_push(all: &mut ::std::vec::Vec<$crate::Export>) {
+                                all.push($crate::Export { name: stringify!($name), entry: $name, arity: $crate::__count!($($arg)*) as u64 });
+                            }
+                            __rscl_push(&mut all);
+                        }
+                    }
+                )*
+                all
+            }
         }
 
         /// Entry point the rscl runtime calls after `load-native`.
@@ -624,7 +714,7 @@ macro_rules! exports {
         /// `api` must be null or the runtime's static `RtApi` table.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rscl_module_register(api: *const $crate::RtApi) -> i32 {
-            unsafe { $crate::register(api, $ns, __rscl_exports::EXPORTS) }
+            unsafe { $crate::register(api, $ns, &__rscl_exports::exports()) }
         }
     };
 }

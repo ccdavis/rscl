@@ -365,6 +365,13 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
                     }
                 }
                 None if x.is_nil() => {}
+                // Any other map (sorted, record): its entries, one by one.
+                Some(Kind::SortedMap | Kind::Instance) if is_map_like(&x) => {
+                    for e in to_vec(&x)? {
+                        let e = &vector::get(&e).v;
+                        map::put(&mut m, e[0].clone(), e[1].clone());
+                    }
+                }
                 _ => return err(ILLEGAL_ARGUMENT, "Vector arg to map conj must be a pair"),
             }
             Ok(with_meta_of(coll, map::new(m)))
@@ -425,11 +432,8 @@ pub fn get(coll: &Value, k: &Value, not_found: Option<&Value>) -> RtResult<Value
     Ok(match coll.kind() {
         Some(Kind::Map) => map::get(coll).m.get(k).cloned().unwrap_or_else(nf),
         Some(Kind::Set) => {
-            if set::get(coll).s.contains(k) {
-                k.clone()
-            } else {
-                nf()
-            }
+            // The element as the set holds it (`1` for a lookup with `1N`).
+            set::stored(&set::get(coll).s, k).unwrap_or_else(nf)
         }
         Some(Kind::Vector) => match k.int_value() {
             Some(i) if i >= 0 => vector::get(coll)
@@ -646,7 +650,11 @@ pub fn contains(coll: &Value, k: &Value) -> RtResult<bool> {
 
 pub fn find(coll: &Value, k: &Value) -> RtResult<Value> {
     Ok(match coll.kind() {
-        Some(Kind::Map) => map::get(coll).m.get(k).map_or(Value::NIL, |v| entry(k, v)),
+        // The entry as the map holds it (key `1` for a lookup with `1N`).
+        Some(Kind::Map) => map::get(coll)
+            .m
+            .get_key_value(k)
+            .map_or(Value::NIL, |(sk, v)| entry(sk, v)),
         Some(Kind::Vector) => match k.int_value() {
             Some(i) if i >= 0 => vector::get(coll)
                 .v
@@ -819,7 +827,8 @@ pub fn compare(a: &Value, b: &Value) -> RtResult<Ordering> {
             Ok(x.ns().cmp(&y.ns()).then_with(|| x.name().cmp(y.name())))
         }
         (Some(Kind::Vector), Some(Kind::Vector)) => {
-            let (x, y) = (&vector::get(a).v, &vector::get(b).v);
+            // Clones: see `equiv`.
+            let (x, y) = (vector::get(a).v.clone(), vector::get(b).v.clone());
             if x.len() != y.len() {
                 return Ok(x.len().cmp(&y.len()));
             }

@@ -24,6 +24,30 @@ pub fn pr_str_meta(v: &Value) -> String {
     s
 }
 
+/// Does `pr-str` of `v` read back as an equal value?
+fn readable(v: &Value) -> bool {
+    match v.kind() {
+        None => true,
+        Some(
+            Kind::Long
+            | Kind::Double
+            | Kind::BigInt
+            | Kind::String
+            | Kind::Keyword
+            | Kind::Symbol
+            | Kind::Regex,
+        ) => true,
+        Some(Kind::List) => obj::list::get(v).iter().all(readable),
+        Some(Kind::Vector) => obj::vector::get(v).v.iter().all(readable),
+        Some(Kind::Set) => obj::set::get(v).s.iter().all(readable),
+        Some(Kind::Map) => obj::map::get(v)
+            .m
+            .iter()
+            .all(|(k, x)| readable(k) && readable(x)),
+        Some(_) => false,
+    }
+}
+
 pub fn print_str(v: &Value) -> String {
     let mut s = String::new();
     write(&mut s, v, false, 0);
@@ -86,6 +110,9 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
         )
         && let Some(m) = obj::meta(v)
         && obj::map::as_map(&m).is_some_and(|m| !m.m.is_empty())
+        // Metadata holding a live object (a fn, an atom) cannot be read back: the
+        // constant is embedded without it.
+        && readable(&m)
     {
         out.push('^');
         write(out, &m, true, depth + 1);
@@ -118,13 +145,21 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
         }
         Kind::Vector => {
             out.push('[');
-            write_items(out, obj::vector::get(v).v.iter(), readably, depth);
+            // An O(1) clone: printing an element can run rscl code (a lazy seq, a
+            // print method), and a collection that happens meanwhile may replace
+            // the node tree of the vector itself.
+            let items = obj::vector::get(v).v.clone();
+            write_items(out, items.iter(), readably, depth);
             out.push(']');
         }
-        Kind::Map => write_entries(out, obj::map::get(v).m.iter(), readably, depth),
+        Kind::Map => {
+            let m = obj::map::get(v).m.clone();
+            write_entries(out, m.iter(), readably, depth)
+        }
         Kind::Set => {
             out.push_str("#{");
-            write_items(out, obj::set::get(v).s.iter(), readably, depth);
+            let items = obj::set::get(v).s.clone();
+            write_items(out, items.iter(), readably, depth);
             out.push('}');
         }
         Kind::Fn => {
@@ -220,20 +255,14 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
             out.push(']');
         }
         Kind::Instance => write_instance(out, v, readably, depth),
-        Kind::SortedMap => write_entries(
-            out,
-            obj::sorted::map_get(v).m.iter().map(|(k, val)| (&k.0, val)),
-            readably,
-            depth,
-        ),
+        Kind::SortedMap => {
+            let m = obj::sorted::map_get(v).m.clone();
+            write_entries(out, m.iter().map(|(k, val)| (&k.0, val)), readably, depth)
+        }
         Kind::SortedSet => {
             out.push_str("#{");
-            write_items(
-                out,
-                obj::sorted::set_get(v).s.iter().map(|k| &k.0),
-                readably,
-                depth,
-            );
+            let items = obj::sorted::set_get(v).s.clone();
+            write_items(out, items.iter().map(|k| &k.0), readably, depth);
             out.push('}');
         }
     }

@@ -153,15 +153,13 @@ impl Jit {
 
     /// Read and evaluate every form in `src`, returning the last value.
     pub fn eval_str(&mut self, src: &str) -> Result<Value, EvalError> {
-        // With a file id, so forms carry positions like those of the REPL and of
-        // source files (stack-trace lines, source order of map literals).
-        let file = rscl_runtime::pos::intern_file("<eval>");
-        let mut reader = rscl_runtime::reader::Reader::new(src, &rscl_runtime::reader::DefaultEnv)
-            .with_file(file);
+        // With a file label, so forms carry positions like those of the REPL and of
+        // source files (stack-trace lines).
         let mut last = Value::NIL;
-        while let Some(form) = reader.read()? {
+        crate::boot::each_form(src, "<eval>", |form| {
             last = self.eval(&form)?;
-        }
+            Ok(())
+        })?;
         Ok(last)
     }
 }

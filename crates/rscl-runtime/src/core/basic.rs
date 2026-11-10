@@ -26,11 +26,15 @@ pub fn emit(s: &str) {
 builtins! {
     "=" => fn cf_eq(args) [; 1] {
         let first = &args[0];
-        Ok(Value::bool(args[1..].iter().all(|a| crate::equiv::equiv(first, a))))
+        let eq = args[1..].iter().all(|a| crate::equiv::equiv(first, a));
+        if !eq && crate::exc::is_pending() { return Err(crate::exc::Exc); }
+        Ok(Value::bool(eq))
     }
     "not=" => fn cf_not_eq(args) [; 1] {
         let first = &args[0];
-        Ok(Value::bool(!args[1..].iter().all(|a| crate::equiv::equiv(first, a))))
+        let eq = args[1..].iter().all(|a| crate::equiv::equiv(first, a));
+        if !eq && crate::exc::is_pending() { return Err(crate::exc::Exc); }
+        Ok(Value::bool(!eq))
     }
     "identical?" => fn cf_identical_p(args) [2] { Ok(Value::bool(args[0].identical(&args[1]))) }
     "not" => fn cf_not(args) [1] { Ok(Value::bool(!args[0].truthy())) }

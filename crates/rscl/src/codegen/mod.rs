@@ -683,7 +683,7 @@ impl<M: Module> Compiler<M> {
             for (i, a) in f.arities.iter().enumerate() {
                 fc.b.switch_to_block(blocks[i]);
                 fc.b.seal_block(blocks[i]);
-                fc.compile_arity(a, argv, argc, owned)?;
+                fc.compile_arity(a, argv, argc, owned, f.pos)?;
             }
             Ok(())
         })
@@ -3011,7 +3011,14 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
     /// Body of one fn arity: bind params (and rest), compile the body as the recur
     /// target, release owned locals, return.
-    fn compile_arity(&mut self, a: &Arity, argv: Value, argc: Value, owned: Value) -> CResult<()> {
+    fn compile_arity(
+        &mut self,
+        a: &Arity,
+        argv: Value,
+        argc: Value,
+        owned: Value,
+        pos: u32,
+    ) -> CResult<()> {
         let mut vars: Vec<(LocalId, Variable, bool)> = Vec::new();
         let mut bits: Vec<Option<u64>> = Vec::new();
         let mask = self.b.declare_var(types::I64);
@@ -3091,7 +3098,11 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.b.ins().jump(header, &[]);
         self.b.switch_to_block(header);
         // A fn that loops with `recur` must stay interruptible, like a `loop`.
-        self.emit_interrupt_check();
+        if a.has_recur {
+            self.srcloc(pos);
+            self.emit_interrupt_check();
+            self.srcloc(0);
+        }
         self.fn_recur = Some(LoopCtx {
             header,
             vars: vars

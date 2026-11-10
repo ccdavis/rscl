@@ -12,7 +12,7 @@
 use core::ffi::c_void;
 
 /// Bump when `RtApi` changes incompatibly.
-pub const API_VERSION: u32 = 3;
+pub const API_VERSION: u32 = 4;
 
 /// The symbol every bridge library exports.
 pub const REGISTER_SYMBOL: &str = "rscl_module_register";
@@ -97,4 +97,6 @@ pub struct RtApi {
     ),
     /// `pr-str` of a value (+1 string).
     pub pr_str: unsafe extern "C" fn(v: u64) -> u64,
+    /// Drop the calling thread's pending exception, if any.
+    pub exc_clear: unsafe extern "C" fn(),
 }

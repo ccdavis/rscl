@@ -286,6 +286,11 @@ impl<'a> Reader<'a> {
     }
 
     fn read_form(&mut self, c: char) -> ReadResult<Value> {
+        // The reader recurses per nesting level: refuse input that would run the
+        // native stack out instead of crashing.
+        if crate::native::stack_low() {
+            return Err(self.syntax("Forms are nested too deeply"));
+        }
         match c {
             '(' => {
                 self.bump();
@@ -401,7 +406,9 @@ impl<'a> Reader<'a> {
             }
             m.insert(kv[0].clone(), kv[1].clone());
         }
-        Ok(map::new(m))
+        // The source order of the entries, for the compiler and syntax-quote.
+        let keys: Vec<Value> = items.iter().step_by(2).cloned().collect();
+        Ok(map::new_ordered(m, keys))
     }
 
     fn read_token(&mut self) -> String {
@@ -586,15 +593,15 @@ impl<'a> Reader<'a> {
                 self.bump();
                 let items = self.read_seq('}')?;
                 let mut s = set::empty_set();
-                for x in items {
-                    if s.contains(&x) {
+                for x in &items {
+                    if s.contains(x) {
                         return Err(
-                            self.syntax(format!("Duplicate key: {}", crate::printer::pr_str(&x)))
+                            self.syntax(format!("Duplicate key: {}", crate::printer::pr_str(x)))
                         );
                     }
-                    s.insert(x);
+                    s.insert(x.clone());
                 }
-                Ok(set::new(s))
+                Ok(set::new_ordered(s, items))
             }
             '\'' => {
                 self.bump();
@@ -786,9 +793,9 @@ impl<'a> Reader<'a> {
             }
             Some(Kind::Map) => {
                 let mut items = Vec::new();
-                for (k, v) in map::get(form).m.iter() {
-                    items.push(k.clone());
-                    items.push(v.clone());
+                for (k, v) in map::ordered_entries(form) {
+                    items.push(k);
+                    items.push(v);
                 }
                 let c = self.sq_concat(&items)?;
                 Ok(list::from_slice(&[
@@ -798,7 +805,7 @@ impl<'a> Reader<'a> {
                 ]))
             }
             Some(Kind::Set) => {
-                let items: Vec<Value> = set::get(form).s.iter().cloned().collect();
+                let items: Vec<Value> = set::ordered_items(form);
                 let c = self.sq_concat(&items)?;
                 Ok(list::from_slice(&[
                     core_sym("apply"),

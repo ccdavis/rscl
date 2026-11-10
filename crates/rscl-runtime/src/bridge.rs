@@ -237,6 +237,10 @@ unsafe extern "C" fn api_pr_str(v: u64) -> u64 {
     string::from_string(crate::printer::pr_str(&borrowed(v))).into_raw()
 }
 
+unsafe extern "C" fn api_exc_clear() {
+    drop(crate::exc::take());
+}
+
 /// The table handed to every bridge library.
 pub static RT_API: RtApi = RtApi {
     version: API_VERSION,
@@ -270,6 +274,7 @@ pub static RT_API: RtApi = RtApi {
     begin_module: api_begin_module,
     register_fn: api_register_fn,
     pr_str: api_pr_str,
+    exc_clear: api_exc_clear,
 };
 
 // ---- loading libraries -------------------------------------------------------------

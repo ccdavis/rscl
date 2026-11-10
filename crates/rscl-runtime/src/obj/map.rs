@@ -84,6 +84,9 @@ pub struct MapObj {
     pub hdr: ObjHeader,
     pub m: Map_,
     pub meta: Value,
+    /// Keys in source order, for a map the reader built (the compiler evaluates a
+    /// literal's entries in that order).
+    pub order: Option<Box<Vec<Value>>>,
 }
 
 pub fn new(m: Map_) -> Value {
@@ -91,7 +94,34 @@ pub fn new(m: Map_) -> Value {
         hdr: ObjHeader::new(Kind::Map),
         m,
         meta: Value::NIL,
+        order: None,
     })
+}
+
+/// A map literal: `keys` is the order its entries were written in.
+pub fn new_ordered(m: Map_, keys: Vec<Value>) -> Value {
+    alloc(MapObj {
+        hdr: ObjHeader::new(Kind::Map),
+        m,
+        meta: Value::NIL,
+        order: Some(Box::new(keys)),
+    })
+}
+
+/// The entries in source order when the map came from the reader, else in the map's
+/// own order.
+pub fn ordered_entries(v: &Value) -> Vec<(Value, Value)> {
+    let o = get(v);
+    if let Some(keys) = &o.order
+        && keys.len() == o.m.len()
+        && let Some(entries) = keys
+            .iter()
+            .map(|k| o.m.get(k).map(|x| (k.clone(), x.clone())))
+            .collect::<Option<Vec<_>>>()
+    {
+        return entries;
+    }
+    o.m.iter().map(|(k, x)| (k.clone(), x.clone())).collect()
 }
 
 /// Associate `k` with `v`. A key equal to one already present keeps the stored key

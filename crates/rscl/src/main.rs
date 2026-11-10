@@ -1,9 +1,8 @@
 //! rscl command line: REPL, `run FILE`, `build FILE -o OUT`, `-e EXPR`.
 use std::io::Write;
 
+use rscl_runtime::exc;
 use rscl_runtime::printer::pr_str;
-use rscl_runtime::reader::{DefaultEnv, Reader};
-use rscl_runtime::{exc, pos};
 
 use rscl::jit::EvalError;
 use rscl::repl;
@@ -226,16 +225,13 @@ fn eval_expr(expr: &str, paths: &[String]) -> i32 {
     if let Err(code) = start_session(None, paths) {
         return code;
     }
-    let file_id = pos::intern_file("<expr>");
-    let mut reader = Reader::new(expr, &DefaultEnv).with_file(file_id);
-    loop {
-        match reader.read() {
-            Ok(Some(form)) => match rscl::session::eval_form(&form) {
-                Ok(v) => println!("{}", pr_str(&v)),
-                Err(e) => return report(&e),
-            },
-            Ok(None) => return EXIT_OK,
-            Err(e) => return report(&EvalError::Read(e)),
-        }
+    let run = rscl::boot::each_form(expr, "<expr>", |form| {
+        let v = rscl::session::eval_form(&form)?;
+        println!("{}", pr_str(&v));
+        Ok(())
+    });
+    match run {
+        Ok(()) => EXIT_OK,
+        Err(e) => report(&e),
     }
 }

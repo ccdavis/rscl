@@ -96,6 +96,36 @@ impl Kind {
 /// # Safety
 /// `p` must point at a live heap object with no remaining references.
 pub(crate) unsafe fn free(p: *mut ObjHeader) {
+    // Freeing an object releases what it holds, which may free more objects: those
+    // are queued and freed from this loop instead of recursively, so dropping a
+    // structure nested millions deep cannot overflow the stack.
+    let Ok(outermost) = FREEING.try_with(|f| !f.replace(true)) else {
+        // The thread's locals are gone (it is exiting): recurse.
+        return unsafe { free_one(p) };
+    };
+    if !outermost {
+        if PENDING_FREE
+            .try_with(|q| q.borrow_mut().push(p as usize))
+            .is_err()
+        {
+            unsafe { free_one(p) };
+        }
+        return;
+    }
+    unsafe { free_one(p) };
+    while let Ok(Some(next)) = PENDING_FREE.try_with(|q| q.borrow_mut().pop()) {
+        unsafe { free_one(next as *mut ObjHeader) };
+    }
+    let _ = FREEING.try_with(|f| f.set(false));
+}
+
+thread_local! {
+    static FREEING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PENDING_FREE: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+unsafe fn free_one(p: *mut ObjHeader) {
     unsafe {
         match (*p).kind {
             Kind::Long => drop(Box::from_raw(p as *mut long::LongObj)),

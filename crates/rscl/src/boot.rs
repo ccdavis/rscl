@@ -7,13 +7,27 @@ use crate::jit::{EvalError, Jit};
 /// Read every form of `core.clj`. Must run with `clojure.core` as the current
 /// namespace so syntax-quote qualifies symbols into it.
 pub fn core_forms() -> Result<Vec<Value>, EvalError> {
-    let file = pos::intern_file("clojure/core.clj");
-    let mut reader = Reader::new(rscl_runtime::CORE_CLJ, &DefaultEnv).with_file(file);
     let mut forms = Vec::new();
-    while let Some(f) = reader.read()? {
+    each_form(rscl_runtime::CORE_CLJ, "clojure/core.clj", |f| {
         forms.push(f);
-    }
+        Ok(())
+    })?;
     Ok(forms)
+}
+
+/// Read `src` form by form, with positions attributed to `file`, handing each form
+/// to `f` before the next one is read (a form may change how later ones read, e.g.
+/// by switching the namespace).
+pub fn each_form(
+    src: &str,
+    file: &str,
+    mut f: impl FnMut(Value) -> Result<(), EvalError>,
+) -> Result<(), EvalError> {
+    let mut reader = Reader::new(src, &DefaultEnv).with_file(pos::intern_file(file));
+    while let Some(form) = reader.read()? {
+        f(form)?;
+    }
+    Ok(())
 }
 
 /// Run `f` with `clojure.core` as the current namespace, restoring the previous one.

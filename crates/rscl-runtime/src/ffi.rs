@@ -217,22 +217,8 @@ pub unsafe extern "C" fn rt_invoke(f: VRef, argc: i64, argv: *const Value, owned
 
 /// Invoke any callable from Rust.
 pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
-    invoke_with(f, args, true)
-}
-
-/// `invoke` from a frame that borrows nothing from the heap across the call (a
-/// thread's or a program's outermost call, `apply`): the collector need not treat it
-/// as a native callback in flight.
-pub fn invoke_root(f: &Value, args: &[Value]) -> RtResult<Value> {
-    // SAFETY: Value and VRef share a layout.
-    let refs = unsafe { std::slice::from_raw_parts(args.as_ptr() as *const VRef, args.len()) };
-    invoke_with(f, refs, false)
-}
-
-fn invoke_with(f: &Value, args: &[VRef], callback: bool) -> RtResult<Value> {
     match f.kind() {
         Some(Kind::Fn) => {
-            let _guard = callback.then(crate::gc::CallbackGuard::new);
             let fo = func::get(f);
             let proto = fo.proto();
             if !proto.accepts(args.len() as i64) {
@@ -342,7 +328,7 @@ pub unsafe extern "C" fn rt_map_from_slice(items: *const Value, n: i64, owned: u
     let mut m = map::empty_map();
     let mut it = unsafe { take_slice(items, n, owned) }.into_iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
-        m.insert(k, v);
+        map::put(&mut m, k, v);
     }
     map::new(m)
 }
@@ -351,7 +337,10 @@ pub unsafe extern "C" fn rt_map_from_slice(items: *const Value, n: i64, owned: u
 pub unsafe extern "C" fn rt_set_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
     let mut s = set::empty_set();
     for x in unsafe { take_slice(items, n, owned) } {
-        s.insert(x);
+        // An equal element already there stays (as `hash-set` does).
+        if !s.contains(&x) {
+            s.insert(x);
+        }
     }
     set::new(s)
 }
@@ -462,7 +451,7 @@ pub unsafe extern "C" fn rt_run_main(v: *const obj::var::VarObj) -> i32 {
         Some(l) => l.to_vec(),
         None => Vec::new(),
     };
-    match invoke_root(&root, &args) {
+    match root.call(&args) {
         Ok(v) => {
             drop(v);
             0

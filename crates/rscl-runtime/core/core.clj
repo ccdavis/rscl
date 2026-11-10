@@ -536,7 +536,7 @@
         sigs (if (vector? (first body)) (list body) body)
         add-implicit (fn [sig] (cons (vec (concat ['&form '&env] (first sig))) (next sig)))]
     `(do (def ~(with-meta name (def-meta name doc attrs sigs {:macro true}))
-           (fn ~name ~@(map add-implicit sigs)))
+           (fn ~@(map add-implicit sigs)))
          (set-macro! (var ~name))
          (var ~name))))
 

@@ -208,8 +208,7 @@ builtins! {
     "apply" => fn cf_apply(args) [; 2] {
         let mut fargs: Vec<Value> = args[1..args.len() - 1].iter().map(|a| a.owned()).collect();
         fargs.extend(coll::to_vec(&args[args.len() - 1])?);
-        // Only owned arguments are held across the call.
-        crate::ffi::invoke_root(&args[0], &fargs)
+        call(&args[0], &fargs)
     }
     "list?" => fn cf_list_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::List))) }
     "vector?" => fn cf_vector_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Vector))) }

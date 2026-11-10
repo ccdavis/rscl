@@ -124,7 +124,7 @@ fn defnative(form: &Value, args: &[Value]) -> CResult<Value> {
 }
 
 /// `(defmacro name doc? attr? [params] body...)` or multi-arity →
-/// `(do (def name (fn* name ([&form &env params...] body...)...)) (set-macro! (var name)))`
+/// `(do (def name (fn* ([&form &env params...] body...)...)) (set-macro! (var name)))`
 fn defmacro(form: &Value, args: &[Value]) -> CResult<Value> {
     let Some(name) = args.first().filter(|a| a.is_kind(Kind::Symbol)) else {
         return fail(form, "First argument to defmacro must be a symbol");
@@ -192,7 +192,8 @@ fn defn(form: &Value, args: &[Value]) -> CResult<Value> {
             format!("defn {} requires a parameter vector", printer::pr_str(name)),
         );
     }
-    let mut f = vec![sym("fn*"), name.clone()];
+    // Unnamed, like the `defn` of core.clj: recursion goes through the var.
+    let mut f = vec![sym("fn*")];
     f.extend_from_slice(rest);
     Ok(lst(&[sym("def"), name.clone(), lst(&f)]))
 }
