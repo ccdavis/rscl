@@ -234,11 +234,19 @@ impl<M: Module> Compiler<M> {
     /// for every `fn*` it contains.
     pub fn compile_unit(&mut self, node: &Node, an: &Analyzer) -> CResult<UnitIds> {
         let mut u = self.new_unit()?;
-        let body = self.compile_body_fn(&mut u, node, &an.locals)?;
-        while let Some((id, f)) = u.pending_fns.pop() {
-            self.compile_fn(&mut u, id, &f, &an.locals)?;
-        }
-        self.finish_unit(&mut u)?;
+        let compiled = (|| {
+            let body = self.compile_body_fn(&mut u, node, &an.locals)?;
+            while let Some((id, f)) = u.pending_fns.pop() {
+                self.compile_fn(&mut u, id, &f, &an.locals)?;
+            }
+            self.compile_init(&mut u)?;
+            Ok(body)
+        })();
+        // Also for a failed unit: functions of it that were already defined refer to
+        // its data, which the module must be able to resolve later.
+        let data = self.define_unit_data(&mut u);
+        let body = compiled?;
+        data?;
         Ok(UnitIds {
             init: u.init_id,
             body,
@@ -322,6 +330,10 @@ impl<M: Module> Compiler<M> {
     /// that may add constants has been compiled).
     fn finish_unit(&mut self, u: &mut UnitCtx) -> CResult<()> {
         self.compile_init(u)?;
+        self.define_unit_data(u)
+    }
+
+    fn define_unit_data(&mut self, u: &mut UnitCtx) -> CResult<()> {
         let mut table = DataDescription::new();
         table.define_zeroinit(8 * u.consts.len().max(1));
         table.set_align(8);
@@ -476,14 +488,26 @@ impl<M: Module> Compiler<M> {
                 &mut self.builtin_ids,
                 flag_id,
             )?;
-            body(&mut fc)?;
-            debug_assert!(
-                fc.cleanup.is_empty(),
-                "owned-temporary stack not empty at exit of {name}"
-            );
-            let config = fc.module.target_config();
-            fc.b.finalize(config);
+            match body(&mut fc) {
+                Ok(()) => {
+                    debug_assert!(
+                        fc.cleanup.is_empty(),
+                        "owned-temporary stack not empty at exit of {name}"
+                    );
+                    let config = fc.module.target_config();
+                    fc.b.finalize(config);
+                    None
+                }
+                Err(e) => Some(e),
+            }
         }
+        .map_or(Ok(()), |e| {
+            // The half-built function is abandoned: the shared builder context still
+            // describes it and must not leak into the next compilation.
+            self.fb_ctx = FunctionBuilderContext::new();
+            self.module.clear_context(&mut ctx);
+            Err(e)
+        })?;
         if self.debug_ir {
             eprintln!("=== IR for {name} ===\n{}", ctx.func.display());
         }
@@ -634,7 +658,12 @@ impl<M: Module> Compiler<M> {
 
             // Arity dispatch.
             let blocks: Vec<Block> = f.arities.iter().map(|_| fc.b.create_block()).collect();
-            for (i, a) in f.arities.iter().enumerate() {
+            // An exact fixed arity wins over the variadic one, whatever the order
+            // they were written in.
+            let mut order: Vec<usize> = (0..f.arities.len()).collect();
+            order.sort_by_key(|&i| f.arities[i].rest.is_some());
+            for i in order {
+                let a = &f.arities[i];
                 let n = a.params.len() as i64;
                 let c = if a.rest.is_some() {
                     fc.b.ins()
@@ -799,7 +828,10 @@ fn max_args(node: &Node) -> usize {
         | Node::TheVar(_)
         | Node::Fn(_)
         | Node::CurrentNs => 0,
-        Node::Def { init, .. } => init.as_ref().map_or(0, |n| max_args(n)),
+        Node::Def { init, meta, .. } => init
+            .as_ref()
+            .map_or(0, |n| max_args(n))
+            .max(meta.as_ref().map_or(0, |n| max_args(n))),
         Node::VarSet { value, .. } => max_args(value),
         Node::If { test, then, else_ } => max_args(test).max(max_args(then)).max(max_args(else_)),
         Node::Do(nodes) => nodes.iter().map(max_args).max().unwrap_or(0),
@@ -2077,7 +2109,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 // (The analyzer already applied `^:dynamic` at compile time; the root
                 // is republished when the flag changes.)
                 if let Some(m) = meta {
-                    let mv = self.compile_const(m)?;
+                    let mv = self.compile(m)?;
                     let mv = self.make_owned_force(mv);
                     self.call_rt(RtFn::VarSetMeta, &[p, mv.val]);
                 }
@@ -2258,7 +2290,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         match t {
             NativeTy::Void => types::INVALID,
             NativeTy::Long | NativeTy::Str | NativeTy::Ptr => types::I64,
-            NativeTy::Int => types::I32,
+            NativeTy::Int | NativeTy::UInt => types::I32,
             NativeTy::Double => types::F64,
             NativeTy::Float => types::F32,
             NativeTy::Bool => types::I8,
@@ -2285,11 +2317,11 @@ impl<'a, M: Module> FnCtx<'a, M> {
         let mut cargs = Vec::with_capacity(ops.len());
         for (op, ty) in ops.iter().zip(params) {
             let v = match ty {
-                NativeTy::Long | NativeTy::Ptr | NativeTy::Int => {
+                NativeTy::Long | NativeTy::Ptr | NativeTy::Int | NativeTy::UInt => {
                     let r = self.call_rt(RtFn::ToLong, &[op.val, scratch_addr]).unwrap();
                     self.check_exc(r);
                     let n = self.b.ins().stack_load(types::I64, types::I64, scratch, 0);
-                    if *ty == NativeTy::Int {
+                    if matches!(ty, NativeTy::Int | NativeTy::UInt) {
                         self.b.ins().ireduce(types::I32, n)
                     } else {
                         n
@@ -2338,6 +2370,11 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 let r = self.b.ins().sextend(types::I64, r);
                 Operand::owned(self.call_rt(RtFn::BoxLong, &[r]).unwrap())
             }
+            NativeTy::UInt => {
+                let r = self.b.inst_results(inst)[0];
+                let r = self.b.ins().uextend(types::I64, r);
+                Operand::owned(self.call_rt(RtFn::BoxLong, &[r]).unwrap())
+            }
             NativeTy::Double => {
                 let r = self.b.inst_results(inst)[0];
                 Operand::owned(self.call_rt(RtFn::BoxDouble, &[r]).unwrap())
@@ -2375,6 +2412,12 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 let k = obj::keyword::get(v);
                 ConstEntry::Keyword(k.ns().map(str::to_string), k.name().to_string())
             }
+            // A symbol with metadata goes through the reader, which restores it.
+            Kind::Symbol
+                if obj::map::as_map(&obj::symbol::get(v).meta).is_some_and(|m| !m.m.is_empty()) =>
+            {
+                ConstEntry::Edn(printer::pr_str_meta(v))
+            }
             Kind::Symbol => {
                 let s = obj::symbol::get(v);
                 ConstEntry::Symbol(s.ns().map(str::to_string), s.name().to_string())
@@ -2386,7 +2429,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
             | Kind::Regex
             | Kind::Cons
             | Kind::LazySeq
-            | Kind::BigInt => ConstEntry::Edn(printer::pr_str(v)),
+            | Kind::BigInt => ConstEntry::Edn(printer::pr_str_meta(v)),
             k => {
                 return Err(internal(format!(
                     "cannot embed a {} as a constant",
@@ -3047,6 +3090,8 @@ impl<'a, M: Module> FnCtx<'a, M> {
         let header = self.b.create_block();
         self.b.ins().jump(header, &[]);
         self.b.switch_to_block(header);
+        // A fn that loops with `recur` must stay interruptible, like a `loop`.
+        self.emit_interrupt_check();
         self.fn_recur = Some(LoopCtx {
             header,
             vars: vars

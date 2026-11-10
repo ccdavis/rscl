@@ -94,6 +94,19 @@ pub fn new(m: Map_) -> Value {
     })
 }
 
+/// Associate `k` with `v`. A key equal to one already present keeps the stored key
+/// (`1` stays `1` when `1N` is added), as in Clojure; only the value is replaced.
+pub fn put(m: &mut Map_, k: Value, v: Value) {
+    match m.entry(k) {
+        imbl::hashmap::Entry::Occupied(mut e) => {
+            e.insert(v);
+        }
+        imbl::hashmap::Entry::Vacant(e) => {
+            e.insert(v);
+        }
+    }
+}
+
 pub fn empty_map() -> Map_ {
     Map_::with_hasher(Hasher)
 }

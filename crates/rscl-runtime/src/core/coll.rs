@@ -24,18 +24,18 @@ builtins! {
     "vec" => fn cf_vec(args) [1] { Ok(vector::from_iter(coll::to_vec(&args[0])?)) }
     "set" => fn cf_set(args) [1] {
         let mut s = set::empty_set();
-        for x in coll::to_vec(&args[0])? { s.insert(x); }
+        for x in coll::to_vec(&args[0])? { if !s.contains(&x) { s.insert(x); } }
         Ok(set::new(s))
     }
     "hash-map" => fn cf_hash_map(args) [; 0] {
         if !args.len().is_multiple_of(2) { return err(ILLEGAL_ARGUMENT, "hash-map requires an even number of arguments"); }
         let mut m = map::empty_map();
-        for kv in args.chunks(2) { m.insert(kv[0].owned(), kv[1].owned()); }
+        for kv in args.chunks(2) { map::put(&mut m, kv[0].owned(), kv[1].owned()); }
         Ok(map::new(m))
     }
     "hash-set" => fn cf_hash_set(args) [; 0] {
         let mut s = set::empty_set();
-        for x in args { s.insert(x.owned()); }
+        for x in args { let x = x.owned(); if !s.contains(&x) { s.insert(x); } }
         Ok(set::new(s))
     }
     "count" => fn cf_count(args; owned = taker) [1] { Ok(Value::int(coll::count_owned(taker.take(0))?)) }
@@ -154,7 +154,7 @@ builtins! {
         for x in coll::iter_owned(taker.take(0))? {
             let x = x?;
             let n = m.get(&x).and_then(|v| v.as_int()).unwrap_or(0);
-            m.insert(x, Value::int(n + 1));
+            map::put(&mut m, x, Value::int(n + 1));
         }
         Ok(map::new(m))
     }
@@ -163,7 +163,8 @@ builtins! {
         for x in coll::to_vec(&args[1])? {
             let k = call(&args[0], std::slice::from_ref(&x))?;
             let cur = m.get(&k).cloned().unwrap_or_else(|| vector::new(vector::Vec_::new()));
-            m.insert(k, coll::conj(&cur, x)?);
+            let v = coll::conj(&cur, x)?;
+            map::put(&mut m, k, v);
         }
         Ok(map::new(m))
     }
@@ -180,49 +181,35 @@ builtins! {
         let ks = coll::to_vec(&args[0])?;
         let vs = coll::to_vec(&args[1])?;
         let mut m = map::empty_map();
-        for (k, v) in ks.into_iter().zip(vs) { m.insert(k, v); }
+        for (k, v) in ks.into_iter().zip(vs) { map::put(&mut m, k, v); }
         Ok(map::new(m))
     }
     "compare" => fn cf_compare(args) [2] {
         Ok(Value::int(match coll::compare(&args[0], &args[1])? { Ordering::Less => -1, Ordering::Equal => 0, Ordering::Greater => 1 }))
     }
     "sort" => fn cf_sort(args) [1, 2] {
-        let mut items = coll::to_vec(&args[args.len() - 1])?;
-        let mut failure: Option<crate::exc::Exc> = None;
-        if args.len() == 2 {
-            items.sort_by(|a, b| {
-                if failure.is_some() { return Ordering::Equal; }
-                compare_with(&args[0], a, b).unwrap_or_else(|e| { failure = Some(e); Ordering::Equal })
-            });
+        let items = coll::to_vec(&args[args.len() - 1])?;
+        let items = if args.len() == 2 {
+            merge_sort(items, &mut |a, b| compare_with(&args[0], a, b))?
         } else {
-            items.sort_by(|a, b| {
-                if failure.is_some() { return Ordering::Equal; }
-                coll::compare(a, b).unwrap_or_else(|e| { failure = Some(e); Ordering::Equal })
-            });
-        }
-        if let Some(e) = failure { return Err(e); }
+            merge_sort(items, &mut |a, b| coll::compare(a, b))?
+        };
         Ok(if items.is_empty() { Value::NIL } else { list::from_iter(items) })
     }
     "sort-by" => fn cf_sort_by(args) [2, 3] {
         let items = coll::to_vec(&args[args.len() - 1])?;
         let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
         for x in items { keyed.push((call(&args[0], std::slice::from_ref(&x))?, x)); }
-        let mut failure: Option<crate::exc::Exc> = None;
-        keyed.sort_by(|(ka, _), (kb, _)| {
-            if failure.is_some() { return Ordering::Equal; }
-            if args.len() == 3 {
-                compare_with(&args[1], ka, kb).unwrap_or_else(|e| { failure = Some(e); Ordering::Equal })
-            } else {
-                coll::compare(ka, kb).unwrap_or_else(|e| { failure = Some(e); Ordering::Equal })
-            }
-        });
-        if let Some(e) = failure { return Err(e); }
+        let keyed = merge_sort(keyed, &mut |(ka, _), (kb, _)| {
+            if args.len() == 3 { compare_with(&args[1], ka, kb) } else { coll::compare(ka, kb) }
+        })?;
         Ok(if keyed.is_empty() { Value::NIL } else { list::from_iter(keyed.into_iter().map(|(_, x)| x).collect::<Vec<_>>()) })
     }
     "apply" => fn cf_apply(args) [; 2] {
         let mut fargs: Vec<Value> = args[1..args.len() - 1].iter().map(|a| a.owned()).collect();
         fargs.extend(coll::to_vec(&args[args.len() - 1])?);
-        call(&args[0], &fargs)
+        // Only owned arguments are held across the call.
+        crate::ffi::invoke_root(&args[0], &fargs)
     }
     "list?" => fn cf_list_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::List))) }
     "vector?" => fn cf_vector_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Vector))) }
@@ -235,6 +222,38 @@ builtins! {
     "seqable?" => fn cf_seqable_p(args) [1] { Ok(Value::bool(coll::is_seqable(&args[0]))) }
     "ifn?" => fn cf_ifn_p(args) [1] { Ok(Value::bool(matches!(args[0].kind(), Some(Kind::Fn | Kind::Keyword | Kind::Map | Kind::Set | Kind::Vector | Kind::Var | Kind::SortedMap | Kind::SortedSet)))) }
     "hash" => fn cf_hash(args) [1] { Ok(Value::int((crate::equiv::hasheq(&args[0]) as i64) & 0x7fff_ffff)) }
+}
+
+/// A stable merge sort with a fallible comparator. Unlike `slice::sort_by` it accepts
+/// any comparator (a user fn need not be a total order; the result is then merely
+/// some permutation) and stops at the first error.
+fn merge_sort<T>(
+    mut items: Vec<T>,
+    cmp: &mut dyn FnMut(&T, &T) -> RtResult<Ordering>,
+) -> RtResult<Vec<T>> {
+    if items.len() < 2 {
+        return Ok(items);
+    }
+    let right = items.split_off(items.len() / 2);
+    let left = merge_sort(items, cmp)?;
+    let right = merge_sort(right, cmp)?;
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    let (mut l, mut r) = (left.into_iter().peekable(), right.into_iter().peekable());
+    loop {
+        match (l.peek(), r.peek()) {
+            (Some(a), Some(b)) => {
+                // Stable: the right element goes first only when strictly smaller.
+                if cmp(b, a)? == Ordering::Less {
+                    out.extend(r.next());
+                } else {
+                    out.extend(l.next());
+                }
+            }
+            (Some(_), None) => out.extend(l.by_ref()),
+            (None, Some(_)) => out.extend(r.by_ref()),
+            (None, None) => return Ok(out),
+        }
+    }
 }
 
 /// Order two values with a user comparator: an integer result is a signum, a boolean

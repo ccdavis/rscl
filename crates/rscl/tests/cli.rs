@@ -174,3 +174,17 @@ fn heap_limit_crossed_by_the_last_form_is_reported() {
     assert!(err.contains("OutOfMemoryError"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_fn_that_loops_with_recur_reaches_safepoints() {
+    // Without a check at the fn's recur header the heap limit is never noticed.
+    let out = rscl(
+        &[
+            "-e",
+            "(defn grow [acc] (recur (conj acc (str \"x\")))) \
+             (println (try (grow []) (catch OutOfMemoryError e :oom)))",
+        ],
+        &[("RSCL_MAX_HEAP_MB", "64")],
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains(":oom"));
+}

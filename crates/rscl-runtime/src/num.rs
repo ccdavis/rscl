@@ -182,11 +182,14 @@ pub fn div(a: Num, b: Num) -> RtResult<Num> {
 pub fn quot(a: Num, b: Num) -> RtResult<Num> {
     Ok(match (a, b) {
         (a, b) if is_double(&a, &b) => {
-            let q = f(&a) / f(&b);
+            let (x, y) = (f(&a), f(&b));
+            let q = x / y;
             if q.is_finite() {
                 Num::D(q.trunc())
-            } else {
+            } else if y == 0.0 {
                 return err(ARITHMETIC, "Divide by zero");
+            } else {
+                return err(ARITHMETIC, "Infinite or NaN");
             }
         }
         (Num::I(_), Num::I(0)) => return err(ARITHMETIC, "Divide by zero"),

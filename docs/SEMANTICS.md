@@ -48,6 +48,15 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 - Redefinition (`def` again) is visible to every caller immediately: calls go through
   the var's root.
 
+- `defn` leaves the fn unnamed, as Clojure does: a recursive call goes through the
+  var, so it sees a redefinition (`(def fib (memoize fib))`). The fn is still shown
+  under the var's name in stack traces. `(fn name [..] ..)` binds `name` to the fn
+  itself.
+- Map and set literals evaluate their parts in source order. Metadata on a `def`
+  name and on collection literals is evaluated (`^{:doc (str "a" "b")}`); a `:tag`
+  symbol is kept as written.
+- With several arities, an exact fixed arity wins over the variadic one.
+
 ## Exceptions
 
 - Thrown values propagate as an `EXC` sentinel return checked after every call; the
@@ -278,9 +287,13 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   `(gc)` (which returns the number of objects freed; `(gc-count)` counts
   collections), trial deletion runs from the candidates with every other thread
   stopped at a safepoint. Candidates found live stay under watch for a few
-  collections, then drop out until they change again. A persistent collection on
+  collections, then drop out until they change again, unless something in their
+  own graph refers back to them (then they stay, since the cycle can die without
+  the candidate itself changing). A persistent collection on
   the way is counted through only when it is the sole owner of its node tree (the
-  collector rebuilds it, which can unshare structure); a collection with more than
+  collector rebuilds it, which can unshare structure; it does not do so while a
+  native fn that called back into rscl code is on some thread's stack, since that
+  fn may be iterating the collection, and runs again once none is); a collection with more than
   one reference is treated as holding its contents from outside. Cycles through a
   native object's payload are not seen. A thread stuck in a long native call delays
   a collection; `(gc)` throws if the others cannot be stopped within 200 ms.

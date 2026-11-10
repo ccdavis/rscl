@@ -215,7 +215,8 @@ pub fn hasheq(v: &Value) -> u64 {
         Kind::BigInt => {
             mix64(hash_bytes(&obj::bigint::get(v).to_signed_bytes_le()) ^ 0xb16b_0000_0000_0001)
         }
-        Kind::Double => mix64(obj::double::get(v).to_bits() ^ 0xd0d0),
+        // `+ 0.0` turns -0.0 into 0.0: the two are `=`, so they hash alike.
+        Kind::Double => mix64((obj::double::get(v) + 0.0).to_bits() ^ 0xd0d0),
         Kind::String => mix64(hash_bytes(obj::string::get(v).as_bytes())),
         Kind::Symbol => {
             let s = obj::symbol::get(v);

@@ -114,7 +114,15 @@ pub fn build(o: &BuildOptions) -> Result<(), BuildError> {
     crate::session::eval_source(&src, &path)?;
     let bytes = crate::session::finish_aot()?;
 
-    let obj_path = o.output.with_extension("o");
+    // `--keep-obj` leaves `OUT.o`; otherwise a private name, so an unrelated object
+    // file beside the output is neither overwritten nor deleted.
+    let obj_path = if o.keep_obj {
+        o.output.with_extension("o")
+    } else {
+        let mut name = o.output.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".rscl-{}.o", std::process::id()));
+        o.output.with_file_name(name)
+    };
     std::fs::write(&obj_path, &bytes)
         .map_err(|e| BuildError::Io(format!("cannot write {}: {e}", obj_path.display())))?;
     let result = link(&obj_path, &o.output, o);

@@ -162,6 +162,12 @@ pub fn request_interrupt() {
     rscl_interrupt_flag.store(1, Ordering::Release);
 }
 
+/// Forget a Ctrl-C nobody consumed (the REPL, before it evaluates the next input).
+pub fn clear_ctrl_c() {
+    CTRL_C.store(false, Ordering::Release);
+    refresh_flag();
+}
+
 pub fn ctrl_c_pending() -> bool {
     CTRL_C.load(Ordering::Acquire)
 }

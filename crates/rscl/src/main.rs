@@ -52,7 +52,10 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
     let args = &args[..];
     match args.first().map(String::as_str) {
         None => Ok(Cmd::Repl { paths }),
-        Some("--help" | "-h") => Err(USAGE.to_string()),
+        Some("--help" | "-h") => {
+            println!("{USAGE}");
+            std::process::exit(EXIT_OK);
+        }
         Some("--version" | "-V") => {
             println!("rscl {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(EXIT_OK);

@@ -151,7 +151,9 @@ fn defmacro(form: &Value, args: &[Value]) -> CResult<Value> {
         }
         out
     };
-    let mut f = vec![sym("fn*"), name.clone()];
+    // Unnamed: recursion goes through the var (the analyzer still displays the fn
+    // under the var's name).
+    let mut f = vec![sym("fn*")];
     for a in &arities {
         let Some(params) = vector::as_vec(&a[0]) else {
             return fail(&a[0], "defmacro requires a parameter vector");

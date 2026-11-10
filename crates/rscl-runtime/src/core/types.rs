@@ -176,7 +176,7 @@ builtins! {
         let mut ext = map::empty_map();
         for (k, v) in entries {
             if !t.field_kws.iter().any(|fk| fk.identical(&k)) {
-                ext.insert(k, v);
+                map::put(&mut ext, k, v);
             }
         }
         let ext = if ext.is_empty() { Value::NIL } else { map::new(ext) };
@@ -435,6 +435,8 @@ fn set_ref_meta(r: &Value, m: Value) -> RtResult<()> {
         }
         Some(Kind::Atom) => {
             atom::get(r).set_meta(m);
+            // Metadata can close a cycle like the value can.
+            crate::gc::note_write(r);
             Ok(())
         }
         _ => err(

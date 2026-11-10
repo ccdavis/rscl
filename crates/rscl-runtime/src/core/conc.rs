@@ -32,15 +32,15 @@ pub fn join_all() {
         for h in handles {
             // Ctrl-C while waiting gives up on them: the process exits anyway.
             while !h.is_finished() {
+                if crate::native::ctrl_c_pending() {
+                    eprintln!("interrupted: not waiting for running futures");
+                    return;
+                }
                 // The main thread may have crossed the heap limit in its last form.
                 if crate::native::check_interrupt().is_err() {
                     let e = crate::exc::take().unwrap_or(Value::NIL);
                     eprintln!("Uncaught exception: {}", crate::exc::format_exception(&e));
                     std::process::exit(1);
-                }
-                if crate::native::ctrl_c_pending() {
-                    eprintln!("interrupted: not waiting for running futures");
-                    return;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -81,7 +81,7 @@ pub fn future_call(f: Value) -> RtResult<Value> {
             crate::native::set_current_future(Some(fut2.clone()));
             let p = pending::get(&fut2);
             if !p.cancel.load(std::sync::atomic::Ordering::Acquire) {
-                match f.call(&[]) {
+                match crate::ffi::invoke_root(&f, &[]) {
                     Ok(v) => {
                         p.deliver(v);
                     }

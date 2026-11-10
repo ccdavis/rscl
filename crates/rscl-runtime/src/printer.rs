@@ -11,6 +11,19 @@ pub fn pr_str(v: &Value) -> String {
     s
 }
 
+thread_local! {
+    static PRINT_META: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `pr_str` with `^{...}` before every symbol and collection that has metadata, so
+/// reading the text back restores it (compiled constants).
+pub fn pr_str_meta(v: &Value) -> String {
+    PRINT_META.with(|p| p.set(true));
+    let s = pr_str(v);
+    PRINT_META.with(|p| p.set(false));
+    s
+}
+
 pub fn print_str(v: &Value) -> String {
     let mut s = String::new();
     write(&mut s, v, false, 0);
@@ -66,6 +79,18 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
         out.push_str("#<?>");
         return;
     };
+    if PRINT_META.with(|p| p.get())
+        && matches!(
+            kind,
+            Kind::Symbol | Kind::List | Kind::Vector | Kind::Map | Kind::Set
+        )
+        && let Some(m) = obj::meta(v)
+        && obj::map::as_map(&m).is_some_and(|m| !m.m.is_empty())
+    {
+        out.push('^');
+        write(out, &m, true, depth + 1);
+        out.push(' ');
+    }
     match kind {
         Kind::Long => out.push_str(&obj::long::get(v).to_string()),
         Kind::BigInt => {

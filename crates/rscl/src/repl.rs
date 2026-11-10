@@ -109,6 +109,8 @@ pub fn run(paths: &[String]) -> i32 {
                 }
                 let _ = rl.add_history_entry(buffer.trim_end());
                 buffer.clear();
+                // A Ctrl-C that arrived while nothing ran is not meant for this input.
+                rscl_runtime::native::clear_ctrl_c();
                 for form in forms {
                     match crate::session::eval_form(&form) {
                         Ok(v) => {

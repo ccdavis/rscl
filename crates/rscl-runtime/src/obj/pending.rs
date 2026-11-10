@@ -284,7 +284,7 @@ impl PendingObj {
             return err(ILLEGAL_STATE, "delay has no thunk");
         };
         self.forcing.store(me, Ordering::Release);
-        let r = thunk.call(&[]);
+        let r = crate::ffi::invoke_root(&thunk, &[]);
         self.forcing.store(0, Ordering::Release);
         let out = match r {
             Ok(v) => {

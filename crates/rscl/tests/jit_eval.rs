@@ -998,3 +998,118 @@ fn bigints_do_not_leak() {
         );
     });
 }
+
+#[test]
+fn second_pass_review_regressions() {
+    with_jit(|j| {
+        // A cycle that outlives several collections is still collected once its
+        // last outside reference goes.
+        def(
+            j,
+            "(defn mk-cycle [] (let [a (atom nil)] (reset! a (fn [] @a)) @a))",
+        );
+        let base = live_objects();
+        def(j, "(def held (mk-cycle))");
+        def(j, "(do (gc) (gc) (gc) (gc))");
+        def(j, "(def held nil)");
+        def(j, "(gc)");
+        assert_eq!(live_objects(), base, "struck-out cycle leaked");
+        // Printing a nested map while a lazy seq in it realises (collections run
+        // meanwhile) leaves the structure intact.
+        def(j, "(def nested (atom nil))");
+        assert_eq!(
+            eval(
+                j,
+                "(do (reset! nested (list {:k (map inc (range 200000)) :z 1})) (let [n (count (pr-str @nested))] (reset! nested nil) (> n 1000000)))"
+            ),
+            "true"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[(re-matches #\"a|ab\" \"ab\") (re-matches #\"a\" \"ab\")]"
+            ),
+            "[\"ab\" nil]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[(conj {1 :a} [1N :b]) (hash-map 1 :a 1N :b) (merge {1 :a} {1N :b}) (hash-set 1 1N)]"
+            ),
+            "[{1 :b} {1 :b} {1 :b} #{1}]"
+        );
+        assert_eq!(eval(j, "(get {0.0 :a} -0.0)"), ":a");
+        assert_eq!(
+            eval(j, "(count (sort (fn [a b] (< (rand) 0.5)) (range 2000)))"),
+            "2000"
+        );
+        assert_eq!(
+            eval(j, "(sort-by first > [[1 :a] [2 :b] [1 :c]])"),
+            "([2 :b] [1 :a] [1 :c])"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(try (quot ##Inf 2.0) (catch ArithmeticException e (ex-message e)))"
+            ),
+            "\"Infinite or NaN\""
+        );
+    });
+}
+
+#[test]
+fn compiler_review_regressions() {
+    with_jit(|j| {
+        // A failed compilation must not poison the next one.
+        def(j, "(defmacro bad-macro [] inc)");
+        assert!(eval(j, "(bad-macro)").starts_with("ERR"));
+        assert_eq!(eval(j, "(+ 1 2)"), "3");
+        assert!(eval(j, "(fn [] (bad-macro))").starts_with("ERR"));
+        assert_eq!(eval(j, "(+ 2 3)"), "5");
+        // An exact fixed arity wins over a variadic one declared first.
+        assert_eq!(
+            eval(
+                j,
+                "(let [f (fn ([a & r] :variadic) ([a] :fixed))] [(f 1) (f 1 2)])"
+            ),
+            "[:fixed :variadic]"
+        );
+        // Map and set literals evaluate in source order.
+        def(j, "(def order (atom []))");
+        assert_eq!(
+            eval(
+                j,
+                "(do {:a (swap! order conj 1) :b (swap! order conj 2) :c (swap! order conj 3) :d (swap! order conj 4)} (let [o @order] (reset! order []) o))"
+            ),
+            "[1 2 3 4]"
+        );
+        // A recursive defn goes through its var.
+        def(j, "(defn rec-f [n] (if (zero? n) :old (rec-f (dec n))))");
+        def(j, "(def rec-g rec-f)");
+        def(j, "(defn rec-f [n] :new)");
+        assert_eq!(eval(j, "(rec-g 1)"), ":new");
+        // Var and literal metadata are evaluated; quoted metadata survives.
+        def(j, "(def ^{:doc (str \"a\" \"b\")} with-doc 1)");
+        assert_eq!(eval(j, "(:doc (meta (var with-doc)))"), "\"ab\"");
+        def(j, "(defn with-args \"d\" [a b] a)");
+        assert_eq!(
+            eval(
+                j,
+                "[(:arglists (meta (var with-args))) (:doc (meta (var with-args)))]"
+            ),
+            "[([a b]) \"d\"]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[(meta ^:foo [1 2]) (let [x 1] (meta ^{:n (inc x)} [x])) (meta (quote ^:foo sym)) (meta [1])]"
+            ),
+            "[{:foo true} {:n 2} {:foo true} nil]"
+        );
+        // A long recur argument does not turn into the loop local's double.
+        assert_eq!(
+            eval(j, "(loop [x 1.5 i 0] (if (< i 3) (recur i (inc i)) x))"),
+            "2"
+        );
+    });
+}

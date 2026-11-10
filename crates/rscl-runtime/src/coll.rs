@@ -357,11 +357,11 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
             match x.kind() {
                 Some(Kind::Vector) if vector::get(&x).v.len() == 2 => {
                     let e = &vector::get(&x).v;
-                    m.insert(e[0].clone(), e[1].clone());
+                    map::put(&mut m, e[0].clone(), e[1].clone());
                 }
                 Some(Kind::Map) => {
                     for (k, v) in map::get(&x).m.iter() {
-                        m.insert(k.clone(), v.clone());
+                        map::put(&mut m, k.clone(), v.clone());
                     }
                 }
                 None if x.is_nil() => {}
@@ -511,21 +511,14 @@ pub fn assoc(coll: &Value, k: Value, v: Value) -> RtResult<Value> {
     match coll.kind() {
         None if coll.is_nil() => {
             let mut m = map::empty_map();
-            m.insert(k, v);
+            map::put(&mut m, k, v);
             Ok(map::new(m))
         }
         Some(Kind::Map) => {
             let mut m = map::get(coll).m.clone();
             // An equal key keeps its stored form (`1` stays `1` when `1N` is
             // assoc'ed): only the value is replaced.
-            match m.entry(k) {
-                imbl::hashmap::Entry::Occupied(mut e) => {
-                    e.insert(v);
-                }
-                imbl::hashmap::Entry::Vacant(e) => {
-                    e.insert(v);
-                }
-            }
+            map::put(&mut m, k, v);
             Ok(with_meta_of(coll, map::new(m)))
         }
         Some(Kind::Vector) => {
@@ -559,7 +552,7 @@ pub fn assoc(coll: &Value, k: Value, v: Value) -> RtResult<Value> {
                 return Ok(types::with(coll, fields, i.ext.clone()));
             }
             let mut ext = map::as_map(&i.ext).map_or_else(map::empty_map, |m| m.m.clone());
-            ext.insert(k, v);
+            map::put(&mut ext, k, v);
             Ok(types::with(coll, fields, map::new(ext)))
         }
         _ => err(

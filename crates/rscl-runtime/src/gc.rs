@@ -30,7 +30,7 @@
 //! counts non-atomically. Threads waiting for input or on a future declare
 //! themselves idle, which counts as stopped.
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -406,6 +406,49 @@ pub fn collections() -> u64 {
 
 // ---- trial deletion -----------------------------------------------------------------
 
+/// Calls from Rust into compiled code that are in flight, on any thread. A native
+/// frame below such a call may be iterating a collection it only borrows (the
+/// printer inside a nested map, `=` on two maps while a lazy seq realises), and a
+/// collection that runs meanwhile must not replace that collection's node tree.
+static NATIVE_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+/// A collection had to leave uniquely referenced collections alone; run another one
+/// when no callback is in flight.
+static RETRY: AtomicBool = AtomicBool::new(false);
+
+/// Held around a call from a native into compiled code (see `NATIVE_CALLBACKS`).
+pub struct CallbackGuard;
+
+impl CallbackGuard {
+    #[inline]
+    pub fn new() -> Self {
+        NATIVE_CALLBACKS.fetch_add(1, Ordering::AcqRel);
+        CallbackGuard
+    }
+}
+
+impl Default for CallbackGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for CallbackGuard {
+    #[inline]
+    fn drop(&mut self) {
+        if NATIVE_CALLBACKS.fetch_sub(1, Ordering::AcqRel) == 1
+            && RETRY.swap(false, Ordering::AcqRel)
+        {
+            request_gc();
+        }
+    }
+}
+
+thread_local! {
+    /// Whether this collection may make uniquely referenced collections' node trees
+    /// unique (and so count through them).
+    static MAY_REBUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 struct Info {
     /// Refcount minus the references found inside the walked subgraph.
     count: i64,
@@ -438,7 +481,15 @@ fn mortal(v: &Value) -> Option<usize> {
 /// references.
 unsafe fn child_slots(addr: usize) -> Vec<*const Value> {
     let h = header(addr);
-    let rc = h.rc.load(Ordering::Relaxed);
+    // Not rebuilding: a uniquely referenced collection is opaque like a shared one.
+    let rc = if MAY_REBUILD.with(|m| m.get()) {
+        h.rc.load(Ordering::Relaxed)
+    } else {
+        match h.kind {
+            Kind::Vector | Kind::Map | Kind::Set | Kind::SortedMap | Kind::SortedSet => 0,
+            _ => 1,
+        }
+    };
     let p = addr as *mut ObjHeader;
     unsafe {
         match h.kind {
@@ -724,15 +775,20 @@ fn collect() -> usize {
         (objs, set)
     };
     let roots: Vec<usize> = cands.iter().map(|c| c.addr).collect();
+    let cands_empty = cands.is_empty();
     *COLLECTIONS.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     let mut walk = Walk {
         info: HashMap::new(),
         slots: HashSet::new(),
         order: Vec::new(),
     };
+    // Every thread is stopped, so the count cannot change under us.
+    let exact = NATIVE_CALLBACKS.load(Ordering::Acquire) == 0;
+    MAY_REBUILD.with(|m| m.set(exact));
     for &r in &roots {
         walk.mark(r, &buffered);
     }
+    MAY_REBUILD.with(|m| m.set(true));
     walk.scan();
     if std::env::var_os("RSCL_GC_DEBUG").is_some() {
         eprintln!("gc: {} roots, {} walked", roots.len(), walk.order.len());
@@ -779,7 +835,20 @@ fn collect() -> usize {
             }
             let (version, buffered) = marks(c.addr);
             let now = version.load(Ordering::Acquire);
-            let strikes = if now != c.version { 0 } else { c.strikes + 1 };
+            // Referenced from inside its own graph: it may sit on a cycle that dies
+            // when some other member loses its last outside reference, which no
+            // write or decrement of this object announces. Such a candidate stays
+            // under watch; so does every candidate of an inexact round.
+            let h = header(c.addr);
+            let cyclic = walk
+                .info
+                .get(&c.addr)
+                .is_some_and(|i| i.count < h.rc.load(Ordering::Relaxed));
+            let strikes = if now != c.version || cyclic || !exact {
+                0
+            } else {
+                c.strikes + 1
+            };
             if strikes < MAX_STRIKES && b.set.insert(c.addr) {
                 b.objs.push(Candidate {
                     addr: c.addr,
@@ -794,6 +863,9 @@ fn collect() -> usize {
     }
     for addr in to_release {
         unsafe { crate::value::release_raw(addr as u64) };
+    }
+    if !exact && !cands_empty {
+        RETRY.store(true, Ordering::Release);
     }
     // The buffer's references to the garbage (released directly: a `Value` drop
     // would buffer them again).

@@ -93,10 +93,4 @@ builtins! {
         let start = START.get_or_init(std::time::Instant::now);
         Ok(Value::int(start.elapsed().as_nanos() as i64))
     }
-    "sleep" => fn cf_sleep(args) [1] {
-        let ms = args::int(&args[0], "millis")?;
-        if ms < 0 { return err(ILLEGAL_ARGUMENT, "sleep requires a non-negative duration"); }
-        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-        Ok(Value::NIL)
-    }
 }

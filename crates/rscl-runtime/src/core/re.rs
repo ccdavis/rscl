@@ -41,7 +41,13 @@ builtins! {
     "re-matches" => fn cf_re_matches(args) [2] {
         let p = pattern(&args[0])?;
         let s = args::string(&args[1], "s")?;
-        match regex::get(&p).re.captures(s) {
+        // The whole string must match: anchor the pattern (the leftmost match of the
+        // unanchored one may be a shorter alternative, as in `a|ab` on "ab").
+        let r = regex::get(&p);
+        let full = r.full.get_or_init(|| {
+            ::regex::Regex::new(&format!(r"\A(?:{})\z", r.source)).unwrap_or_else(|_| r.re.clone())
+        });
+        match full.captures(s) {
             Some(c) if c.get(0).is_some_and(|m| m.start() == 0 && m.end() == s.len()) => Ok(match_value(&c)),
             _ => Ok(Value::NIL),
         }

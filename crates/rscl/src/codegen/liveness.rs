@@ -90,7 +90,11 @@ fn walk(node: &Node, live: &mut HashSet<LocalId>, out: &mut Liveness) {
                 out.mark_last(node, *id);
             }
         }
-        Node::Def { init, .. } => {
+        Node::Def { init, meta, .. } => {
+            // Backward: the metadata is evaluated after the init.
+            if let Some(m) = meta {
+                walk(m, live, out);
+            }
             if let Some(i) = init {
                 walk(i, live, out);
             }
@@ -184,9 +188,12 @@ fn collect(node: &Node, used: &mut HashSet<LocalId>, bound: &mut HashSet<LocalId
         Node::Local(id) => {
             used.insert(*id);
         }
-        Node::Def { init, .. } => {
+        Node::Def { init, meta, .. } => {
             if let Some(i) = init {
                 collect(i, used, bound);
+            }
+            if let Some(m) = meta {
+                collect(m, used, bound);
             }
         }
         Node::VarSet { value, .. } => collect(value, used, bound),

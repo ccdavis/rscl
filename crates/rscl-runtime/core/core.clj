@@ -513,7 +513,8 @@
 (defn def-meta
   "Var metadata for defn/defmacro: the name's own meta, the attr map, :doc and :arglists."
   [name doc attrs sigs extra]
-  (merge (meta name) attrs (if doc {:doc doc} nil) {:arglists (map first sigs)} extra))
+  (merge (meta name) attrs (if doc {:doc doc} nil)
+         {:arglists (list 'quote (map first sigs))} extra))
 
 (defmacro defn [name & fdecl]
   (let [doc (if (string? (first fdecl)) (first fdecl) nil)
@@ -522,7 +523,7 @@
         fdecl (if attrs (next fdecl) fdecl)
         sigs (if (vector? (first fdecl)) (list fdecl) fdecl)]
     (list 'def (with-meta name (def-meta name doc attrs sigs nil))
-          (cons 'clojure.core/fn (cons name fdecl)))))
+          (cons 'clojure.core/fn fdecl))))
 
 (defmacro defn- [name & fdecl]
   (cons 'clojure.core/defn (cons (vary-meta name assoc :private true) fdecl)))
@@ -744,7 +745,7 @@
                            mdoc (first (filter string? (rest sig)))]
                        (when (empty? arglists)
                          (throw (ex-info (str "Protocol method " mname " needs at least one arglist") {})))
-                       (list 'def (with-meta mname (merge (if mdoc {:doc mdoc} nil) {:arglists arglists}))
+                       (list 'def (with-meta mname (merge (if mdoc {:doc mdoc} nil) {:arglists (list 'quote arglists)}))
                              (list 'clojure.core/protocol-fn* pname (list 'quote mname)))))]
     `(do (def ~(with-meta pname (if doc {:doc doc} nil))
            (protocol* '~qname '~(vec (map first sigs))))

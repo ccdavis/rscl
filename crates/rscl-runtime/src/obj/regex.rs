@@ -9,6 +9,8 @@ pub struct RegexObj {
     pub hdr: ObjHeader,
     pub re: regex::Regex,
     pub source: Box<str>,
+    /// The pattern anchored at both ends, for `re-matches` (built on first use).
+    pub full: std::sync::OnceLock<regex::Regex>,
 }
 
 pub fn new(source: &str) -> RtResult<Value> {
@@ -17,6 +19,7 @@ pub fn new(source: &str) -> RtResult<Value> {
             hdr: ObjHeader::new(Kind::Regex),
             re,
             source: source.into(),
+            full: std::sync::OnceLock::new(),
         })),
         Err(e) => err(ILLEGAL_ARGUMENT, format!("invalid regex {source:?}: {e}")),
     }

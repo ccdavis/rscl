@@ -45,8 +45,9 @@ pub enum Node {
     Def {
         var: VarPtr,
         init: Option<Box<Node>>,
-        /// Metadata for the var (`^:dynamic`, `:doc`, ...), applied after binding.
-        meta: Option<Value>,
+        /// Metadata for the var (`^:dynamic`, `:doc`, ...): a map expression,
+        /// evaluated and applied after binding.
+        meta: Option<Box<Node>>,
     },
     /// `(set! var value)` on a dynamic var.
     VarSet {
@@ -130,6 +131,8 @@ pub enum NativeTy {
     Bool,
     Str,
     Ptr,
+    /// 32-bit unsigned: zero-extended on return.
+    UInt,
 }
 
 impl NativeTy {
@@ -137,7 +140,8 @@ impl NativeTy {
         Some(match name {
             "void" => NativeTy::Void,
             "long" | "i64" | "u64" | "size_t" => NativeTy::Long,
-            "int" | "i32" | "u32" => NativeTy::Int,
+            "int" | "i32" => NativeTy::Int,
+            "u32" => NativeTy::UInt,
             "double" | "f64" => NativeTy::Double,
             "float" | "f32" => NativeTy::Float,
             "bool" => NativeTy::Bool,
@@ -411,10 +415,12 @@ impl PrimOp {
     }
 }
 
-/// May a `recur` argument of type `arg` rebind a loop local of type `var`? A long
-/// widens to a double; anything else must match exactly.
+/// May a `recur` argument of type `arg` rebind an inferred loop local of type
+/// `var`? Only the same type: a long must stay a long (widening it to the local's
+/// double would change the value the untyped loop computes), so the local is
+/// demoted to a boxed value instead.
 fn recur_compatible(var: Ty, arg: Ty) -> bool {
-    var == arg || (var == Ty::Double && arg == Ty::Long)
+    var == arg
 }
 
 struct Frame {
@@ -430,6 +436,8 @@ pub struct Analyzer {
     frames: Vec<Frame>,
     next_loop: LoopId,
     fn_counter: u32,
+    /// Display name for the fn a `def` is about to analyse as its init.
+    fn_name_hint: Option<String>,
 }
 
 pub use rscl_runtime::reader::is_special;
@@ -457,6 +465,7 @@ impl Analyzer {
             frames: Vec::new(),
             next_loop: 0,
             fn_counter: 0,
+            fn_name_hint: None,
         }
     }
 
@@ -538,6 +547,20 @@ impl Analyzer {
     // ---- dispatch ----------------------------------------------------------------
 
     pub fn analyze(&mut self, form: &Value, tail: bool) -> CResult<Node> {
+        // `^{:k (f)} [x]`: a literal's metadata is evaluated and attached at run
+        // time, unless literal and metadata are constant (then it is embedded).
+        if matches!(form.kind(), Some(Kind::Vector | Kind::Map | Kind::Set))
+            && let Some(m) = rscl_runtime::obj::meta(form)
+            && !m.is_nil()
+            && !(is_constant(form) && is_constant(&m))
+        {
+            let with_meta = ns::core().intern("with-meta").root();
+            let bare = with_meta
+                .call(&[form.clone(), Value::NIL])
+                .or_else(|_| fail(form, "cannot strip literal metadata"))?;
+            let call = list::from_slice(&[symbol::new(Some("clojure.core"), "with-meta"), bare, m]);
+            return self.analyze_list(&call, tail);
+        }
         match form.kind() {
             Some(Kind::Symbol) => self.analyze_symbol(form),
             // Macro expansions may return cons cells or lazy seqs: any seq is a call form.
@@ -547,19 +570,29 @@ impl Analyzer {
                 self.analyze_coll(form, CollKind::Vector, &items)
             }
             Some(Kind::Map) => {
+                // The reader's map has no order: restore the source order of the
+                // entries (from the positions of their forms) so the value
+                // expressions run left to right.
+                let mut entries: Vec<(Value, Value)> = map::get(form)
+                    .m
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                entries.sort_by_key(|(k, v)| source_order(k).min(source_order(v)));
                 let mut items = Vec::new();
-                for (k, v) in map::get(form).m.iter() {
-                    items.push(k.clone());
-                    items.push(v.clone());
+                for (k, v) in entries {
+                    items.push(k);
+                    items.push(v);
                 }
                 self.analyze_coll(form, CollKind::Map, &items)
             }
             Some(Kind::Set) => {
-                let items = rscl_runtime::obj::set::get(form)
+                let mut items = rscl_runtime::obj::set::get(form)
                     .s
                     .iter()
                     .cloned()
                     .collect::<Vec<_>>();
+                items.sort_by_key(source_order);
                 self.analyze_coll(form, CollKind::Set, &items)
             }
             // Sorted collections only come from macro expansions (there is no literal
@@ -899,6 +932,16 @@ impl Analyzer {
             m.insert(rscl_runtime::obj::keyword::intern(None, "doc"), d);
             meta = Some(m);
         }
+        // A type hint is kept as written; everything else in the metadata is an
+        // expression, evaluated when the def runs (as in Clojure).
+        if let Some(m) = &mut meta {
+            let tag = rscl_runtime::obj::keyword::intern(None, "tag");
+            if let Some(t) = m.get(&tag).cloned()
+                && t.is_kind(Kind::Symbol)
+            {
+                m.insert(tag, list::from_slice(&[symbol::new(None, "quote"), t]));
+            }
+        }
         let meta = meta.map(rscl_runtime::obj::map::new);
         // Like Clojure, `^:dynamic` takes effect at compile time (a `binding` later in
         // the same form); the rest of the metadata is applied when the def runs, so a
@@ -911,8 +954,25 @@ impl Analyzer {
         {
             var_obj.set_flag(FLAG_DYNAMIC, true);
         }
+        // `(def f (fn [..] ..))`: the fn is displayed under the var's name. It is not
+        // bound to that name inside itself, so a recursive call goes through the var
+        // and sees a later redefinition (`(def fib (memoize fib))`).
+        self.fn_name_hint = init
+            .and_then(seq_items)
+            .and_then(|it| {
+                it.first()
+                    .and_then(symbol::as_sym)
+                    .map(|s| s.name().to_string())
+            })
+            .filter(|n| n == "fn" || n == "fn*")
+            .map(|_| sym.name().to_string());
         let init = match init {
             Some(f) => Some(Box::new(self.analyze(f, false)?)),
+            None => None,
+        };
+        self.fn_name_hint = None;
+        let meta = match meta {
+            Some(m) => Some(Box::new(self.analyze(&m, false)?)),
             None => None,
         };
         Ok(Node::Def { var, init, meta })
@@ -1067,6 +1127,7 @@ impl Analyzer {
     }
 
     fn analyze_fn(&mut self, form: &Value, items: &[Value]) -> CResult<Node> {
+        let hint = self.fn_name_hint.take();
         let mut rest = &items[1..];
         let mut name: Option<String> = None;
         if let Some(sym) = rest.first().and_then(symbol::as_sym) {
@@ -1090,7 +1151,7 @@ impl Analyzer {
             out
         };
         self.fn_counter += 1;
-        let display = match &name {
+        let display = match name.as_ref().or(hint.as_ref()) {
             Some(n) => format!("{}/{}", self.ns.name, n),
             None => format!("{}/fn__{}", self.ns.name, self.fn_counter),
         };
@@ -1366,7 +1427,20 @@ pub fn seq_items(v: &Value) -> Option<Vec<Value>> {
 }
 
 /// Self-evaluating form that needs no code to construct.
+/// Where a form was read, for ordering the entries of a map or set literal; forms
+/// without a position (keywords, numbers, strings: no effects to order) sort last.
+fn source_order(v: &Value) -> (u32, u32) {
+    pos::pos_of(v).map_or((u32::MAX, u32::MAX), |p| (p.line, p.col))
+}
+
 pub fn is_constant(v: &Value) -> bool {
+    // Metadata is part of a literal: a non-constant one makes the literal a runtime
+    // construction.
+    if matches!(v.kind(), Some(Kind::Vector | Kind::Map | Kind::Set))
+        && rscl_runtime::obj::meta(v).is_some_and(|m| !m.is_nil() && !is_constant(&m))
+    {
+        return false;
+    }
     match v.kind() {
         None => true,
         Some(Kind::Long | Kind::Double | Kind::BigInt | Kind::String | Kind::Keyword) => true,
