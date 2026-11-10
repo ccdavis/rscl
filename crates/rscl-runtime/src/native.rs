@@ -275,7 +275,7 @@ fn take_interrupt() -> Option<(&'static str, String)> {
     if !is_blocked() && (GC_PENDING.load(Ordering::Acquire) || crate::gc::stopping()) {
         crate::gc::safepoint();
     }
-    if crate::heap::take_oom() {
+    if crate::heap::take_oom(!is_blocked()) {
         refresh_flag();
         // Cycles may hold the memory: collect once before giving up.
         if !is_blocked() {
@@ -404,7 +404,7 @@ pub unsafe extern "C" fn rt_throw_unresolved_native(name: *const u8, len: i64) -
 /// Write the integer value of `v` to `out`; returns `nil` or `EXC`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_to_long(v: crate::value::VRef, out: *mut i64) -> Value {
-    match v.as_int() {
+    match v.int_value() {
         Some(n) => {
             unsafe { *out = n };
             Value::NIL

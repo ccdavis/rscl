@@ -36,7 +36,7 @@ builtins! {
     }
     "spit" => fn cf_spit(args) [2] {
         let path = args::string(&args[0], "path")?;
-        let content = crate::printer::print_str(&args[1]);
+        let content = crate::printer::str_of(&args[1]);
         match std::fs::write(path, content) {
             Ok(()) => Ok(Value::NIL),
             Err(e) => err(RUNTIME, format!("{path}: {e}")),

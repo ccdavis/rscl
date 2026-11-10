@@ -145,7 +145,7 @@ builtins! {
         Ok(Value::bool(expect_atom(&args[0])?.compare_and_set(&args[1], args[2].owned())))
     }
     "gensym" => fn cf_gensym(args) [0, 1] {
-        let prefix = if args.is_empty() { "G__".to_string() } else { crate::printer::print_str(&args[0]) };
+        let prefix = if args.is_empty() { "G__".to_string() } else { crate::printer::str_of(&args[0]) };
         Ok(symbol::new(None, &format!("{prefix}{}", next_gensym())))
     }
     "set-macro!" => fn cf_set_macro(args) [1] {

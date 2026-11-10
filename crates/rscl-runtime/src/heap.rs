@@ -27,6 +27,19 @@ static NEXT: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// An error was raised and not yet delivered (`OOM_THREAD` says to whom).
 static OOM_PENDING: AtomicBool = AtomicBool::new(false);
 static OOM_THREAD: AtomicU64 = AtomicU64::new(0);
+/// When the pending error was raised (milliseconds, see `now_ms`).
+static RAISED_AT: AtomicU64 = AtomicU64::new(0);
+/// How long the thread that crossed the limit has to take its error before any
+/// other thread at a safepoint takes it instead.
+const HANDOVER_MS: u64 = 50;
+
+fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
 
 thread_local! {
     static DELTA: Cell<isize> = const { Cell::new(0) };
@@ -99,7 +112,13 @@ fn flush(n: isize) {
     let live = LIVE.fetch_add(n, Ordering::Relaxed) + n;
     let live = live.max(0) as usize;
     let limit = LIMIT.load(Ordering::Relaxed);
+    // The collector's own working memory is short-lived: it must not raise the
+    // error that asked for the collection again.
+    if crate::gc::collecting() {
+        return;
+    }
     if live >= NEXT.load(Ordering::Relaxed) {
+        RAISED_AT.store(now_ms(), Ordering::Relaxed);
         NEXT.store(
             live.saturating_add(limit / 16).max(limit),
             Ordering::Relaxed,
@@ -153,12 +172,13 @@ fn hard_failure(size: usize) {
     unsafe { write(2, buf.as_ptr(), n) };
 }
 
-/// Is a raised error waiting for this thread? Consumes it. An error addressed to
-/// another thread is dropped by whoever notices that the heap is back under its
-/// limit, so a thread that never reaches a safepoint cannot keep the interrupt flag
-/// raised for everyone. The caller refreshes the flag when this returns true or the
-/// pending state changed.
-pub fn take_oom() -> bool {
+/// Is a raised error waiting for this thread? Consumes it. The error is meant for
+/// the thread that crossed the limit, but that thread may never reach a safepoint
+/// (it exited, or it waits in native code): whoever notices that the heap is back
+/// under its limit drops the error, and after `HANDOVER_MS` any thread running rscl
+/// code (`may_adopt`) takes it over, so the flag is not left raised for everyone and
+/// the error is still reported.
+pub fn take_oom(may_adopt: bool) -> bool {
     if !OOM_PENDING.load(Ordering::Acquire) {
         return false;
     }
@@ -167,8 +187,12 @@ pub fn take_oom() -> bool {
         if over_limit().is_none() {
             OOM_PENDING.store(false, Ordering::Release);
             crate::native::oom_cleared();
+            return false;
         }
-        return false;
+        let waited = now_ms().saturating_sub(RAISED_AT.load(Ordering::Relaxed));
+        if !may_adopt || waited < HANDOVER_MS {
+            return false;
+        }
     }
     OOM_PENDING.swap(false, Ordering::AcqRel)
 }

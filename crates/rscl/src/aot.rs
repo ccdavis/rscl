@@ -103,7 +103,8 @@ pub fn build(o: &BuildOptions) -> Result<(), BuildError> {
     let src = std::fs::read_to_string(&o.input)
         .map_err(|e| BuildError::Io(format!("cannot read {path}: {e}")))?;
 
-    let compiler = Compiler::new(object_module(o)?);
+    let mut compiler = Compiler::new(object_module(o)?);
+    compiler.keep_fns = true;
     let cfg = SessionConfig {
         paths: crate::session::source_paths(Some(&o.input), &o.paths),
         aot: Some(compiler),

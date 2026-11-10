@@ -928,6 +928,51 @@ fn bigints_do_not_leak() {
             "1180591620717411303424N"
         );
         assert_eq!(eval(j, "(long 5N)"), "5");
+        // A BigInt that fits a long is an index like any other.
+        assert_eq!(
+            eval(
+                j,
+                "[(get [1 2 3] 1N) (nth [1 2 3] (mod 31N 3)) (subs \"hello\" 1N) ([1 2 3] 1N) (assoc [1 2 3] 1N :x)]"
+            ),
+            "[2 2 \"ello\" 2 [1 :x 3]]"
+        );
+        // An equal key keeps its stored form.
+        assert_eq!(
+            eval(
+                j,
+                "[(conj #{1} 1N) (assoc {1 :a} 1N :b) (assoc {1N :a} 1 :b)]"
+            ),
+            "[#{1} {1 :b} {1N :b}]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[(sort (fn [a b] (- a b)) [3N 1N 2N]) (sort (fn [a b] (- a b)) [3.0 1.0 2.0])]"
+            ),
+            "[(1N 2N 3N) (1.0 2.0 3.0)]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[(clojure.string/join \",\" [1N 2N nil]) (clojure.string/upper-case 12N)]"
+            ),
+            "[\"1,2,\" \"12\"]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [b (reduce *' (repeat 340 10))] [(== b ##Inf) (< b ##Inf) (> b ##-Inf) (< 2N 2.5)])"
+            ),
+            "[false true true true]"
+        );
+        assert_eq!(eval(j, "(== (/ 273N 1343) (/ 273 1343))"), "true");
+        assert_eq!(
+            eval(
+                j,
+                "[(try (long 1e30) (catch Exception e :range)) (try (long (identity ##NaN)) (catch Exception e :nan)) (long -3.9)]"
+            ),
+            "[:range :nan -3]"
+        );
         assert_eq!(
             eval(j, "[(int? 1N) (integer? 1N) (get {1 :a} 1N)]"),
             "[false true :a]"

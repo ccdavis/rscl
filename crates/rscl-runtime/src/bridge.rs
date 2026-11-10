@@ -45,7 +45,7 @@ unsafe extern "C" fn api_bool_new(b: i32) -> u64 {
     Value::bool(b != 0).into_raw()
 }
 unsafe extern "C" fn api_int_get(v: u64, out: *mut i64) -> i32 {
-    match borrowed(v).as_int() {
+    match borrowed(v).int_value() {
         Some(n) => {
             unsafe { *out = n };
             1

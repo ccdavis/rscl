@@ -17,6 +17,22 @@ pub fn print_str(v: &Value) -> String {
     s
 }
 
+/// `(str v)`: like `print_str`, except that `nil` is empty and a BigInt has no `N`
+/// suffix (which it keeps inside a collection).
+pub fn str_of(v: &Value) -> String {
+    let mut s = String::new();
+    write_str(&mut s, v);
+    s
+}
+
+pub fn write_str(out: &mut String, v: &Value) {
+    if let Some(b) = obj::bigint::as_big(v) {
+        out.push_str(&b.to_string());
+    } else if !v.is_nil() {
+        write(out, v, false, 0);
+    }
+}
+
 pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
     if depth > MAX_DEPTH {
         out.push_str("...");

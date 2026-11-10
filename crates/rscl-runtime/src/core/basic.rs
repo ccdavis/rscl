@@ -55,12 +55,7 @@ builtins! {
     "str" => fn cf_str(args) [; 0] {
         let mut out = String::new();
         for a in args {
-            if let Some(b) = crate::obj::bigint::as_big(a) {
-                // Only `str` of the number itself drops the `N`.
-                out.push_str(&b.to_string());
-            } else if !a.is_nil() {
-                crate::printer::write(&mut out, a, false, 0);
-            }
+            crate::printer::write_str(&mut out, a);
         }
         Ok(string::from_string(out))
     }

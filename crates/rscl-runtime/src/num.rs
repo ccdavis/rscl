@@ -131,16 +131,28 @@ pub fn mul_p(a: Num, b: Num) -> RtResult<Num> {
 /// operand first would give infinity or NaN beyond the double range, so the quotient
 /// is computed to 64 significant bits as an integer and scaled back.
 fn big_ratio(x: &BigInt, y: &BigInt) -> f64 {
+    // Both exact as doubles: one correctly rounded division, as for longs.
+    if x.bits() <= 53 && y.bits() <= 53 {
+        return x.to_f64().unwrap_or(f64::NAN) / y.to_f64().unwrap_or(f64::NAN);
+    }
+    let negative = x.is_negative() != y.is_negative();
+    let (x, y) = (x.abs(), y.abs());
     let shift = 64 - (x.bits() as i64 - y.bits() as i64);
-    let q = if shift >= 0 {
-        (x << shift as usize) / y
+    let (mut q, r) = if shift >= 0 {
+        (x << shift as usize).div_rem(&y)
     } else {
-        x / (y << (-shift) as usize)
+        x.div_rem(&(y << (-shift) as usize))
     };
+    // The discarded remainder as a sticky bit, so the conversion below rounds the
+    // true quotient and not its truncation.
+    if !r.is_zero() {
+        q |= BigInt::from(1);
+    }
     let q = q.to_f64().unwrap_or(f64::INFINITY);
     // Two steps keep the scale factor itself inside the double range.
     let half = -shift / 2;
-    q * 2f64.powi(half as i32) * 2f64.powi((-shift - half) as i32)
+    let v = q * 2f64.powi(half as i32) * 2f64.powi((-shift - half) as i32);
+    if negative { -v } else { v }
 }
 
 pub fn div(a: Num, b: Num) -> RtResult<Num> {
@@ -282,11 +294,32 @@ pub fn dec_p(a: Num) -> RtResult<Num> {
 pub fn cmp(a: &Num, b: &Num) -> Option<Ordering> {
     match (a, b) {
         (Num::I(x), Num::I(y)) => Some(x.cmp(y)),
+        (Num::B(x), Num::D(d)) => cmp_big_double(x, *d),
+        (Num::D(d), Num::B(y)) => cmp_big_double(y, *d).map(Ordering::reverse),
         (Num::D(_), _) | (_, Num::D(_)) => f(a).partial_cmp(&f(b)),
         (Num::B(x), Num::B(y)) => Some(x.cmp(y)),
         (Num::B(x), Num::I(y)) => Some(x.cmp(&big(*y))),
         (Num::I(x), Num::B(y)) => Some(big(*x).cmp(y)),
     }
+}
+
+/// Exact: a `BigInt` beyond the double range is not equal to infinity.
+fn cmp_big_double(x: &BigInt, d: f64) -> Option<Ordering> {
+    if d.is_nan() {
+        return None;
+    }
+    if d.is_infinite() {
+        return Some(if d > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let whole = BigInt::from_f64(d.trunc())?;
+    Some(x.cmp(&whole).then_with(|| {
+        // Same integer part: the fraction of `d` decides.
+        0.0f64.partial_cmp(&d.fract()).unwrap_or(Ordering::Equal)
+    }))
 }
 
 /// `==`: numeric equality across categories.
@@ -340,7 +373,14 @@ pub fn f(n: &Num) -> f64 {
 pub fn to_long(n: &Num) -> RtResult<i64> {
     match n {
         Num::I(i) => Ok(*i),
-        Num::D(d) => Ok(*d as i64),
+        // 2^63 is exact as a double; NaN fails both comparisons.
+        Num::D(d) if *d >= -9_223_372_036_854_775_808.0 && *d < 9_223_372_036_854_775_808.0 => {
+            Ok(*d as i64)
+        }
+        Num::D(d) => err(
+            crate::obj::exception::ILLEGAL_ARGUMENT,
+            format!("Value out of range for long: {d}"),
+        ),
         Num::B(b) => b.to_i64().map_or_else(
             || {
                 err(
@@ -421,6 +461,27 @@ mod tests {
             Num::B(num_traits::pow(big(10), 399)),
         );
         assert!(matches!(q.unwrap(), Num::D(d) if (d - 10.0).abs() < 1e-9));
+        assert_eq!(
+            div(Num::B(big(273)), Num::I(1343)).unwrap(),
+            div(Num::I(273), Num::I(1343)).unwrap()
+        );
+        let wide = Num::B(big(273) << 70usize);
+        assert_eq!(
+            div(wide, Num::B(big(1343) << 70usize)).unwrap(),
+            Num::D(273.0 / 1343.0)
+        );
+        assert_eq!(cmp(&huge, &Num::D(f64::INFINITY)), Some(Ordering::Less));
+        assert_eq!(cmp(&Num::D(f64::NEG_INFINITY), &huge), Some(Ordering::Less));
+        assert_eq!(cmp(&Num::B(big(2)), &Num::D(2.5)), Some(Ordering::Less));
+        assert_eq!(
+            cmp(&Num::B(big(-2)), &Num::D(-2.5)),
+            Some(Ordering::Greater)
+        );
+        assert!(to_long(&Num::D(1e30)).is_err());
+        crate::exc::take();
+        assert!(to_long(&Num::D(f64::NAN)).is_err());
+        crate::exc::take();
+        assert_eq!(to_long(&Num::D(-3.9)).unwrap(), -3);
         assert_eq!(neg_p(Num::I(i64::MIN)), Num::B(-big(i64::MIN)));
         assert_eq!(neg_p(Num::D(0.0)), Num::D(-0.0));
         assert!(matches!(neg_p(Num::D(0.0)), Num::D(d) if d.is_sign_negative()));

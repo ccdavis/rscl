@@ -45,16 +45,7 @@ pub struct CompiledFn {
     pub lines: Vec<LineEntry>,
 }
 
-/// A code range `[start, end)` within a fn that belongs to a call at a source
-/// position.
-#[derive(Clone, Debug)]
-pub struct LineEntry {
-    pub start: u32,
-    pub end: u32,
-    pub file: String,
-    pub line: u32,
-    pub col: u32,
-}
+pub use rscl_runtime::trace::Line as LineEntry;
 
 pub struct Compiler<M: Module> {
     pub module: M,
@@ -67,6 +58,8 @@ pub struct Compiler<M: Module> {
     flag_id: Option<DataId>,
     /// Every `fn*` compiled into this module (AOT registers them for stack traces).
     registered_fns: Vec<CompiledFn>,
+    /// Remember every compiled fn for `compile_entry` (AOT builds).
+    pub keep_fns: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -109,7 +102,8 @@ struct UnitCtx {
     fn_ids: HashMap<usize, FuncId>,
     fns: Vec<CompiledFn>,
     /// Source positions referenced by `SourceLoc`s in this unit (index + 1).
-    positions: Vec<(String, u32, u32)>,
+    positions: Vec<(std::sync::Arc<str>, u32, u32)>,
+    files: HashMap<String, std::sync::Arc<str>>,
     pos_index: HashMap<u32, u32>,
 }
 
@@ -133,7 +127,15 @@ impl UnitCtx {
             return Some(i);
         }
         let p = rscl_runtime::pos::get(pos)?;
-        let file = rscl_runtime::pos::file_name(p.file);
+        let name = rscl_runtime::pos::file_name(p.file);
+        let file = match self.files.get(&name) {
+            Some(f) => f.clone(),
+            None => {
+                let f: std::sync::Arc<str> = name.as_str().into();
+                self.files.insert(name, f.clone());
+                f
+            }
+        };
         self.positions.push((file, p.line, p.col));
         let i = self.positions.len() as u32;
         self.pos_index.insert(pos, i);
@@ -220,6 +222,7 @@ impl<M: Module> Compiler<M> {
             next_unit: 0,
             flag_id: None,
             registered_fns: Vec::new(),
+            keep_fns: false,
         }
     }
 
@@ -310,6 +313,7 @@ impl<M: Module> Compiler<M> {
             fn_ids: HashMap::new(),
             fns: Vec::new(),
             positions: Vec::new(),
+            files: HashMap::new(),
             pos_index: HashMap::new(),
         })
     }
@@ -532,8 +536,11 @@ impl<M: Module> Compiler<M> {
                 size,
                 lines,
             };
-            u.fns.push(f.clone());
-            self.registered_fns.push(f);
+            // Only an AOT build registers every fn again in the program's entry.
+            if self.keep_fns {
+                self.registered_fns.push(f.clone());
+            }
+            u.fns.push(f);
         }
         self.module.clear_context(&mut ctx);
         Ok(())
@@ -1730,6 +1737,19 @@ impl<'a, M: Module> FnCtx<'a, M> {
                     }
                     t => {
                         let raw = self.compile_typed(&args[0], t)?;
+                        if t == Ty::Double {
+                            // NaN and values outside the long range are errors,
+                            // not saturated.
+                            let lo = self.b.ins().f64const(-9_223_372_036_854_775_808.0);
+                            let hi = self.b.ins().f64const(9_223_372_036_854_775_808.0);
+                            let below = self.b.ins().fcmp(FloatCC::UnorderedOrLessThan, raw, lo);
+                            let above =
+                                self.b
+                                    .ins()
+                                    .fcmp(FloatCC::UnorderedOrGreaterThanOrEqual, raw, hi);
+                            let bad = self.b.ins().bor(below, above);
+                            self.arith_check(bad, 3);
+                        }
                         Ok(self.convert(raw, t, Ty::Long))
                     }
                 };
@@ -1893,7 +1913,9 @@ impl<'a, M: Module> FnCtx<'a, M> {
             PrimOp::Ne => (IntCC::NotEqual, FloatCC::NotEqual),
             _ => (IntCC::Equal, FloatCC::Equal),
         };
-        if any_double {
+        // A boxed operand may be a BigInt beyond the double range, which must not
+        // compare as infinity: leave those to the runtime.
+        if any_double && !tys.contains(&Ty::Val) {
             let xs = self.prim_args(args, Ty::Double)?;
             Ok(Some(self.b.ins().fcmp(fcc, xs[0], xs[1])))
         } else if all_long {

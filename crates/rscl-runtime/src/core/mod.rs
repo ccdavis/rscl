@@ -276,7 +276,7 @@ pub mod args {
     use crate::value::Value;
 
     pub fn int(v: &Value, what: &str) -> RtResult<i64> {
-        v.as_int().map_or_else(
+        v.int_value().map_or_else(
             || {
                 err(
                     CLASS_CAST,

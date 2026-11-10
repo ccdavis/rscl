@@ -322,6 +322,12 @@ impl Value {
             None
         }
     }
+    /// The 64-bit integer this value stands for: a long, or a `BigInt` that fits one
+    /// (indexes, counts and `=`/`hash` accept either).
+    pub fn int_value(&self) -> Option<i64> {
+        self.as_int()
+            .or_else(|| obj::bigint::as_big(self).and_then(num_traits::ToPrimitive::to_i64))
+    }
     #[inline]
     pub fn as_double(&self) -> Option<f64> {
         if self.is_kind(Kind::Double) {

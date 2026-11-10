@@ -343,7 +343,12 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
             Ok(with_meta_of(coll, vector::new(v)))
         }
         Some(Kind::Set) => {
-            let mut s = set::get(coll).s.clone();
+            let old = &set::get(coll).s;
+            // An equal element is already there (`1` for `1N`): keep it.
+            if old.contains(&x) {
+                return Ok(coll.clone());
+            }
+            let mut s = old.clone();
             s.insert(x);
             Ok(with_meta_of(coll, set::new(s)))
         }
@@ -426,7 +431,7 @@ pub fn get(coll: &Value, k: &Value, not_found: Option<&Value>) -> RtResult<Value
                 nf()
             }
         }
-        Some(Kind::Vector) => match k.as_int() {
+        Some(Kind::Vector) => match k.int_value() {
             Some(i) if i >= 0 => vector::get(coll)
                 .v
                 .get(i as usize)
@@ -434,7 +439,7 @@ pub fn get(coll: &Value, k: &Value, not_found: Option<&Value>) -> RtResult<Value
                 .unwrap_or_else(nf),
             _ => nf(),
         },
-        Some(Kind::String) => match k.as_int() {
+        Some(Kind::String) => match k.int_value() {
             Some(i) if i >= 0 => string::get(coll)
                 .chars()
                 .nth(i as usize)
@@ -511,12 +516,21 @@ pub fn assoc(coll: &Value, k: Value, v: Value) -> RtResult<Value> {
         }
         Some(Kind::Map) => {
             let mut m = map::get(coll).m.clone();
-            m.insert(k, v);
+            // An equal key keeps its stored form (`1` stays `1` when `1N` is
+            // assoc'ed): only the value is replaced.
+            match m.entry(k) {
+                imbl::hashmap::Entry::Occupied(mut e) => {
+                    e.insert(v);
+                }
+                imbl::hashmap::Entry::Vacant(e) => {
+                    e.insert(v);
+                }
+            }
             Ok(with_meta_of(coll, map::new(m)))
         }
         Some(Kind::Vector) => {
             let vec = &vector::get(coll).v;
-            let Some(i) = k.as_int() else {
+            let Some(i) = k.int_value() else {
                 return err(ILLEGAL_ARGUMENT, "Key must be integer");
             };
             if i < 0 || i as usize > vec.len() {
@@ -620,10 +634,10 @@ pub fn contains(coll: &Value, k: &Value) -> RtResult<bool> {
         Some(Kind::Map) => map::get(coll).m.contains_key(k),
         Some(Kind::Set) => set::get(coll).s.contains(k),
         Some(Kind::Vector) => k
-            .as_int()
+            .int_value()
             .is_some_and(|i| i >= 0 && (i as usize) < vector::get(coll).v.len()),
         Some(Kind::String) => k
-            .as_int()
+            .int_value()
             .is_some_and(|i| i >= 0 && (i as usize) < string::get(coll).chars().count()),
         Some(Kind::SortedMap) => sorted::map_lookup(&sorted::map_get(coll).m, k)?.is_some(),
         Some(Kind::SortedSet) => sorted::set_contains(&sorted::set_get(coll).s, k)?,
@@ -640,7 +654,7 @@ pub fn contains(coll: &Value, k: &Value) -> RtResult<bool> {
 pub fn find(coll: &Value, k: &Value) -> RtResult<Value> {
     Ok(match coll.kind() {
         Some(Kind::Map) => map::get(coll).m.get(k).map_or(Value::NIL, |v| entry(k, v)),
-        Some(Kind::Vector) => match k.as_int() {
+        Some(Kind::Vector) => match k.int_value() {
             Some(i) if i >= 0 => vector::get(coll)
                 .v
                 .get(i as usize)

@@ -241,8 +241,9 @@ builtins! {
 /// result is a predicate (`(pred a b)` → less, `(pred b a)` → greater, else equal).
 fn compare_with(f: &Value, a: &Value, b: &Value) -> RtResult<Ordering> {
     let r = call(f, &[a.clone(), b.clone()])?;
-    if let Some(n) = r.as_int() {
-        return Ok(n.cmp(&0));
+    // Any number is a signum (Clojure takes its `intValue`).
+    if let Some(n) = crate::num::num(&r) {
+        return Ok(crate::num::sign(&n));
     }
     if r.truthy() {
         return Ok(Ordering::Less);

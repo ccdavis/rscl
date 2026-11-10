@@ -12,7 +12,9 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   BigInt instead. BigInts are written `123N` (an integer literal too large for 64
   bits is read as a BigInt too) and print as `123N`; only `str` of the number itself
   gives `123`. In a radix literal a trailing `N` is a digit (`36rZN` is 1283). They are contagious in arithmetic and comparisons, come back down to a long
-  only through `long`/`int` (which throw when the value does not fit), and are equal
+  only through `long`/`int` (which throw when the value does not fit, as they do for
+  a double outside the long range or NaN), are accepted wherever an index is when
+  they fit a long, and are equal
   to and hash like the long of the same value (`(= 1N 1)`, `(get {1N :a} 1)`), though
   `int?` is false for them. A quotient of BigInts that does not divide exactly is a
   double computed from the exact ratio, so it is right even when the operands
@@ -286,7 +288,10 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   the physical memory or of the cgroup limit, whichever is smaller. The allocator
   keeps count of the bytes in use; the thread whose allocation crosses the limit
   gets an `OutOfMemoryError` at its next fn entry, loop iteration or blocking wait,
-  after one cycle collection has had the chance to free enough. The error is
+  after one cycle collection has had the chance to free enough. If that thread does
+  not get there within 50 ms (it waits in native code), another thread running rscl
+  code takes the error instead; one raised by a program's last form is reported
+  while the program waits for its futures, with exit status 1. The error is
   ordinary and catchable; the memory it unwinds is released, and the REPL carries
   on. A program that catches it and keeps allocating gets another error every
   sixteenth of the limit. The count is of bytes requested, so the process's resident

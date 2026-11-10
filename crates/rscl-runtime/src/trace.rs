@@ -13,7 +13,7 @@ use std::sync::{OnceLock, RwLock};
 pub struct Line {
     pub start: u32,
     pub end: u32,
-    pub file: String,
+    pub file: std::sync::Arc<str>,
     pub line: u32,
     pub col: u32,
 }
@@ -154,14 +154,25 @@ pub unsafe extern "C" fn rt_register_code(
 ) {
     let name = unsafe { crate::ffi::str_arg(name, len) };
     let mut lines = Vec::with_capacity(n.max(0) as usize);
+    // Nearly every entry of a fn names the same file: share the string.
+    let mut last: Option<((u32, u32), std::sync::Arc<str>)> = None;
     for i in 0..n.max(0) as usize {
         let rec = unsafe { entries.add(i * 24) } as *const u32;
         let field = |k: usize| unsafe { rec.add(k).read_unaligned() };
-        let file = unsafe { crate::ffi::str_arg(blob.add(field(4) as usize), field(5) as i64) };
+        let key = (field(4), field(5));
+        let file = match &last {
+            Some((k, f)) if *k == key => f.clone(),
+            _ => {
+                let f: std::sync::Arc<str> =
+                    unsafe { crate::ffi::str_arg(blob.add(key.0 as usize), key.1 as i64) }.into();
+                last = Some((key, f.clone()));
+                f
+            }
+        };
         lines.push(Line {
             start: field(0),
             end: field(1),
-            file: file.to_string(),
+            file,
             line: field(2),
             col: field(3),
         });

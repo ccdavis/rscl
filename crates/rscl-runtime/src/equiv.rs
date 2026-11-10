@@ -17,7 +17,7 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
     if a.kind().is_none() && b.kind().is_none() {
         return false;
     }
-    if let (Some(x), Some(y)) = (int_value(a), int_value(b)) {
+    if let (Some(x), Some(y)) = (a.int_value(), b.int_value()) {
         return x == y;
     }
     let (Some(ka), Some(kb)) = (a.kind(), b.kind()) else {
@@ -202,7 +202,7 @@ fn hash_set_items<'a>(items: impl Iterator<Item = &'a Value>) -> u64 {
 }
 
 pub fn hasheq(v: &Value) -> u64 {
-    if let Some(n) = int_value(v) {
+    if let Some(n) = v.int_value() {
         return mix64(n as u64);
     }
     let Some(kind) = v.kind() else {
@@ -267,13 +267,6 @@ pub fn hasheq(v: &Value) -> u64 {
         | Kind::Protocol
         | Kind::Pending => mix64(v.bits()),
     }
-}
-
-/// The 64-bit integer a value stands for in `=` and `hash`: a long, or a `BigInt`
-/// that fits one (so `(= 1N 1)` and both find the same map entry).
-pub fn int_value(v: &Value) -> Option<i64> {
-    v.as_int()
-        .or_else(|| obj::bigint::as_big(v).and_then(num_traits::ToPrimitive::to_i64))
 }
 
 #[cfg(test)]

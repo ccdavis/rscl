@@ -61,10 +61,13 @@ pub unsafe extern "C" fn rt_unbox_long(v: VRef, out: *mut i64, strict: i64) -> V
             unsafe { *out = n };
             Value::NIL
         }
-        Ok(crate::num::Num::D(d)) if strict == 0 => {
-            unsafe { *out = d as i64 };
-            Value::NIL
-        }
+        Ok(n @ crate::num::Num::D(_)) if strict == 0 => match crate::num::to_long(&n) {
+            Ok(i) => {
+                unsafe { *out = i };
+                Value::NIL
+            }
+            Err(_) => Value::EXC,
+        },
         Ok(crate::num::Num::D(_)) => unsafe { rt_throw_prim(2) },
         Ok(n @ crate::num::Num::B(_)) => match crate::num::to_long(&n) {
             Ok(i) => {
@@ -78,12 +81,13 @@ pub unsafe extern "C" fn rt_unbox_long(v: VRef, out: *mut i64, strict: i64) -> V
 }
 
 /// Failure in inline primitive code: 0 integer overflow, 1 division by zero, 2 a
-/// double where a long is required.
+/// double where a long is required, 3 a double outside the long range.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_throw_prim(code: i64) -> Value {
     match code {
         0 => exc::throw_new(exception::ARITHMETIC, "integer overflow"),
         1 => exc::throw_new(exception::ARITHMETIC, "Divide by zero"),
+        3 => exc::throw_new(exception::ILLEGAL_ARGUMENT, "Value out of range for long"),
         _ => exc::throw_new(exception::CLASS_CAST, "Double cannot be cast to Long"),
     };
     Value::EXC
@@ -241,7 +245,7 @@ pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
                     args.len() as i64,
                 )));
             }
-            match args[0].as_int() {
+            match args[0].int_value() {
                 Some(i) => crate::coll::nth(f, i, None),
                 None => exc::err(exception::ILLEGAL_ARGUMENT, "Key must be integer"),
             }

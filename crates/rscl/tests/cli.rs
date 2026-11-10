@@ -132,3 +132,45 @@ fn short_lived_threads_do_not_skew_the_heap_count() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("4000"));
 }
+
+#[test]
+fn heap_limit_with_a_large_live_atom_does_not_spin_in_the_collector() {
+    // The collector's working memory must not re-raise the error it was run for.
+    let out = rscl(
+        &[
+            "-e",
+            "(def a (atom [])) \
+             (println (try (loop [i 0] (when (< i 3000000) (swap! a conj i) (recur (inc i)))) \
+                           (catch OutOfMemoryError e :oom)))",
+        ],
+        &[("RSCL_MAX_HEAP_MB", "40")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn heap_limit_crossed_by_the_last_form_is_reported() {
+    let dir = std::env::temp_dir().join(format!("rscl_cli_last_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("last.clj");
+    std::fs::write(
+        &file,
+        r#"(def s (loop [s "0123456789" i 0] (if (< i 20) (recur (str s s) (inc i)) s)))
+(future (loop [i 0 s 0] (if (< i 300000000) (recur (inc i) (+ s i)) s)))
+(def s3 (str s s s s s s s s))
+"#,
+    )
+    .unwrap();
+    let out = rscl(
+        &["run", file.to_str().unwrap()],
+        &[("RSCL_MAX_HEAP_MB", "64")],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("OutOfMemoryError"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
