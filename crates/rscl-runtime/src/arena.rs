@@ -18,6 +18,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::value::ObjHeader;
 
+/// Empty blocks kept mapped after a collection (64 MB).
+const KEEP_FREE: usize = 1024;
 const BLOCK_SHIFT: usize = 16;
 pub const BLOCK: usize = 1 << BLOCK_SHIFT;
 /// Smallest slot; every size class is a multiple of it.
@@ -356,9 +358,11 @@ pub fn sweep(mut keep: impl FnMut(*mut ObjHeader) -> bool) -> usize {
             }
         }
         if live == 0 {
-            unsafe {
-                *class_ptr(l, block) = 0;
-                madvise(block_addr(l, block) as *mut u8, BLOCK, MADV_DONTNEED);
+            unsafe { *class_ptr(l, block) = 0 };
+            // A reserve of empty blocks stays mapped (the next cycle will want
+            // them); the rest goes back to the operating system.
+            if p.free.len() >= KEEP_FREE {
+                unsafe { madvise(block_addr(l, block) as *mut u8, BLOCK, MADV_DONTNEED) };
             }
             p.free.push(block as u32);
         } else if live < slots {

@@ -62,8 +62,11 @@ impl Jit {
         rscl_runtime::entry::init();
         let flags = [
             ("opt_level", "none"),
-            // Fast register allocation: the REPL compiles core.clj at start-up.
-            // ("regalloc_algorithm", "single_pass"),
+            // The default register allocator, not the single-pass one: without
+            // retain/release the IR is small enough that start-up is fast anyway,
+            // and the single-pass allocator spills every value that crosses a
+            // block boundary, which leaves dead references in frames for the
+            // collector's conservative stack scan to find.
             ("use_colocated_libcalls", "false"),
             ("is_pic", "false"),
             ("preserve_frame_pointers", "true"),

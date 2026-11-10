@@ -906,6 +906,9 @@ impl Operand {
     }
 }
 
+// The fields record what the entries stood for when cleanup code was emitted for
+// them; with the tracing collector nothing is emitted, so some are never read.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 enum Cleanup {
     Val(Value),

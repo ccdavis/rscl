@@ -67,12 +67,7 @@ pub fn is_pending() -> bool {
 /// Convert an FFI return value into a `RtResult`.
 #[inline]
 pub fn check(v: Value) -> RtResult<Value> {
-    if v.is_exc() {
-        std::mem::forget(v);
-        Err(Exc)
-    } else {
-        Ok(v)
-    }
+    if v.is_exc() { Err(Exc) } else { Ok(v) }
 }
 
 /// `Class: message` for display.
@@ -119,6 +114,5 @@ pub unsafe extern "C" fn rt_take_exception() -> Value {
 #[allow(non_snake_case)]
 pub fn Exc_from(v: Value) -> Exc {
     debug_assert!(v.is_exc());
-    std::mem::forget(v);
     Exc
 }

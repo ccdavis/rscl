@@ -74,7 +74,6 @@ pub fn macroexpand_1(form: &Value) -> RtResult<Value> {
     }
     let f = v.root();
     if f.is_unbound() {
-        std::mem::forget(f);
         return Ok(form.clone());
     }
     let mut margs = vec![form.clone(), Value::NIL];
@@ -123,7 +122,7 @@ builtins! {
             }
             Some(Kind::Var) => {
                 let r = var::get(&args[0]).root();
-                if r.is_unbound() { std::mem::forget(r); return err(crate::obj::exception::ILLEGAL_STATE, format!("Var {} is unbound", var::get(&args[0]).qualified())); }
+                if r.is_unbound() { return err(crate::obj::exception::ILLEGAL_STATE, format!("Var {} is unbound", var::get(&args[0]).qualified())); }
                 Ok(r)
             }
             _ => err(CLASS_CAST, format!("{} cannot be cast to IDeref", crate::core::type_name(&args[0]))),
@@ -171,7 +170,7 @@ builtins! {
     }
     "var-get" => fn cf_var_get(args) [1] {
         let r = expect_var(&args[0])?.root();
-        if r.is_unbound() { std::mem::forget(r); return Ok(Value::NIL); }
+        if r.is_unbound() { return Ok(Value::NIL); }
         Ok(r)
     }
     "bound?" => fn cf_bound_p(args) [; 1] {

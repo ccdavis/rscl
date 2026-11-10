@@ -238,7 +238,7 @@ unsafe extern "C" fn api_pr_str(v: u64) -> u64 {
 }
 
 unsafe extern "C" fn api_exc_clear() {
-    drop(crate::exc::take());
+    let _ = crate::exc::take();
 }
 
 /// The table handed to every bridge library.

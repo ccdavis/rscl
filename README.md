@@ -19,7 +19,7 @@ Ctrl-C guards, a bridge for exposing Rust crates as rscl namespaces, `deftype`,
 `doc`, sorted maps and sets, unboxed `long`/`double` locals with `^long`/`^double`
 hints and inline arithmetic, direct calls to Rust builtins, futures, promises,
 delays, `pmap` and `locking`, locals clearing so lazy sequences stream in constant
-memory, a cycle collector, weakly interned keywords, BigInt arithmetic (`123N`, `+'`),
+memory, a tracing garbage collector, weakly interned keywords, BigInt arithmetic (`123N`, `+'`),
 source lines in stack traces, a heap limit that turns exhaustion into a catchable
 `OutOfMemoryError`, and a differential test corpus that runs every program under both
 the JIT and the AOT compiler.
@@ -52,7 +52,7 @@ crossing it throws `OutOfMemoryError` instead of letting the kernel kill the pro
 ## Tests
 
 ```bash
-cargo test                 # runtime unit tests, in-process JIT leak tests, REPL tests, corpus
+cargo test                 # runtime unit tests, in-process JIT tests, REPL tests, corpus
 scripts/validate.sh        # every tests/corpus/*.clj under JIT and AOT, diffed against tests/expected/
 target/debug/rscl run tests/corpus/scheme.clj   # the largest corpus program: a Scheme interpreter
 UPDATE_EXPECTED=1 scripts/validate.sh tests/corpus/x.clj   # (re)write an expected file
@@ -106,8 +106,8 @@ call `load-native` again to pick up changes without restarting the REPL.
 ## Design in one paragraph
 
 Values are 64-bit tagged words (63-bit fixnums, immediates for nil/booleans/chars,
-pointers to refcounted heap objects). Memory is managed by atomic reference counting
-with an explicit owned/borrowed discipline in the code generator. Every function uses
+pointers to heap objects). Memory is managed by a tracing garbage collector: stop-the-world
+mark and sweep over a non-moving heap, with machine stacks scanned conservatively. Every function uses
 one calling convention, `entry(fn, argc, argv) -> value`, so Rust builtins and
 compiled fns are interchangeable and `def` can rebind a var at any time. Exceptions
 are a sentinel return value checked after every call; nothing unwinds across the

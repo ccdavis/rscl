@@ -30,7 +30,7 @@ static OOM_THREAD: AtomicU64 = AtomicU64::new(0);
 /// The byte count at which the next collection is requested.
 static GC_NEXT: AtomicUsize = AtomicUsize::new(GC_MIN);
 /// A collection is not worth its pause below this much heap.
-const GC_MIN: usize = 32 << 20;
+const GC_MIN: usize = 64 << 20;
 /// When the pending error was raised (milliseconds, see `now_ms`).
 static RAISED_AT: AtomicU64 = AtomicU64::new(0);
 /// How long the thread that crossed the limit has to take its error before any

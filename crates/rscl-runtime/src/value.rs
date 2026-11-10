@@ -136,9 +136,7 @@ impl Value {
     /// Give up ownership and return the raw bits (no release).
     #[inline]
     pub fn into_raw(self) -> u64 {
-        let bits = self.0;
-        std::mem::forget(self);
-        bits
+        self.0
     }
     #[inline]
     pub fn bits(&self) -> u64 {

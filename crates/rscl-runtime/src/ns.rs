@@ -225,7 +225,6 @@ pub unsafe extern "C" fn rt_var_root(v: *const VarObj) -> Value {
     let var = unsafe { &*v };
     let root = var.root();
     if root.is_unbound() {
-        std::mem::forget(root);
         crate::exc::throw_new(
             crate::obj::exception::ILLEGAL_STATE,
             format!("Attempting to call unbound fn: #'{}", var.qualified()),
@@ -251,7 +250,7 @@ pub unsafe extern "C" fn rt_var_set(v: *const VarObj, val: Value) -> Value {
     if var.has_flag(var::FLAG_DYNAMIC) && var::set_binding(var, val.clone()) {
         return val;
     }
-    drop(val);
+    let _ = val;
     crate::exc::throw_new(
         crate::obj::exception::ILLEGAL_STATE,
         format!(

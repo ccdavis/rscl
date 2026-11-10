@@ -250,9 +250,8 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   fallback to the fn.
 - A `fn` without captures is one immortal object shared by every evaluation of the
   form (**divergence**: Clojure creates a new object per evaluation, so two
-  evaluations are not `identical?` there; here they are). A var whose root can never
-  be freed (an immediate or an immortal object) is read without locking or
-  refcounting.
+  evaluations are not `identical?` there; here they are). A bound, non-dynamic var is read without
+  locking.
 - `rscl build --opt` compiles with Cranelift's `speed` level and drops unreferenced
   functions at link time. The JIT uses the fast single-pass register allocator.
 
@@ -271,8 +270,8 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   `pmap`, `pcalls`, `pvalues` (semi-lazy, `available-processors` + 2 ahead),
   `locking` (a reentrant lock per object identity; immediates cannot be locked),
   `(sleep ms)`, `thread-id`.
-- Everything in the runtime is safe to share between threads: refcounts are atomic,
-  collections are persistent, vars lock their roots, atoms are compare-and-swap,
+- Everything in the runtime is safe to share between threads: collections are
+  persistent, vars lock their roots, atoms are compare-and-swap,
   lazy sequences realise under a lock, keyword interning is locked. Code is loaded
   and compiled on the main thread only: `require`, `load-file` and `eval` from a
   future throw `IllegalStateException`. Ctrl-C interrupts the main thread's
@@ -280,43 +279,58 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 
 ## Memory
 
-- Heap objects are reference counted (atomic). Compile-time constants are immortal.
+- Heap objects are managed by a tracing garbage collector (stop-the-world mark and
+  sweep; objects never move). Nothing counts references. Compile-time constants are
+  permanent.
 - Hash maps and sets use a deterministic hash by default (iteration order is the
   same in every run and in JIT and AOT, as in Clojure). `RSCL_HASH_SEED=random`
   (or `0`) mixes keys with a per-process secret so attacker-chosen keys cannot be
   made to collide, and a non-zero number is a fixed secret; iteration order then
   differs from the default. Any other value is reported on stderr and ignored.
-- Locals are cleared at their last use (as Clojure does): the value moves out of the
-  variable into the expression that uses it, so a function that passes a sequence on
-  stops holding its head. Arguments a caller no longer needs are handed over to the
-  callee (fns receive an ownership mask beside `argc`/`argv`), and the consuming core
-  fns (`reduce`, `count`, `nth`, `last`, `dorun`, `into`, `frequencies`) take them
-  over and walk them cell by cell. `(reduce + (range n))` therefore runs in constant
-  memory; a sequence held by a var or by a local used again later is kept, as in
-  Clojure.
-- Reference cycles are collected. Everything except atoms and pending values
-  (futures, promises, delays) is immutable once shared, so a cycle must pass through
-  one of them. An atom or pending value becomes a candidate when it is written or
-  when it loses a reference without dying; once enough new candidates have
-  accumulated (1024, more after a collection that walked much live data), or on
-  `(gc)` (which returns the number of objects freed; `(gc-count)` counts
-  collections), trial deletion runs from the candidates with every other thread
-  stopped at a safepoint. Candidates found live stay under watch for a few
-  collections, then drop out until they change again, unless something in their
-  own graph refers back to them (then they stay, since the cycle can die without
-  the candidate itself changing). A persistent collection on
-  the way is counted through only when it is the sole owner of its node tree (the
-  collector rebuilds it, which can unshare structure; the natives that walk a
-  borrowed collection while rscl code may run, such as the printer, `=`, `hash`
-  and `compare`, walk their own O(1) clone, so this is safe); a collection with more than
-  one reference is treated as holding its contents from outside. Cycles through a
-  native object's payload are not seen. A thread stuck in a long native call delays
-  a collection; `(gc)` throws if the others cannot be stopped within 200 ms.
+- **Roots.** The collector scans machine stacks and registers *conservatively*:
+  any word that is the address of an object keeps it alive. That covers compiled
+  code and the Rust runtime without stack maps or handles. Vars, namespaces, types,
+  protocols and compiled constants are permanent roots; the pending exception,
+  `binding` frames and argument lists passed to rscl fns by natives are roots too.
+  From the roots, objects are traced precisely.
+- **When.** A collection is requested when the heap has doubled since the last one
+  (at least 64 MB; `RSCL_GC_MIN_MB`), and runs at the next safepoint: a fn entry, a
+  loop iteration or a blocking wait, with every other thread stopped at one too.
+  Allocation itself never collects. `(gc)` collects now and returns the number of
+  objects freed; `(gc-count)` counts collections. A thread stuck in a long native
+  call delays a collection; `(gc)` throws if the others cannot be stopped within
+  200 ms.
+- **Natives.** A builtin defers collections while it runs (it may hold values in
+  Rust data the collector cannot see) unless it is declared safe; the ones that
+  drive long computations are (`reduce`, `apply`, `swap!`, the seq functions,
+  protocol and multimethod dispatch, `deref`, `require`, ...). A collection wanted
+  meanwhile runs at the first safepoint after the builtin returns. The compiler
+  defers collections while it analyses a form (macros run then).
+- **Lazy sequences stream.** Arguments a caller no longer needs are handed over to
+  the callee (fns receive an ownership mask beside `argc`/`argv`): the callee clears
+  the caller's argument slot, and the consuming core fns (`reduce`, `count`, `nth`,
+  `last`, `dorun`, `into`, `frequencies`) use that slot as their cursor, so
+  `(reduce + (range n))` runs in constant memory. A sequence held by a var or by a
+  local used again later is kept, as in Clojure. **Caveat**: because the stack scan
+  is conservative, a stale word in a frame can occasionally keep a sequence's head
+  (and so every realised cell) alive longer than Clojure would. The runtime works
+  against that (objects have their own address range, the dead stack is zeroed at
+  collections and before long-lived frames, thread-local storage is not scanned),
+  and the common idioms stream, but constant memory is not guaranteed for every
+  shape of code.
+- Cycles need no special treatment. Keywords are interned weakly: one that nothing
+  refers to is removed from the intern table when it is collected.
+- Native bridge libraries: values a library function holds on its stack are found
+  by the scan, and collections are deferred while it calls back into rscl code. A
+  library must not keep rscl values in its own long-lived storage.
+- Diagnostics: `RSCL_GC_DEBUG` (one line per collection), `RSCL_GC_STRESS=n`
+  (collect at every n-th safepoint), `RSCL_GC_VERIFY` (check every traced
+  reference), `RSCL_GC_EXPLAIN` (report what keeps sequence cells alive).
 - The heap has a soft limit: `RSCL_MAX_HEAP_MB` (`0` for none), by default half of
   the physical memory or of the cgroup limit, whichever is smaller. The allocator
   keeps count of the bytes in use; the thread whose allocation crosses the limit
   gets an `OutOfMemoryError` at its next fn entry, loop iteration or blocking wait,
-  after one cycle collection has had the chance to free enough. If that thread does
+  after one collection has had the chance to free enough. If that thread does
   not get there within 50 ms (it waits in native code), another thread running rscl
   code takes the error instead; one raised by a program's last form is reported
   while the program waits for its futures, with exit status 1. The error is

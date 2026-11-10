@@ -12,3 +12,33 @@
    ...
    fun:*std*thread*
 }
+{
+   The collector scans stacks conservatively: dead slots hold uninitialised words
+   Memcheck:Cond
+   ...
+   fun:*rscl_runtime*gc*
+}
+{
+   The collector scans stacks conservatively (values derived from scanned words)
+   Memcheck:Value8
+   ...
+   fun:*rscl_runtime*gc*
+}
+{
+   The collector reads through object slots found by the conservative scan
+   Memcheck:Cond
+   ...
+   fun:*rscl_runtime*arena*
+}
+{
+   The collector reads through object slots found by the conservative scan
+   Memcheck:Value8
+   ...
+   fun:*rscl_runtime*arena*
+}
+{
+   The dead part of the stack (below the stack pointer) is zeroed on purpose
+   Memcheck:Addr8
+   ...
+   fun:*rscl_runtime*gc*clear_dead_stack*
+}

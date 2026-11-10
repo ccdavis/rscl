@@ -118,7 +118,7 @@ macro_rules! native_fns {
                 // A native that walks a sequence it was handed gets a clean stack to
                 // work on: its frame is long-lived, and leftovers of the calls that
                 // produced the sequence must not show through it as references.
-                $( let _ = stringify!($taker); $crate::core::clear_stack_for_stream(argv, argc, owned); )?
+                $( let _ = stringify!($taker); unsafe { $crate::core::clear_stack_for_stream(argv, argc, owned) }; )?
                 unsafe { body(this, argc, argv, owned) }
             }
         )*
@@ -127,8 +127,11 @@ macro_rules! native_fns {
 
 /// Before a native starts to walk a lazy sequence its caller gave up: zero the dead
 /// stack below (see `gc::clear_dead_stack`).
+///
+/// # Safety
+/// `argv` must point at `argc` values.
 #[inline]
-pub fn clear_stack_for_stream(argv: *const Value, argc: i64, owned: u64) {
+pub unsafe fn clear_stack_for_stream(argv: *const Value, argc: i64, owned: u64) {
     if owned == 0 {
         return;
     }

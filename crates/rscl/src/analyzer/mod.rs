@@ -749,7 +749,6 @@ impl Analyzer {
     fn macroexpand(&mut self, var: VarPtr, form: &Value, items: &[Value]) -> CResult<Value> {
         let f = var.get().root();
         if f.is_unbound() {
-            std::mem::forget(f);
             return fail(form, format!("macro {} is unbound", var.get().qualified()));
         }
         let mut args = Vec::with_capacity(items.len() + 1);

@@ -451,7 +451,6 @@ pub unsafe extern "C" fn rt_run_main(v: *const obj::var::VarObj) -> i32 {
     let var = unsafe { &*v };
     let root = var.root();
     if root.is_unbound() {
-        std::mem::forget(root);
         return 0;
     }
     let cli = crate::ns::core().intern("*command-line-args*").root();
@@ -461,10 +460,7 @@ pub unsafe extern "C" fn rt_run_main(v: *const obj::var::VarObj) -> i32 {
     };
     crate::gc::clear_dead_stack();
     match root.call(&args) {
-        Ok(v) => {
-            drop(v);
-            0
-        }
+        Ok(_) => 0,
         Err(_) => unsafe { rt_report_uncaught() },
     }
 }
