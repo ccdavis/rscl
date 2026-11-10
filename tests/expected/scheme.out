@@ -1,0 +1,82 @@
+--- arithmetic
+6
+6.0
+2.5
+3 2 2
+=> (9 2 5 144 1.0)
+--- factorial
+3628800
+=> 265252859812191058636308480000000
+--- fibonacci
+=> (0 1 1 2 3 5 8 13 21 34 55 89 144 233 377)
+--- tail-calls
+=> (450015000 #t #f)
+--- closures
+=> (3 2 15 (101 102 103))
+--- lists
+8
+(6 2 9 5 1 4 1 3)
+(a b c d e)
+(1 . 2)(1 2 3)(1 2 . 3)
+(3 1 (4 1 5 9 2 6) 5 (2 6))
+(b 2)(4 1 5 9 2 6)#f
+=> ((3 1 1 5 9) 31 (3 1 4 1 5 9 2 6) 10)
+--- sorting
+(3 4 15 23 31 33 35 62 64 65 79 84 89 92)
+(3 4 15 23 31 33 35 62 64 65 79 84 89 92)
+=> #t
+--- let-forms
+(5 10 #t)
+5050
+=> (0 1 4 9 16 25)
+--- conditionals
+(negative zero one few many)
+(3 #f #t 2 #f #f)
+when-yes
+
+--- quasiquote-and-macros
+(x is 5 and twice is 10 list 1 2 3 end)
+=> (2 1 45 7)
+--- vectors
+(2 3 5 7 11 13 17 19 23 29 31 37 41 43 47 53 59)
+=> (#(1 two 3) 3 (1 two 3) #(a b) #(1 (2) "s"))
+--- hash-tables
+9
+3none
+=> ("the")
+--- strings-and-chars
+13
+SCHEME
+"Hello, Scheme!42"
+(#\A #\B #\C)
+("desserts" 12 #f "sym" made 65 #\a #\space)
+--- continuations
+-4
+#f
+=> (24 0 6)
+--- error-handling
+5
+(error division by zero (1))
+(caught oops)
+(caught car: not a pair: ())
+(caught unbound variable: undefined-fn)
+(caught procedure: expected 2 arguments, got 1)
+=> #<error: vector-ref: index out of range: 5>
+--- higher-order
+=> (11 720 3 (4 10 18))
+--- n-queens
+=> (1 0 0 2 10 4)
+--- objects
+120
+((deposit 50) (withdraw 30))
+(insufficient funds (500 120))
+=> #<error: unknown message frobnicate>
+--- streams
+=> (2 3 5 7 11 13 17 19 23 29 31 37)
+--- metacircular
+=> 3628800
+--- reader-errors
+=> #<error: unexpected end of input>
+--- summary
+21 programs, 104 primitives, 20 special forms
+collected: true

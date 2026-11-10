@@ -1167,7 +1167,7 @@ fn third_pass_review_regressions() {
                 j,
                 "[(merge {:a 1} (sorted-map :b 2)) (merge {:x 1} (->MergeRec 5))]"
             ),
-            "[{:b 2, :a 1} {:a 5, :x 1}]"
+            "[{:b 2, :a 1} {:x 1, :a 5}]"
         );
         // Deep nesting: a reader error, a catchable overflow, an iterative free.
         assert_eq!(

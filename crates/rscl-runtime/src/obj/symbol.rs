@@ -9,6 +9,9 @@ pub struct SymObj {
     pub ns: Option<Box<str>>,
     pub name: Box<str>,
     pub meta: Value,
+    /// `hash_named(ns, name)`, computed once: symbols are map keys in every
+    /// interpreter and macro.
+    pub hash: u64,
 }
 
 pub fn new(ns: Option<&str>, name: &str) -> Value {
@@ -17,6 +20,7 @@ pub fn new(ns: Option<&str>, name: &str) -> Value {
         ns: ns.map(Into::into),
         name: name.into(),
         meta: Value::NIL,
+        hash: crate::equiv::hash_named(ns, name),
     })
 }
 
@@ -78,5 +82,6 @@ pub fn with_meta(v: &Value, meta: Value) -> Value {
         ns: s.ns.clone(),
         name: s.name.clone(),
         meta,
+        hash: s.hash,
     })
 }

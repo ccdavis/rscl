@@ -407,7 +407,8 @@ pub fn collections() -> u64 {
 // ---- trial deletion -----------------------------------------------------------------
 
 struct Info {
-    /// Refcount minus the references found inside the walked subgraph.
+    /// Refcount minus the references found inside the walked subgraph (complete
+    /// after `settle`).
     count: i64,
     black: bool,
 }
@@ -597,10 +598,10 @@ unsafe fn unlink(addr: usize) {
 
 impl Walk {
     fn discover(&mut self, addr: usize, buffered: &HashSet<usize>) {
-        let mut count = header(addr).rc.load(Ordering::Relaxed);
-        if buffered.contains(&addr) {
-            count -= 1; // the buffer's own reference
-        }
+        // Starts as minus the references accounted for (the buffer's own); `mark`
+        // subtracts one per slot found, and `settle` adds the refcount once the
+        // whole graph is walked.
+        let count = if buffered.contains(&addr) { -1 } else { 0 };
         self.info.insert(
             addr,
             Info {
@@ -609,6 +610,18 @@ impl Walk {
             },
         );
         self.order.push(addr);
+    }
+
+    /// Turn "minus the internal references" into "references from outside". The
+    /// refcount is read only now: making a collection's node tree unique during
+    /// `mark` adds references to its elements (and drops the old tree's, if nothing
+    /// else shares it), so a count taken when an object was first met could be
+    /// lower than the number of slots that end up referring to it, and a live
+    /// object would look unreferenced.
+    fn settle(&mut self) {
+        for (addr, i) in self.info.iter_mut() {
+            i.count += header(*addr).rc.load(Ordering::Relaxed);
+        }
     }
 
     /// First phase: count internal references over everything reachable from `root`.
@@ -726,6 +739,21 @@ fn collect() -> usize {
         b.fresh = 0;
         (objs, set)
     };
+    // A candidate that only the buffer still references is plain garbage, not a
+    // cycle: release it without walking anything. Short-lived atoms (an
+    // interpreter's environments, loop-local state) are nearly all of this kind.
+    let (dead, cands): (Vec<Candidate>, Vec<Candidate>) = cands
+        .into_iter()
+        .partition(|c| header(c.addr).rc.load(Ordering::Relaxed) == 1);
+    let mut buffered = buffered;
+    let early = dead.len();
+    for c in &dead {
+        buffered.remove(&c.addr);
+        marks(c.addr).1.store(false, Ordering::Release);
+    }
+    for c in dead {
+        unsafe { crate::value::release_raw(c.addr as u64) };
+    }
     let roots: Vec<usize> = cands.iter().map(|c| c.addr).collect();
     *COLLECTIONS.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     let mut walk = Walk {
@@ -736,6 +764,7 @@ fn collect() -> usize {
     for &r in &roots {
         walk.mark(r, &buffered);
     }
+    walk.settle();
     walk.scan();
     if std::env::var_os("RSCL_GC_DEBUG").is_some() {
         eprintln!("gc: {} roots, {} walked", roots.len(), walk.order.len());
@@ -767,7 +796,7 @@ fn collect() -> usize {
     // Live candidates stay buffered (keeping their reference) for a few rounds, in
     // case a reference from outside the cycle goes away soon; ones that stay live
     // and unchanged leave the buffer until their next write or lost reference.
-    let freed = whites.len();
+    let freed = whites.len() + early;
     let white_set: HashSet<usize> = whites.iter().copied().collect();
     // Releasing may free objects whose drops reach the buffer: do it after the lock.
     let mut to_release: Vec<usize> = Vec::new();

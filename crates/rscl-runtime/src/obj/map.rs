@@ -4,7 +4,7 @@
 //! keys maps by attacker-controlled data can set `RSCL_HASH_SEED=random` (or a
 //! number) to mix keys with a per-process secret, which defeats precomputed hash
 //! collisions at the cost of a stable iteration order.
-use std::hash::{BuildHasher, DefaultHasher, RandomState};
+use std::hash::{BuildHasher, RandomState};
 use std::sync::OnceLock;
 
 use super::{Kind, alloc, cast};
@@ -37,15 +37,20 @@ fn seed() -> Option<u64> {
 pub struct Hasher;
 
 pub enum Mixer {
-    Fixed(DefaultHasher),
-    Keyed { h: u64, key: u64 },
+    /// Deterministic mode: `hasheq` is already well mixed, so its value is used as
+    /// is (hashing it again cost more than the lookup it served).
+    Fixed(u64),
+    Keyed {
+        h: u64,
+        key: u64,
+    },
 }
 
 impl BuildHasher for Hasher {
     type Hasher = Mixer;
     fn build_hasher(&self) -> Mixer {
         match seed() {
-            None => Mixer::Fixed(DefaultHasher::new()),
+            None => Mixer::Fixed(0),
             Some(key) => Mixer::Keyed { h: key, key },
         }
     }
@@ -54,13 +59,17 @@ impl BuildHasher for Hasher {
 impl std::hash::Hasher for Mixer {
     fn finish(&self) -> u64 {
         match self {
-            Mixer::Fixed(h) => h.finish(),
+            Mixer::Fixed(h) => *h,
             Mixer::Keyed { h, .. } => *h,
         }
     }
     fn write(&mut self, bytes: &[u8]) {
         match self {
-            Mixer::Fixed(h) => h.write(bytes),
+            Mixer::Fixed(h) => {
+                for b in bytes {
+                    *h = (*h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
+                }
+            }
             Mixer::Keyed { h, key } => {
                 for b in bytes {
                     *h = crate::equiv::mix64(
@@ -72,7 +81,7 @@ impl std::hash::Hasher for Mixer {
     }
     fn write_u64(&mut self, x: u64) {
         match self {
-            Mixer::Fixed(h) => h.write_u64(x),
+            Mixer::Fixed(h) => *h = x ^ h.rotate_left(17),
             Mixer::Keyed { h, key } => *h = crate::equiv::mix64(x ^ *key ^ h.rotate_left(17)),
         }
     }

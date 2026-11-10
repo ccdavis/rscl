@@ -54,6 +54,7 @@ crossing it throws `OutOfMemoryError` instead of letting the kernel kill the pro
 ```bash
 cargo test                 # runtime unit tests, in-process JIT leak tests, REPL tests, corpus
 scripts/validate.sh        # every tests/corpus/*.clj under JIT and AOT, diffed against tests/expected/
+target/debug/rscl run tests/corpus/scheme.clj   # the largest corpus program: a Scheme interpreter
 UPDATE_EXPECTED=1 scripts/validate.sh tests/corpus/x.clj   # (re)write an expected file
 ```
 

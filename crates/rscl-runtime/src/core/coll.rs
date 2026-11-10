@@ -194,7 +194,7 @@ builtins! {
         } else {
             merge_sort(items, &mut |a, b| coll::compare(a, b))?
         };
-        Ok(if items.is_empty() { Value::NIL } else { list::from_iter(items) })
+        Ok(if items.is_empty() { list::empty() } else { list::from_iter(items) })
     }
     "sort-by" => fn cf_sort_by(args) [2, 3] {
         let items = coll::to_vec(&args[args.len() - 1])?;
@@ -203,7 +203,7 @@ builtins! {
         let keyed = merge_sort(keyed, &mut |(ka, _), (kb, _)| {
             if args.len() == 3 { compare_with(&args[1], ka, kb) } else { coll::compare(ka, kb) }
         })?;
-        Ok(if keyed.is_empty() { Value::NIL } else { list::from_iter(keyed.into_iter().map(|(_, x)| x).collect::<Vec<_>>()) })
+        Ok(if keyed.is_empty() { list::empty() } else { list::from_iter(keyed.into_iter().map(|(_, x)| x).collect::<Vec<_>>()) })
     }
     "apply" => fn cf_apply(args) [; 2] {
         let mut fargs: Vec<Value> = args[1..args.len() - 1].iter().map(|a| a.owned()).collect();

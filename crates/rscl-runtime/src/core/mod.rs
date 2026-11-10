@@ -202,6 +202,7 @@ pub fn arity_error(name: &str, argc: i64) -> Value {
 }
 
 /// Turn a builtin body's outcome into the FFI return value.
+#[inline(always)]
 pub fn finish(name: &str, r: std::thread::Result<crate::exc::RtResult<Value>>) -> Value {
     match r {
         Ok(Ok(v)) => v,

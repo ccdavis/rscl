@@ -368,8 +368,12 @@
       (proc (first s))
       (recur (next s)))))
 
-(defn mapv [f & colls] (vec (apply map f colls)))
-(defn filterv [pred coll] (vec (filter pred coll)))
+(defn mapv
+  "A vector of f applied to the items of coll (or of the colls, in step). Eager: no
+  lazy sequence is built for the single-collection case."
+  ([f coll] (reduce (fn [v x] (conj v (f x))) [] coll))
+  ([f c1 & colls] (vec (apply map f c1 colls))))
+(defn filterv [pred coll] (reduce (fn [v x] (if (pred x) (conj v x) v)) [] coll))
 
 (defn max-key
   ([k x] x)
@@ -931,3 +935,19 @@
   [& exprs]
   `(pcalls ~@(map (fn [e] (list 'clojure.core/fn [] e)) exprs)))
 
+
+;;; ---- additions found by larger programs ----------------------------------------------
+
+(defn subvec
+  "The items of vector v from start (inclusive) to end (exclusive, default: its end)."
+  ([v start] (subvec v start (count v)))
+  ([v start end]
+   (when (or (< start 0) (> end (count v)) (> start end))
+     (throw (ex-info "subvec: index out of bounds" {:start start :end end :count (count v)})))
+   (loop [i start out []]
+     (if (< i end) (recur (inc i) (conj out (nth v i))) out))))
+
+(defn abs
+  "The absolute value of a number."
+  [x]
+  (if (neg? x) (-' x) x))

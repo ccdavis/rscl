@@ -14,7 +14,8 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
     }
     // Too deep to compare: `StackOverflowError` is left pending (the `=` builtin
     // rethrows it) and the answer is "not equal".
-    if a.kind().is_some() && crate::native::stack_low() {
+    // (Only collections recurse.)
+    if a.kind().is_some_and(nests) && crate::native::stack_low() {
         crate::exc::throw_new(crate::obj::exception::STACK_OVERFLOW, "stack overflow");
         return false;
     }
@@ -35,7 +36,7 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
         (Kind::String, Kind::String) => obj::string::get(a) == obj::string::get(b),
         (Kind::Symbol, Kind::Symbol) => {
             let (x, y) = (obj::symbol::get(a), obj::symbol::get(b));
-            x.ns == y.ns && x.name == y.name
+            x.hash == y.hash && x.ns == y.ns && x.name == y.name
         }
         (
             Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq,
@@ -61,6 +62,22 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Kinds whose equality and hash recurse into elements.
+fn nests(k: Kind) -> bool {
+    matches!(
+        k,
+        Kind::List
+            | Kind::Vector
+            | Kind::Cons
+            | Kind::LazySeq
+            | Kind::Map
+            | Kind::Set
+            | Kind::SortedMap
+            | Kind::SortedSet
+            | Kind::Instance
+    )
 }
 
 /// Entry-wise comparison of a hash map and/or a sorted map.
@@ -213,14 +230,14 @@ pub fn hasheq(v: &Value) -> u64 {
     if let Some(n) = v.int_value() {
         return mix64(n as u64);
     }
-    // Too deep to walk: stop descending (equal structures still hash alike).
-    if crate::native::stack_low() {
-        return mix64(0x5eed);
-    }
     let Some(kind) = v.kind() else {
         // nil, bools, chars: the bit pattern itself is unique per value.
         return mix64(v.bits() ^ 0xa5a5);
     };
+    // Too deep to walk: stop descending (equal structures still hash alike).
+    if nests(kind) && crate::native::stack_low() {
+        return mix64(0x5eed);
+    }
     match kind {
         Kind::Long => unreachable!("handled by int_value"),
         // A BigInt that fits a long was handled by `int_value`, with the long's hash.
@@ -230,10 +247,7 @@ pub fn hasheq(v: &Value) -> u64 {
         // `+ 0.0` turns -0.0 into 0.0: the two are `=`, so they hash alike.
         Kind::Double => mix64((obj::double::get(v) + 0.0).to_bits() ^ 0xd0d0),
         Kind::String => mix64(hash_bytes(obj::string::get(v).as_bytes())),
-        Kind::Symbol => {
-            let s = obj::symbol::get(v);
-            mix64(hash_named(s.ns(), s.name()))
-        }
+        Kind::Symbol => mix64(obj::symbol::get(v).hash),
         Kind::Keyword => obj::keyword::get(v).hash,
         Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq => {
             let mut h = SEQ_SEED;
