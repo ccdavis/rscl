@@ -80,6 +80,7 @@ pub fn new(proto: *const FnProto, ncaptures: usize) -> Value {
 /// Store a capture (takes ownership of `v`). Only valid before the fn is shared.
 pub unsafe fn set_capture(f: &Value, i: usize, v: Value) {
     unsafe {
+        // No write barrier: the fn object was allocated a moment ago and is young.
         *capture_ptr(f, i) = v;
     }
 }

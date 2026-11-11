@@ -78,12 +78,25 @@ fn reserve(len: usize) -> Option<usize> {
     (p as isize != -1 && !p.is_null()).then_some(p as usize)
 }
 
-/// The reserved ranges: object blocks, one class byte per block, and the bitmaps.
+/// The reserved ranges: object blocks, one class byte per block, and four bitmaps
+/// with one bit per 16 bytes of heap; the bit of an object is
+/// `(address - base) / 16` in each.
+///
+/// * `bitmaps`: the slot is in use.
+/// * `marks`: reached in the collection that is running (scratch between
+///   collections).
+/// * `olds`: the object is old: it has survived two collections, and minor
+///   collections no longer look at it.
+/// * `ageds`: the object has survived one collection. It is still young, so it is
+///   traced and swept like a new object, but its next survival makes it old.
 struct Layout {
     base: usize,
     blocks: usize,
     classes: usize,
     bitmaps: usize,
+    marks: usize,
+    olds: usize,
+    ageds: usize,
 }
 
 fn layout() -> &'static Layout {
@@ -96,8 +109,13 @@ fn layout() -> &'static Layout {
             let Some(base) = reserve(blocks << BLOCK_SHIFT) else {
                 continue;
             };
-            let (Some(classes), Some(bitmaps)) = (reserve(blocks), reserve(blocks * WORDS * 8))
-            else {
+            let (Some(classes), Some(bitmaps), Some(marks), Some(olds), Some(ageds)) = (
+                reserve(blocks),
+                reserve(blocks * WORDS * 8),
+                reserve(blocks * WORDS * 8),
+                reserve(blocks * WORDS * 8),
+                reserve(blocks * WORDS * 8),
+            ) else {
                 continue;
             };
             return Layout {
@@ -105,6 +123,9 @@ fn layout() -> &'static Layout {
                 blocks,
                 classes,
                 bitmaps,
+                marks,
+                olds,
+                ageds,
             };
         }
         panic!("cannot reserve address space for the object heap");
@@ -116,7 +137,6 @@ fn layout() -> &'static Layout {
 static USED_END: AtomicUsize = AtomicUsize::new(0);
 /// Bumped by every collection: threads then drop the blocks they held.
 static EPOCH: AtomicU64 = AtomicU64::new(1);
-static OBJECTS: AtomicUsize = AtomicUsize::new(0);
 
 struct Pool {
     /// Blocks handed out so far (indices below this may be in use).
@@ -125,6 +145,9 @@ struct Pool {
     free: Vec<u32>,
     /// Per class: blocks with free slots that no thread holds.
     partial: [Vec<u32>; NCLASSES],
+    /// Blocks threads have taken since the last collection: every object
+    /// allocated since then is in one of them.
+    young: Vec<u32>,
 }
 
 fn pool() -> MutexGuard<'static, Pool> {
@@ -134,6 +157,7 @@ fn pool() -> MutexGuard<'static, Pool> {
             next: 0,
             free: Vec::new(),
             partial: [const { Vec::new() }; NCLASSES],
+            young: Vec::new(),
         })
     })
     .lock()
@@ -153,6 +177,75 @@ unsafe fn class_ptr(l: &Layout, block: usize) -> *mut u8 {
 #[inline]
 unsafe fn bitmap(l: &Layout, block: usize) -> *mut u64 {
     (l.bitmaps + block * WORDS * 8) as *mut u64
+}
+
+/// Mark the object at `addr`; true if it was not marked before. The marks are kept
+/// apart from the objects: a collection that meets many references to objects it
+/// has already marked (or, in a minor collection, to old ones) decides each from
+/// this dense bitmap without touching the object. Only the collector calls this,
+/// with the world stopped.
+#[inline]
+pub fn mark(addr: usize) -> bool {
+    let l = layout();
+    let i = (addr - l.base) >> 4;
+    let w = (l.marks + (i >> 6) * 8) as *mut u64;
+    let bit = 1u64 << (i & 63);
+    unsafe {
+        if *w & bit != 0 {
+            false
+        } else {
+            *w |= bit;
+            true
+        }
+    }
+}
+
+/// Was the object at `addr` reached in the collection that is running (or, in a
+/// minor one, is it old)?
+#[inline]
+pub fn is_marked(addr: usize) -> bool {
+    let l = layout();
+    let i = (addr - l.base) >> 4;
+    let w = (l.marks + (i >> 6) * 8) as *const u64;
+    unsafe { std::ptr::read_volatile(w) & (1u64 << (i & 63)) != 0 }
+}
+
+/// Is the object at `addr` old (see `Layout`)?
+#[inline]
+pub fn is_old(addr: usize) -> bool {
+    let l = layout();
+    let i = (addr - l.base) >> 4;
+    let w = (l.olds + (i >> 6) * 8) as *const u64;
+    unsafe { std::ptr::read_volatile(w) & (1u64 << (i & 63)) != 0 }
+}
+
+/// Will the object at `addr` still be young after the collection that is running,
+/// if it is reached? (It is neither old nor aged: this is its first survival.)
+#[inline]
+pub fn stays_young(addr: usize) -> bool {
+    let l = layout();
+    let i = (addr - l.base) >> 4;
+    let bit = 1u64 << (i & 63);
+    unsafe {
+        let old = std::ptr::read_volatile((l.olds + (i >> 6) * 8) as *const u64);
+        let aged = std::ptr::read_volatile((l.ageds + (i >> 6) * 8) as *const u64);
+        (old | aged) & bit == 0
+    }
+}
+
+/// Prepare the marks for a collection: none for a full one; for a minor one every
+/// old object starts out marked, so the trace neither enters nor frees it.
+pub fn begin_marks(full: bool) {
+    let l = layout();
+    let p = pool();
+    let bytes = p.next * WORDS * 8;
+    unsafe {
+        if full {
+            std::ptr::write_bytes(l.marks as *mut u8, 0, bytes);
+        } else {
+            std::ptr::copy_nonoverlapping(l.olds as *const u8, l.marks as *mut u8, bytes);
+        }
+    }
 }
 
 /// A thread's allocation state: per class, the block it fills (index + 1; 0: none)
@@ -258,7 +351,6 @@ pub fn alloc(size: usize) -> *mut u8 {
             block_addr(l, block) + i * csize
         }
     };
-    OBJECTS.fetch_add(1, Ordering::Relaxed);
     crate::heap::account_object(csize as isize);
     addr as *mut u8
 }
@@ -268,6 +360,7 @@ pub fn alloc(size: usize) -> *mut u8 {
 fn acquire(l: &Layout, class: usize) -> usize {
     let mut p = pool();
     if let Some(b) = p.partial[class].pop() {
+        p.young.push(b);
         return b as usize;
     }
     let block = match p.free.pop() {
@@ -283,6 +376,7 @@ fn acquire(l: &Layout, class: usize) -> usize {
         }
     };
     unsafe { *class_ptr(l, block) = class as u8 };
+    p.young.push(block as u32);
     block
 }
 
@@ -320,23 +414,27 @@ pub fn slot_size(addr: usize) -> usize {
     class_size(unsafe { *class_ptr(l, block) } as usize)
 }
 
+/// Number of objects in the heap (counted from the bitmaps: a diagnostic).
 pub fn object_count() -> usize {
-    OBJECTS.load(Ordering::Relaxed)
+    let l = layout();
+    let p = pool();
+    let mut n = 0usize;
+    for block in 0..p.next {
+        if unsafe { *class_ptr(l, block) } == 0 {
+            continue;
+        }
+        let bits = unsafe { bitmap(l, block) };
+        for w in 0..WORDS {
+            n += unsafe { *bits.add(w) }.count_ones() as usize;
+        }
+    }
+    n
 }
 
-/// Visit every object; `keep` decides whether it stays (and may clear its mark).
-/// Objects that do not stay are dropped by `keep` itself before it returns false.
-/// The world must be stopped. Blocks left empty are released; every other block
-/// goes back to the pool, so threads start the next cycle with fresh blocks.
-pub fn sweep(mut keep: impl FnMut(*mut ObjHeader) -> bool) -> usize {
+/// Visit every object in the heap. The world must be stopped.
+pub fn for_each_object(mut f: impl FnMut(*mut ObjHeader)) {
     let l = layout();
-    let mut p = pool();
-    EPOCH.fetch_add(1, Ordering::Relaxed);
-    for list in p.partial.iter_mut() {
-        list.clear();
-    }
-    let mut freed = 0usize;
-    let mut freed_bytes = 0usize;
+    let p = pool();
     for block in 0..p.next {
         let class = unsafe { *class_ptr(l, block) } as usize;
         if class == 0 {
@@ -344,24 +442,116 @@ pub fn sweep(mut keep: impl FnMut(*mut ObjHeader) -> bool) -> usize {
         }
         let csize = class_size(class);
         let step = csize / GRAIN;
-        let slots = BLOCK / csize;
         let bits = unsafe { bitmap(l, block) };
-        let mut live = 0usize;
         for w in 0..WORDS {
             let mut word = unsafe { *bits.add(w) };
             while word != 0 {
                 let b = word.trailing_zeros() as usize;
                 word &= word - 1;
                 let bit = w * 64 + b;
-                let addr = block_addr(l, block) + bit / step * csize;
-                if keep(addr as *mut ObjHeader) {
-                    live += 1;
+                f((block_addr(l, block) + bit / step * csize) as *mut ObjHeader);
+            }
+        }
+    }
+}
+
+/// Sweep after marking. The world must be stopped.
+///
+/// * An object in use that was not reached is offered to `finalize`, which either
+///   keeps it (returns true: a permanent object) or drops its fields and returns
+///   false, whereupon its slot is released.
+/// * A young object that was reached for the first time is *aged*: it stays young.
+/// * A young object that was reached again is *promoted*: it is old from now on,
+///   and is reported to `promoted` (it may refer to young objects, which the
+///   collector must know about, since minor collections will not look inside it).
+///
+/// A `full` sweep visits every block; otherwise only the young blocks: those
+/// allocated into since the last collection and those that still hold aged
+/// objects. Blocks left empty are released, and every block visited goes back to
+/// the pool, so threads start the next cycle with blocks of their own.
+pub fn sweep(
+    full: bool,
+    mut finalize: impl FnMut(*mut ObjHeader) -> bool,
+    mut promoted: impl FnMut(*mut ObjHeader),
+) -> usize {
+    let l = layout();
+    let mut p = pool();
+    EPOCH.fetch_add(1, Ordering::Relaxed);
+    let mut young = std::mem::take(&mut p.young);
+    let blocks: Vec<u32> = if full {
+        // Every list is rebuilt from scratch.
+        for list in p.partial.iter_mut() {
+            list.clear();
+        }
+        (0..p.next as u32).collect()
+    } else {
+        // A block is listed once for each time a thread took it, and once more if
+        // it holds aged objects: visit it once. (A young block left the partial
+        // lists when a thread took it; one that only holds aged objects may still
+        // be in them.)
+        young.sort_unstable();
+        young.dedup();
+        for list in p.partial.iter_mut() {
+            list.retain(|b| young.binary_search(b).is_err());
+        }
+        young
+    };
+    let mut freed = 0usize;
+    let mut freed_bytes = 0usize;
+    for block in blocks {
+        let block = block as usize;
+        let class = unsafe { *class_ptr(l, block) } as usize;
+        if class == 0 {
+            continue;
+        }
+        let csize = class_size(class);
+        let slots = BLOCK / csize;
+        let at = block * WORDS * 8;
+        let bits = (l.bitmaps + at) as *mut u64;
+        let marks = (l.marks + at) as *const u64;
+        let olds = (l.olds + at) as *mut u64;
+        let ageds = (l.ageds + at) as *mut u64;
+        let mut live = 0usize;
+        let mut has_young = false;
+        for w in 0..WORDS {
+            let used = unsafe { *bits.add(w) };
+            if used == 0 {
+                continue;
+            }
+            let (mark, mut old, aged) = unsafe { (*marks.add(w), *olds.add(w), *ageds.add(w)) };
+            let young_live = used & mark & !old;
+            let first = young_live & !aged;
+            let mut second = young_live & aged;
+            old |= second;
+            let mut kept = used;
+            let mut dead = used & !mark;
+            while dead != 0 {
+                let b = dead.trailing_zeros() as usize;
+                dead &= dead - 1;
+                let addr = block_addr(l, block) + (w * 64 + b) * GRAIN;
+                if finalize(addr as *mut ObjHeader) {
+                    // Kept though unreached: it never needs looking at again.
+                    old |= 1 << b;
                 } else {
-                    unsafe { *bits.add(w) &= !(1 << b) };
+                    kept &= !(1 << b);
                     freed += 1;
                     freed_bytes += csize;
                 }
             }
+            while second != 0 {
+                let b = second.trailing_zeros() as usize;
+                second &= second - 1;
+                promoted((block_addr(l, block) + (w * 64 + b) * GRAIN) as *mut ObjHeader);
+            }
+            let aged = (aged | first) & kept;
+            let old = old & kept;
+            unsafe {
+                *bits.add(w) = kept;
+                *olds.add(w) = old;
+                *ageds.add(w) = aged;
+            }
+            live += kept.count_ones() as usize;
+            has_young |= aged & !old != 0;
         }
         if live == 0 {
             unsafe { *class_ptr(l, block) = 0 };
@@ -371,11 +561,16 @@ pub fn sweep(mut keep: impl FnMut(*mut ObjHeader) -> bool) -> usize {
                 unsafe { madvise(block_addr(l, block) as *mut u8, BLOCK, MADV_DONTNEED) };
             }
             p.free.push(block as u32);
-        } else if live < slots {
-            p.partial[class].push(block as u32);
+        } else {
+            if live < slots {
+                p.partial[class].push(block as u32);
+            }
+            if has_young {
+                // Its aged objects are examined again by the next collection.
+                p.young.push(block as u32);
+            }
         }
     }
-    OBJECTS.fetch_sub(freed, Ordering::Relaxed);
     crate::heap::account_object(-(freed_bytes as isize));
     freed
 }

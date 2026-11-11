@@ -191,7 +191,8 @@ pub fn set_meta_unshared(v: &Value, meta_: Value) {
             Some(Kind::Instance) => (*(p as *mut types::InstanceObj)).meta = meta_,
             Some(Kind::SortedMap) => (*(p as *mut sorted::SortedMapObj)).meta = meta_,
             Some(Kind::SortedSet) => (*(p as *mut sorted::SortedSetObj)).meta = meta_,
-            _ => {}
+            _ => return,
         }
+        crate::gc::write_barrier(p);
     }
 }

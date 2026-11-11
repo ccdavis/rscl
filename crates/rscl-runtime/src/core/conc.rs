@@ -294,11 +294,17 @@ builtins! {
         lock(&args[0])?;
         Ok(Value::NIL)
     }
-    "gc" => @gc fn cc_gc(args) [0] {
-        let _ = args;
-        match crate::gc::collect_now() {
+    // (gc): a full collection. (gc :minor): only what was allocated since the last
+    // collection is examined. Returns the number of objects freed.
+    "gc" => @gc fn cc_gc(args) [0, 1] {
+        let minor = match args.first() {
+            None => false,
+            Some(k) if crate::obj::keyword::as_kw(k).is_some_and(|k| k.ns().is_none() && k.name() == "minor") => true,
+            Some(k) => return err(ILLEGAL_ARGUMENT, format!("gc: unknown option {}", crate::printer::pr_str(k))),
+        };
+        match crate::gc::collect_now(minor) {
             Some(n) => Ok(Value::int(n as i64)),
-            None => err(ILLEGAL_STATE, "gc: another thread did not reach a safepoint in time"),
+            None => err(ILLEGAL_STATE, "gc: cannot collect now (another thread did not reach a safepoint in time, or collections are deferred here)"),
         }
     }
     "gc-count" => fn cc_gc_count(args) [0] { let _ = args; Ok(Value::int(crate::gc::collections() as i64)) }

@@ -174,6 +174,7 @@ impl VarObj {
     /// Replace the root.
     pub fn bind_root(&self, v: Value) {
         *self.root.lock().unwrap() = v;
+        crate::gc::write_barrier(self);
         self.refresh_fast();
     }
 
@@ -228,6 +229,7 @@ impl VarObj {
             }
         }
         *self.meta.lock().unwrap() = m;
+        crate::gc::write_barrier(self);
     }
     pub fn qualified(&self) -> String {
         format!("{}/{}", self.ns, self.name)

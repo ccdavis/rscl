@@ -98,10 +98,12 @@ pub fn realize(v: &Value) -> RtResult<Value> {
     match result {
         Ok(s) => {
             *g = State::Realized(s.clone());
+            crate::gc::write_barrier(obj);
             Ok(s)
         }
         Err(e) => {
             *g = State::Unrealized(thunk);
+            crate::gc::write_barrier(obj);
             Err(e)
         }
     }

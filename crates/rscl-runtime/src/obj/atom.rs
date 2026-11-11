@@ -52,17 +52,21 @@ impl AtomObj {
     }
     pub fn set_meta(&self, m: Value) {
         *self.meta.lock().unwrap() = m;
+        crate::gc::write_barrier(self);
     }
     /// Store `v`, returning it (+1) like `reset!`.
     pub fn reset(&self, v: Value) -> Value {
         let r = v.clone();
         *self.value.lock().unwrap() = v;
+        crate::gc::write_barrier(self);
         r
     }
     pub fn compare_and_set(&self, expected: &Value, new: Value) -> bool {
         let mut g = self.value.lock().unwrap();
         if g.identical(expected) {
             *g = new;
+            drop(g);
+            crate::gc::write_barrier(self);
             true
         } else {
             false

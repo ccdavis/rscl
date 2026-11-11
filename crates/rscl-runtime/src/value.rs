@@ -35,10 +35,11 @@ const IMM_PAYLOAD_SHIFT: u32 = 8;
 pub const FIXNUM_MIN: i64 = -(1 << 62);
 pub const FIXNUM_MAX: i64 = (1 << 62) - 1;
 
-/// Header flag: reached in the collection that is running (see `gc.rs`).
-pub const MARK: u64 = 1;
 /// Header flag: never freed (vars, namespaces, types, compiled constants).
 pub const PERMANENT: u64 = 2;
+/// Header flag: an old object that was written since the last collection, so it
+/// may refer to young objects (it is in the collector's remembered set).
+pub const REMEMBERED: u64 = 4;
 
 /// Header shared by every heap object. `flags` belongs to the collector; `pos` is a
 /// source-position id (see `pos.rs`), zero when unknown.

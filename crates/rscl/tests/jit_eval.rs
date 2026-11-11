@@ -10,6 +10,9 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn with_jit<F: FnOnce(&mut Jit)>(f: F) {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Every collection in these tests checks its own work (see `RSCL_GC_VERIFY`).
+    // SAFETY: set under the lock, before the runtime reads its settings.
+    unsafe { std::env::set_var("RSCL_GC_VERIFY", "1") };
     let mut jit = Jit::new().expect("jit");
     f(&mut jit);
 }
@@ -1165,5 +1168,77 @@ fn third_pass_review_regressions() {
             ),
             "[true :so]"
         );
+    });
+}
+
+#[test]
+fn old_objects_written_after_a_collection_keep_what_they_refer_to() {
+    with_jit(|j| {
+        // Each store below goes into an object that has survived two collections
+        // (it is old) and refers to objects made afterwards. A minor collection
+        // does not look inside old objects, so only the write barrier keeps the
+        // new objects alive, and it has to keep doing so while they are young.
+        def(j, "(def a (atom nil))");
+        def(j, "(def v nil)");
+        def(j, "(def p (promise))");
+        def(j, "(def d (delay (mapv str (range 30))))");
+        def(j, "(def s (map str (range 200)))");
+        def(j, "(defprotocol Shape (area [x]))");
+        def(j, "(defrecord Sq [side])");
+        def(j, "(do (gc) (gc))");
+        def(j, "(reset! a (mapv str (range 50)))");
+        def(j, "(alter-meta! a assoc :note (str \"n\" 1))");
+        def(j, "(def v (vec (map str (range 20))))");
+        def(j, "(deliver p (str \"x\" 1))");
+        def(
+            j,
+            "(extend-type Sq Shape (area [x] (str (* (:side x) (:side x)))))",
+        );
+        def(j, "(gc :minor)");
+        // Realised and forced after they became old, then collected again.
+        def(j, "(first s)");
+        def(j, "(force d)");
+        def(j, "(do (gc :minor) (gc :minor) (gc :minor))");
+        assert_eq!(
+            eval(j, "[(count @a) (first @a) (last @a)]"),
+            "[50 \"0\" \"49\"]"
+        );
+        assert_eq!(eval(j, "(:note (meta a))"), "\"n1\"");
+        assert_eq!(eval(j, "[(count v) (v 19)]"), "[20 \"19\"]");
+        assert_eq!(eval(j, "@p"), "\"x1\"");
+        assert_eq!(eval(j, "(area (->Sq 7))"), "\"49\"");
+        assert_eq!(eval(j, "[(count s) (last s)]"), "[200 \"199\"]");
+        assert_eq!(eval(j, "(count @d)"), "30");
+        // swap! in a loop across minor collections.
+        def(j, "(def acc (atom []))");
+        def(j, "(do (gc) (gc))");
+        assert_eq!(
+            eval(
+                j,
+                "(do (dotimes [i 300] (swap! acc conj (str i)) (when (zero? (rem i 50)) (gc :minor))) [(count @acc) (@acc 0) (@acc 299)])"
+            ),
+            "[300 \"0\" \"299\"]"
+        );
+        // An object that has survived one collection is still young: a minor
+        // collection frees it once it is garbage.
+        def(j, "(def once (vec (map str (range 1000))))");
+        def(j, "(gc :minor)");
+        def(j, "(def once nil)");
+        let minor: i64 = def(j, "(gc :minor)").parse().unwrap();
+        assert!(
+            minor >= 1000,
+            "aged garbage survived a minor collection: {minor}"
+        );
+        // After two it is old, and only a full collection finds it.
+        def(j, "(def big (vec (map str (range 1000))))");
+        def(j, "(do (gc :minor) (gc :minor))");
+        def(j, "(def big nil)");
+        let minor: i64 = def(j, "(gc :minor)").parse().unwrap();
+        let full: i64 = def(j, "(gc)").parse().unwrap();
+        assert!(
+            minor < 1000,
+            "a minor collection freed old objects: {minor}"
+        );
+        assert!(full >= 1000, "a full collection left old garbage: {full}");
     });
 }

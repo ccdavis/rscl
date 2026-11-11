@@ -111,6 +111,7 @@ impl PendingObj {
             return false;
         }
         *st = State::Done(v);
+        crate::gc::write_barrier(self);
         self.cv.notify_all();
         drop(st);
         true
@@ -123,6 +124,7 @@ impl PendingObj {
             return false;
         }
         *st = State::Failed(e);
+        crate::gc::write_barrier(self);
         self.cv.notify_all();
         drop(st);
         true
@@ -251,11 +253,13 @@ impl PendingObj {
         match r {
             Ok(v) => {
                 *self.lock() = State::Done(v.clone());
+                crate::gc::write_barrier(self);
                 Ok(v)
             }
             Err(Exc) => {
                 let e = exc::take().unwrap_or(Value::NIL);
                 *self.lock() = State::Failed(e.clone());
+                crate::gc::write_barrier(self);
                 Err(exc::throw(e))
             }
         }

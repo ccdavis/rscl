@@ -400,6 +400,7 @@ impl ProtocolObj {
             .entry(key)
             .or_default()
             .insert(method.to_string(), f);
+        crate::gc::write_barrier(self);
     }
     /// The implementation for `key`, falling back to `Object` (`nil` is not an
     /// `Object`, as in Clojure).

@@ -297,13 +297,27 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   Vars, namespaces, types, protocols and compiled constants are permanent roots;
   the pending exception, `binding` frames and the argument lists of calls in
   progress are roots too. From the roots, objects are traced precisely.
-- **When.** A collection is requested when the heap has doubled since the last one
-  (at least 64 MB; `RSCL_GC_MIN_MB`), and runs at the next safepoint: a fn entry, a
+- **Generations.** An object that has survived two collections is *old*. Most
+  collections are minor: they trace from the roots and from the old objects that
+  may refer to young ones, do not look inside other old objects, and sweep only
+  the memory that holds young objects, so their cost follows the recent
+  survivors, not the size of the heap. Old objects that die are found by a full
+  collection, which runs when the old generation has doubled since the last full
+  one. Stores into existing objects are rare here (atoms, vars, lazy seqs and
+  futures being realised, protocol tables), and each is followed by a write
+  barrier in the runtime; compiled code has none. Two survivals rather than one,
+  because the single cell of a lazy sequence that is live when a collection runs
+  would otherwise become old and, once dead, keep the rest of the sequence alive
+  until a full collection. One limit: a new version of a large persistent
+  collection is a young object, and a minor collection visits all of its
+  elements.
+- **When.** A collection is requested when 32 MB have been allocated since the
+  last one (`RSCL_GC_MIN_MB`), and runs at the next safepoint: a fn entry, a
   loop iteration or a blocking wait, with every other thread stopped at one too.
-  Allocation itself never collects. `(gc)` collects now and returns the number of
-  objects freed; `(gc-count)` counts collections. A thread stuck in a long native
-  call delays a collection; `(gc)` throws if the others cannot be stopped within
-  200 ms.
+  Allocation itself never collects. `(gc)` runs a full collection now (`(gc :minor)` a minor
+  one) and returns the number of objects freed; `(gc-count)` counts collections. A thread stuck in
+  a long native call delays a collection; `(gc)` throws if the others cannot be
+  stopped within 200 ms.
 - **Natives.** A builtin defers collections while it runs (it may hold values in
   Rust data the collector cannot see) unless it is declared safe; the ones that
   drive long computations are (`reduce`, `apply`, `swap!`, the seq functions,
@@ -330,10 +344,13 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   library must not keep rscl values in its own long-lived storage.
 - Diagnostics: `RSCL_GC_DEBUG` (one line per collection), `RSCL_GC_STRESS=n`
   (collect at every n-th safepoint), `RSCL_GC_VERIFY` (check every traced
-  reference and stack-map slot), `RSCL_GC_CHAIN` (report the longest chain of
+  reference and stack-map slot, and after each collection that no survivor refers
+  to an object that was not reached, which is what a missing write barrier would
+  cause), `RSCL_GC_CHAIN` (report the longest chain of
   live objects and the root that holds it), `RSCL_GC_EXPLAIN` (report every root
   that refers to a sequence cell), `RSCL_GC_CONSERVATIVE` (ignore the stack maps
-  and scan compiled frames conservatively, for comparison).
+  and scan compiled frames conservatively) and `RSCL_GC_FULL` (make every
+  collection a full one), both for comparison.
 - The heap has a soft limit: `RSCL_MAX_HEAP_MB` (`0` for none), by default half of
   the physical memory or of the cgroup limit, whichever is smaller. The allocator
   keeps count of the bytes in use; the thread whose allocation crosses the limit

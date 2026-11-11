@@ -29,8 +29,8 @@ static OOM_PENDING: AtomicBool = AtomicBool::new(false);
 static OOM_THREAD: AtomicU64 = AtomicU64::new(0);
 /// The byte count at which the next collection is requested.
 static GC_NEXT: AtomicUsize = AtomicUsize::new(GC_MIN);
-/// A collection is not worth its pause below this much heap.
-const GC_MIN: usize = 64 << 20;
+/// Bytes allocated between collections (`RSCL_GC_MIN_MB`): the nursery.
+const GC_MIN: usize = 32 << 20;
 /// When the pending error was raised (milliseconds, see `now_ms`).
 static RAISED_AT: AtomicU64 = AtomicU64::new(0);
 /// How long the thread that crossed the limit has to take its error before any
@@ -244,11 +244,18 @@ pub fn arm_exit_flush() {
     EXIT_FLUSH.with(|_| {});
 }
 
-/// A collection finished: the next one is due when the heap has doubled.
-pub(crate) fn gc_finished() {
+/// A collection finished: the next one is due when another nursery's worth has been
+/// allocated. Returns the bytes in use now.
+pub(crate) fn gc_finished() -> usize {
     let n = DELTA.with(|d| d.replace(0));
     let live = (LIVE.fetch_add(n, Ordering::Relaxed) + n).max(0) as usize;
-    GC_NEXT.store(live.saturating_mul(2).max(gc_min()), Ordering::Relaxed);
+    GC_NEXT.store(live.saturating_add(gc_min()), Ordering::Relaxed);
+    live
+}
+
+/// The allocation budget between collections (the nursery), in bytes.
+pub(crate) fn nursery() -> usize {
+    gc_min()
 }
 
 /// A collection could not run (a thread did not stop in time): ask again only

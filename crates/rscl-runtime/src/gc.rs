@@ -1,4 +1,5 @@
-//! The garbage collector: stop-the-world mark and sweep over a non-moving heap.
+//! The garbage collector: stop-the-world, generational mark and sweep over a
+//! non-moving heap.
 //!
 //! Every heap object lives in the object heap (`arena.rs`) and stays at its
 //! address until a collection finds it unreachable. A `Value` is a plain word that
@@ -53,6 +54,23 @@
 //! blocking region) while a collection runs; their stacks are scanned from the
 //! stack pointer they published when they stopped.
 //!
+//! # Generations
+//!
+//! An object that has survived two collections is *old*; most collections are
+//! *minor* and look only at the young objects (see `collect`). The premise, and the method, are those of Moon's
+//! "Garbage Collection in a Large Lisp System" (1984): most objects die soon after
+//! they are created, so effort goes to the recent ones, and the collector is told
+//! where older memory may refer to them instead of searching for it. There the
+//! table of such places was kept by hardware on every store. Here almost
+//! everything is immutable, so a store into an existing object happens in a dozen
+//! runtime operations (atoms, vars, lazy seqs and futures being realised, protocol
+//! tables), each followed by [`write_barrier`]; compiled code needs no barrier at
+//! all. Being non-moving, the scheme promotes an object by setting a bit for it
+//! (in the manner of "sticky mark bits") rather than by copying it; an object is
+//! promoted when it survives its second collection. What it cannot
+//! see into is the persistent collections (`imbl`): a new version of a large map
+//! is a young object whose elements are all visited, old or not.
+//!
 //! # Design notes
 //!
 //! The approach borrows from `gc-arena` (collections happen only at points where
@@ -62,7 +80,7 @@
 //! tagged words, so roots are found by stack maps and scanning instead of handles.
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -70,7 +88,7 @@ use crate::obj::{
     self, Kind, atom, cons, exception, func, lazyseq, list, map, pending, set, sorted, symbol,
     types, var, vector,
 };
-use crate::value::{MARK, ObjHeader, PERMANENT, Value};
+use crate::value::{ObjHeader, PERMANENT, REMEMBERED, Value};
 
 // ---- the object registry -------------------------------------------------------------
 
@@ -78,6 +96,11 @@ use crate::value::{MARK, ObjHeader, PERMANENT, Value};
 struct Heap {
     /// Objects that are roots and never freed.
     permanent: Vec<usize>,
+    /// The permanent objects created since the last collection (still young).
+    new_permanent: Vec<usize>,
+    /// Old objects written since the last collection: they may refer to young
+    /// objects (see `write_barrier`).
+    remembered: Vec<usize>,
     /// Fn prototypes (not objects; their metadata is a root).
     protos: Vec<usize>,
     /// Constant tables of compiled units: (address, words).
@@ -91,6 +114,8 @@ fn heap() -> MutexGuard<'static, Heap> {
     H.get_or_init(|| {
         Mutex::new(Heap {
             permanent: Vec::new(),
+            new_permanent: Vec::new(),
+            remembered: Vec::new(),
             protos: Vec::new(),
             ranges: Vec::new(),
             pins: HashMap::new(),
@@ -115,8 +140,10 @@ struct Local {
     inhibit: Cell<u32>,
     /// A collection was wanted while inhibited.
     deferred: Cell<bool>,
-    /// An explicit collection: do not wait for a cleaner safepoint.
+    /// An explicit collection: do not wait for a cleaner safepoint. It is a full
+    /// one unless `force_minor` is set.
     force: Cell<bool>,
+    force_minor: Cell<bool>,
     /// Safepoints passed over while a collection was wanted.
     skips: Cell<u32>,
     /// Argument slices of calls into rscl code in progress: (address, values).
@@ -140,6 +167,7 @@ thread_local! {
             inhibit: Cell::new(0),
             deferred: Cell::new(false),
             force: Cell::new(false),
+            force_minor: Cell::new(false),
             skips: Cell::new(0),
             slices: RefCell::new(Vec::new()),
         }
@@ -148,7 +176,9 @@ thread_local! {
 
 /// Register an object that is never freed and is a root (its header is permanent).
 pub(crate) fn register_permanent(p: *mut ObjHeader) {
-    heap().permanent.push(p as usize);
+    let mut h = heap();
+    h.permanent.push(p as usize);
+    h.new_permanent.push(p as usize);
 }
 
 /// Register a fn prototype: its metadata is a root.
@@ -160,7 +190,33 @@ pub(crate) fn register_proto(p: *const func::FnProto) {
 pub fn make_permanent(v: &Value) {
     let Some(h) = v.header() else { return };
     if h.flags.fetch_or(PERMANENT, Ordering::Relaxed) & PERMANENT == 0 {
-        heap().permanent.push(v.bits() as usize);
+        let mut heap = heap();
+        heap.permanent.push(v.bits() as usize);
+        heap.new_permanent.push(v.bits() as usize);
+    }
+}
+
+/// The write barrier: call after storing a reference into an existing heap object
+/// (`obj` is the object written to).
+///
+/// A minor collection does not look inside old objects: it assumes they refer only
+/// to old objects. A store into an old object can break that, so the object is put
+/// in the remembered set, and the next collection looks at what it refers to. Nearly
+/// everything in this runtime is immutable, so the barrier sits in a dozen places
+/// (atoms, vars, lazy seqs and futures being realised, protocol tables) and compiled
+/// code needs none: it never stores into a heap object itself.
+#[inline]
+pub(crate) fn write_barrier<T>(obj: *const T) {
+    let h = unsafe { &*(obj as *const ObjHeader) };
+    if h.flags.load(Ordering::Relaxed) & REMEMBERED == 0 && crate::arena::is_old(obj as usize) {
+        remember(h);
+    }
+}
+
+#[cold]
+fn remember(h: &ObjHeader) {
+    if h.flags.fetch_or(REMEMBERED, Ordering::AcqRel) & REMEMBERED == 0 {
+        heap().remembered.push(h as *const ObjHeader as usize);
     }
 }
 
@@ -416,6 +472,8 @@ struct Config {
     conservative: bool,
     /// Report the longest chain of reachable objects and what roots it.
     chain: bool,
+    /// Make every collection a full one (no generations; for comparison).
+    always_full: bool,
 }
 
 fn config() -> &'static Config {
@@ -433,6 +491,7 @@ fn config() -> &'static Config {
             explain: std::env::var_os("RSCL_GC_EXPLAIN").is_some(),
             conservative: std::env::var_os("RSCL_GC_CONSERVATIVE").is_some(),
             chain: std::env::var_os("RSCL_GC_CHAIN").is_some(),
+            always_full: std::env::var_os("RSCL_GC_FULL").is_some(),
         }
     })
 }
@@ -957,7 +1016,12 @@ fn safepoint_at(frame: &Frame) -> Option<usize> {
             drop(g);
             let freed = LOCAL.with(|l| {
                 l.collecting.set(true);
-                let freed = collect(l, frame, &others);
+                let full = if l.force.get() {
+                    !l.force_minor.get()
+                } else {
+                    full_collection_due()
+                };
+                let freed = collect(l, frame, &others, full);
                 l.collecting.set(false);
                 freed
             });
@@ -1009,19 +1073,57 @@ fn wait_for_cleaner_safepoint(frame: &Frame) -> bool {
         .unwrap_or(false)
 }
 
-/// `(gc)`: collect now, on the calling thread. `None` if the other threads could not
-/// be stopped in time (or collections are deferred on this thread).
-pub fn collect_now() -> Option<usize> {
+/// Would a safepoint reached now take part in a collection (collect, or stop for
+/// another thread's), rather than pass? The slow path of a compiled safepoint asks
+/// this first, so that it only prepares for a collection (see `clear_dead_stack`)
+/// when one is about to happen: while a builtin holds collections off, or while
+/// safepoints are being passed over, the slow path is taken many times in a row.
+pub fn safepoint_ready() -> bool {
+    if HOLD.with(|h| h.get()) > 0 {
+        return false;
+    }
+    LOCAL
+        .try_with(|l| {
+            if l.inhibit.get() > 0 || l.stopped.get() || l.collecting.get() {
+                return false;
+            }
+            if stopping() {
+                return true;
+            }
+            if !GC_WANTED.load(Ordering::Acquire) {
+                return false;
+            }
+            if l.force.get() || config().stress > 0 || l.skips.get() >= MAX_SKIPS {
+                return true;
+            }
+            let frame = capture();
+            let frames = compiled_frames(&frame, l.stack_base.get());
+            !frames.windows(2).any(|w| w[1].lo != w[0].hi + 16)
+        })
+        .unwrap_or(false)
+}
+
+/// `(gc)`: collect now, on the calling thread: a full collection, or with
+/// `minor` one that only looks at what was allocated since the last. `None` if the
+/// other threads could not be stopped in time (or collections are deferred on
+/// this thread).
+pub fn collect_now(minor: bool) -> Option<usize> {
     clear_dead_stack();
-    collect_now_inner()
+    collect_now_inner(minor)
 }
 
 #[inline(never)]
-fn collect_now_inner() -> Option<usize> {
+fn collect_now_inner(minor: bool) -> Option<usize> {
     GC_WANTED.store(true, Ordering::Release);
-    let _ = LOCAL.try_with(|l| l.force.set(true));
+    let _ = LOCAL.try_with(|l| {
+        l.force.set(true);
+        l.force_minor.set(minor);
+    });
     let r = safepoint();
-    let _ = LOCAL.try_with(|l| l.force.set(false));
+    let _ = LOCAL.try_with(|l| {
+        l.force.set(false);
+        l.force_minor.set(false);
+    });
     r
 }
 
@@ -1034,6 +1136,16 @@ const INTERIOR_WORDS: usize = 16;
 pub(crate) struct Marker {
     stack: Vec<usize>,
     verify: bool,
+    /// Verification pass after marking (see `value`).
+    checking: bool,
+    /// A full collection (old objects are traced too).
+    full: bool,
+    /// The object being traced is old: note whether it refers to an object that
+    /// stays young (`young_child`); such objects are collected in `keep`, the
+    /// remembered set for the next collection.
+    track: bool,
+    young_child: bool,
+    keep: Vec<usize>,
     /// Diagnostics: the stack slot being scanned, and for each object reached
     /// straight from a root, the slot it was found in.
     root_at: usize,
@@ -1055,10 +1167,7 @@ impl Marker {
     /// Mark the object at `addr` (known to be one) and queue it for tracing.
     #[inline]
     fn object(&mut self, addr: usize) {
-        let h = header(addr);
-        let f = h.flags.load(Ordering::Relaxed);
-        if f & MARK == 0 {
-            h.flags.store(f | MARK, Ordering::Relaxed);
+        if crate::arena::mark(addr) {
             self.stack.push(addr);
             if let Some(p) = &mut self.parents {
                 p.insert(addr, self.current);
@@ -1074,6 +1183,25 @@ impl Marker {
     pub(crate) fn value(&mut self, v: &Value) {
         if v.is_ptr() {
             let addr = v.bits() as usize;
+            if self.checking {
+                // After marking, everything a surviving object refers to must have
+                // survived too. An old object that refers to an unmarked one was
+                // written without the barrier.
+                if !crate::arena::is_marked(addr)
+                    && header(addr).flags.load(Ordering::Relaxed) & PERMANENT == 0
+                {
+                    panic!(
+                        "gc: {:?}@{:#x} refers to {:?}@{addr:#x}, which was not reached (missing write barrier?)",
+                        header(self.current).kind,
+                        self.current,
+                        header(addr).kind
+                    );
+                }
+                return;
+            }
+            if self.track && crate::arena::stays_young(addr) {
+                self.young_child = true;
+            }
             if self.verify && crate::arena::find(addr) != Some(addr) {
                 panic!("gc: traced reference {addr:#x} is not a live object");
             }
@@ -1123,8 +1251,30 @@ impl Marker {
     fn drain(&mut self) {
         while let Some(addr) = self.stack.pop() {
             self.current = addr;
+            // In a full collection old objects are traced too; one that refers to
+            // an object that stays young has to be remembered (in a minor one only
+            // young objects get here).
+            self.track = self.full && crate::arena::is_old(addr);
+            self.young_child = false;
             unsafe { trace(addr, self) };
+            if self.track && self.young_child {
+                self.keep.push(addr);
+            }
         }
+        self.track = false;
+    }
+
+    /// Trace a remembered (old) object; it stays remembered if it still refers to
+    /// an object that will be young after this collection.
+    fn remembered(&mut self, addr: usize) {
+        self.current = addr;
+        self.track = true;
+        self.young_child = false;
+        unsafe { trace(addr, self) };
+        if self.young_child {
+            self.keep.push(addr);
+        }
+        self.track = false;
     }
 }
 
@@ -1413,17 +1563,60 @@ unsafe fn trace(addr: usize, m: &mut Marker) {
 
 // ---- a collection ------------------------------------------------------------------------
 
+/// Bytes in use after the last collection, and after the last full one.
+static LAST_LIVE: AtomicUsize = AtomicUsize::new(0);
+static LAST_FULL_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Is the next collection a full one? Most are minor: only objects allocated since
+/// the previous collection are examined (see `collect`). Old objects that died are
+/// found by a full collection, which is due when the old generation has doubled
+/// since the last full one (and grown by at least a nursery).
+fn full_collection_due() -> bool {
+    let base = LAST_FULL_LIVE.load(Ordering::Relaxed);
+    let due = base
+        .saturating_mul(2)
+        .max(base.saturating_add(crate::heap::nursery()));
+    config().always_full
+        || LAST_LIVE.load(Ordering::Relaxed) >= due
+        // Stress mode exercises both kinds.
+        || (config().stress > 0 && COLLECTIONS.load(Ordering::Relaxed) % 4 == 3)
+}
+
 /// Mark from the roots and free what was not reached. The world is stopped;
 /// `others` are the other threads' published states.
-fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
+///
+/// Generations: an object that survives two collections is *old* from then on (the
+/// first survival only *ages* it). A minor collection starts from the roots and
+/// from the old objects that may refer to young ones (the remembered set: those
+/// written since the last collection, and those just promoted), does not trace
+/// into other old objects (they start out marked), and sweeps only the young
+/// blocks, so its cost follows the young survivors, not the heap. A full
+/// collection starts with no marks and looks at everything. This is the non-moving
+/// form of the scheme in Moon's "Garbage Collection in a Large Lisp System":
+/// ephemeral objects at two levels, and a table of the places in older memory
+/// that may refer to them, kept by a barrier in the runtime's few mutating
+/// operations instead of in hardware. The second level matters: the one cell of a
+/// lazy sequence that happens to be live at a collection would otherwise become
+/// old, and once dead still keep every later cell alive until a full collection.
+fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) -> usize {
     let started = Instant::now();
     let own_roots = thread_roots(l);
     let mut guard = heap();
     let h = &mut *guard;
-    let before = crate::arena::object_count();
+    let debug = config().debug;
+    let before = if debug {
+        crate::arena::object_count()
+    } else {
+        0
+    };
     let mut m = Marker {
         stack: Vec::new(),
         verify: config().verify,
+        checking: false,
+        full,
+        track: false,
+        young_child: false,
+        keep: Vec::new(),
         root_at: 0,
         root_slots: HashMap::new(),
         frames: 0,
@@ -1431,9 +1624,27 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
         parents: (config().explain || config().chain).then(HashMap::new),
         current: 0,
     };
+    // The remembered set is rebuilt by this collection: an old object stays in it
+    // while it refers to an object that is still young afterwards.
+    let remembered = std::mem::take(&mut h.remembered);
+    for &r in &remembered {
+        header(r).flags.fetch_and(!REMEMBERED, Ordering::Relaxed);
+    }
+    crate::arena::begin_marks(full);
     m.current = 1;
-    for &p in &h.permanent {
-        m.object(p);
+    if full {
+        for &p in &h.permanent {
+            m.object(p);
+        }
+    } else {
+        // Old permanent objects are marked already (a var among them that was
+        // rebound is in the remembered set); the young ones are roots.
+        for &p in &h.new_permanent {
+            m.object(p);
+        }
+        for &r in &remembered {
+            m.remembered(r);
+        }
     }
     m.current = 2;
     for &p in &h.protos {
@@ -1481,6 +1692,19 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
     }
     m.drain();
     let (precise_frames, precise_slots) = (m.frames, m.slots);
+    if m.verify {
+        // Nothing that survived may refer to something that did not.
+        m.checking = true;
+        crate::arena::for_each_object(|p| {
+            if crate::arena::is_marked(p as usize)
+                || unsafe { &*p }.flags.load(Ordering::Relaxed) & PERMANENT != 0
+            {
+                m.current = p as usize;
+                unsafe { trace(p as usize, &mut m) };
+            }
+        });
+        m.checking = false;
+    }
     if let Some(parents) = &m.parents {
         // The longest chain of objects, printed from its root end.
         let mut depth: HashMap<usize, u32> = HashMap::new();
@@ -1544,29 +1768,49 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
 
     // Sweep: an unmarked object is finalised (a keyword leaves the intern table
     // first) and its slot released.
-    let freed = crate::arena::sweep(|p| {
-        let hd = unsafe { &*p };
-        let f = hd.flags.load(Ordering::Relaxed);
-        if f & MARK != 0 {
-            hd.flags.store(f & !MARK, Ordering::Relaxed);
-            true
-        } else if f & PERMANENT != 0 {
-            true
-        } else {
+    let mut promoted: Vec<usize> = Vec::new();
+    let freed = crate::arena::sweep(
+        full,
+        |p| {
+            // Unreached: garbage, unless it is permanent (then it stays as it is).
+            let hd = unsafe { &*p };
+            if hd.flags.load(Ordering::Relaxed) & PERMANENT != 0 {
+                return true;
+            }
             if hd.kind == Kind::Keyword {
                 obj::keyword::forget(&[p as usize]);
             }
             unsafe { obj::free(p) };
             false
-        }
-    });
-    let after = crate::arena::object_count();
+        },
+        |p| promoted.push(p as usize),
+    );
+    // The remembered set for the next collection: the old objects found to refer
+    // to objects that are still young, and the objects promoted now (they may).
+    let mut remembered = std::mem::take(&mut m.keep);
+    remembered.extend(promoted);
+    for &p in &remembered {
+        header(p).flags.fetch_or(REMEMBERED, Ordering::Relaxed);
+    }
+    h.remembered = remembered;
+    // A permanent object is a root for minor collections until it is old.
+    h.new_permanent.retain(|&p| !crate::arena::is_old(p));
+    let after = if debug {
+        crate::arena::object_count()
+    } else {
+        0
+    };
     drop(guard);
     COLLECTIONS.fetch_add(1, Ordering::Relaxed);
-    crate::heap::gc_finished();
+    let live = crate::heap::gc_finished();
+    LAST_LIVE.store(live, Ordering::Relaxed);
+    if full {
+        LAST_FULL_LIVE.store(live, Ordering::Relaxed);
+    }
     if config().debug {
         eprintln!(
-            "[gc] {} objects, {} freed, {} live, {} threads, {} compiled frames ({} slots), {:.2} ms, heap {} KB",
+            "[gc] {} {} objects, {} freed, {} live, {} threads, {} compiled frames ({} slots), {:.2} ms, heap {} KB",
+            if full { "full:" } else { "minor:" },
             before,
             freed,
             after,

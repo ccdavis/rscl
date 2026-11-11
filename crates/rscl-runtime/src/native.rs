@@ -314,7 +314,7 @@ fn take_interrupt() -> Option<(&'static str, String)> {
         refresh_flag();
         // Garbage may hold the memory: collect once before giving up.
         if !is_blocked() {
-            crate::gc::collect_now();
+            crate::gc::collect_now(false);
         }
         if let Some((used, limit)) = crate::heap::over_limit() {
             return Some((
@@ -416,10 +416,13 @@ pub unsafe extern "C" fn rt_stack_check(sp: usize) -> Value {
 /// (after taking part in a collection, if one is pending).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_interrupted() -> Value {
-    // Everything below the compiled frame that called this is dead. Clearing it
-    // before the collector's own frames are pushed there keeps what earlier calls
-    // left behind from looking like references (see `gc::clear_dead_stack`).
-    crate::gc::clear_dead_stack();
+    // Everything below the compiled frame that called this is dead. If a
+    // collection is about to run, clearing it before the collector's own frames
+    // are pushed there keeps what earlier calls left behind from looking like
+    // references (see `gc::clear_dead_stack`).
+    if crate::gc::safepoint_ready() {
+        crate::gc::clear_dead_stack();
+    }
     interrupted()
 }
 
