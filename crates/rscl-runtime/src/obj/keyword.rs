@@ -69,11 +69,6 @@ pub(crate) fn forget(dead: &[usize]) {
     }
 }
 
-/// Number of interned keywords (for diagnostics).
-pub fn interned_count() -> usize {
-    table().read().unwrap().names.len()
-}
-
 /// Whether a keyword of this name is currently interned (for tests).
 pub fn is_interned(ns: Option<&str>, name: &str) -> bool {
     let key = (ns.map(str::to_owned), name.to_owned());

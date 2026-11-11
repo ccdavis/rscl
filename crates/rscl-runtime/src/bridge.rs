@@ -9,14 +9,16 @@ use crate::coll;
 use crate::exc::{RtResult, err};
 use crate::obj::exception::RUNTIME;
 use crate::obj::{self, Kind, func, keyword, map, native, string, vector};
-use crate::value::{EXC, NIL, VRef, Value};
+use crate::value::{EXC, NIL, Value};
 
 unsafe fn s<'a>(p: *const u8, len: i64) -> &'a str {
     unsafe { crate::ffi::str_arg(p, len) }
 }
 
-fn borrowed(v: u64) -> VRef {
-    VRef::from_raw(v)
+/// A word handed over by a bridge library, as a value.
+fn val(v: u64) -> Value {
+    // SAFETY: the bridge only passes back words this runtime gave it.
+    unsafe { Value::from_raw(v) }
 }
 
 unsafe fn write_str(src: &str, out: *mut *const u8, len: *mut i64) {
@@ -26,24 +28,22 @@ unsafe fn write_str(src: &str, out: *mut *const u8, len: *mut i64) {
     }
 }
 
-// Reference counting is gone: no collection runs under a library call (see
-// `bridge_call`), so whatever a library function holds during the call is safe.
-unsafe extern "C" fn api_retain(_v: u64) {}
-unsafe extern "C" fn api_release(_v: u64) {}
+// No collection runs under a library call (see `bridge_call`), so whatever a
+// library function holds during the call stays alive.
 unsafe extern "C" fn api_type_name(v: u64, out: *mut *const u8, len: *mut i64) {
-    unsafe { write_str(crate::core::type_name(&borrowed(v)), out, len) }
+    unsafe { write_str(crate::core::type_name(&val(v)), out, len) }
 }
 unsafe extern "C" fn api_is_nil(v: u64) -> i32 {
     (v == NIL) as i32
 }
 unsafe extern "C" fn api_truthy(v: u64) -> i32 {
-    borrowed(v).truthy() as i32
+    val(v).truthy() as i32
 }
 unsafe extern "C" fn api_bool_new(b: i32) -> u64 {
-    Value::bool(b != 0).into_raw()
+    Value::bool(b != 0).bits()
 }
 unsafe extern "C" fn api_int_get(v: u64, out: *mut i64) -> i32 {
-    match borrowed(v).int_value() {
+    match val(v).int_value() {
         Some(n) => {
             unsafe { *out = n };
             1
@@ -52,10 +52,10 @@ unsafe extern "C" fn api_int_get(v: u64, out: *mut i64) -> i32 {
     }
 }
 unsafe extern "C" fn api_int_new(n: i64) -> u64 {
-    Value::int(n).into_raw()
+    Value::int(n).bits()
 }
 unsafe extern "C" fn api_double_get(v: u64, out: *mut f64) -> i32 {
-    match crate::num::num(&borrowed(v)) {
+    match crate::num::num(&val(v)) {
         Some(n) => {
             unsafe { *out = crate::num::f(&n) };
             1
@@ -64,10 +64,10 @@ unsafe extern "C" fn api_double_get(v: u64, out: *mut f64) -> i32 {
     }
 }
 unsafe extern "C" fn api_double_new(d: f64) -> u64 {
-    Value::double(d).into_raw()
+    Value::double(d).bits()
 }
 unsafe extern "C" fn api_string_get(v: u64, out: *mut *const u8, len: *mut i64) -> i32 {
-    let v = borrowed(v);
+    let v = val(v);
     match string::as_str(&v) {
         Some(st) => {
             unsafe { write_str(st, out, len) };
@@ -77,7 +77,7 @@ unsafe extern "C" fn api_string_get(v: u64, out: *mut *const u8, len: *mut i64) 
     }
 }
 unsafe extern "C" fn api_string_new(p: *const u8, len: i64) -> u64 {
-    string::new(unsafe { s(p, len) }).into_raw()
+    string::new(unsafe { s(p, len) }).bits()
 }
 unsafe extern "C" fn api_keyword_new(
     ns: *const u8,
@@ -90,10 +90,10 @@ unsafe extern "C" fn api_keyword_new(
     } else {
         Some(unsafe { s(ns, ns_len) })
     };
-    keyword::intern(ns, unsafe { s(name, name_len) }).into_raw()
+    keyword::intern(ns, unsafe { s(name, name_len) }).bits()
 }
 unsafe extern "C" fn api_named_name(v: u64, out: *mut *const u8, len: *mut i64) -> i32 {
-    let v = borrowed(v);
+    let v = val(v);
     let name = match v.kind() {
         Some(Kind::Keyword) => keyword::get(&v).name(),
         Some(Kind::Symbol) => obj::symbol::get(&v).name(),
@@ -103,61 +103,61 @@ unsafe extern "C" fn api_named_name(v: u64, out: *mut *const u8, len: *mut i64) 
     1
 }
 unsafe extern "C" fn api_to_vector(v: u64) -> u64 {
-    match coll::to_vec(&borrowed(v)) {
-        Ok(items) => vector::from_iter(items).into_raw(),
+    match coll::to_vec(&val(v)) {
+        Ok(items) => vector::from_iter(items).bits(),
         Err(_) => EXC,
     }
 }
 unsafe extern "C" fn api_vector_len(v: u64) -> i64 {
-    vector::as_vec(&borrowed(v)).map_or(0, |x| x.v.len() as i64)
+    vector::as_vec(&val(v)).map_or(0, |x| x.v.len() as i64)
 }
 unsafe extern "C" fn api_vector_get(v: u64, i: i64) -> u64 {
-    let v = borrowed(v);
+    let v = val(v);
     if i < 0 {
         return NIL;
     }
     vector::as_vec(&v)
         .and_then(|x| x.v.get(i as usize).cloned())
-        .map_or(NIL, Value::into_raw)
+        .map_or(NIL, |v| v.bits())
 }
 unsafe extern "C" fn api_vector_new(items: *const u64, n: i64) -> u64 {
-    let items: &[VRef] = if n <= 0 {
+    let items: &[Value] = if n <= 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(items as *const VRef, n as usize) }
+        unsafe { std::slice::from_raw_parts(items as *const Value, n as usize) }
     };
-    vector::from_iter(items.iter().map(|x| x.owned())).into_raw()
+    vector::from_iter(items.iter().copied()).bits()
 }
 unsafe extern "C" fn api_map_new(kvs: *const u64, n: i64) -> u64 {
-    let items: &[VRef] = if n <= 0 {
+    let items: &[Value] = if n <= 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(kvs as *const VRef, n as usize) }
+        unsafe { std::slice::from_raw_parts(kvs as *const Value, n as usize) }
     };
     let mut m = map::empty_map();
     for kv in items.chunks(2) {
         if kv.len() == 2 {
-            m.insert(kv[0].owned(), kv[1].owned());
+            m.insert(kv[0], kv[1]);
         }
     }
-    map::new(m).into_raw()
+    map::new(m).bits()
 }
 unsafe extern "C" fn api_map_get(m: u64, k: u64, not_found: u64) -> u64 {
-    let nf = borrowed(not_found);
-    match coll::get(&borrowed(m), &borrowed(k), Some(&nf)) {
-        Ok(v) => v.into_raw(),
+    let nf = val(not_found);
+    match coll::get(&val(m), &val(k), Some(&nf)) {
+        Ok(v) => v.bits(),
         Err(_) => EXC,
     }
 }
 unsafe extern "C" fn api_map_entries(m: u64) -> u64 {
-    let m = borrowed(m);
+    let m = val(m);
     match map::as_map(&m) {
         Some(mo) => {
             let entries: Vec<Value> =
                 mo.m.iter()
-                    .map(|(k, v)| vector::from_slice(&[k.clone(), v.clone()]))
+                    .map(|(k, v)| vector::from_slice(&[*k, *v]))
                     .collect();
-            vector::from_iter(entries).into_raw()
+            vector::from_iter(entries).bits()
         }
         None => {
             crate::exc::throw_new(
@@ -169,7 +169,7 @@ unsafe extern "C" fn api_map_entries(m: u64) -> u64 {
     }
 }
 unsafe extern "C" fn api_invoke(f: u64, argc: i64, argv: *const u64) -> u64 {
-    unsafe { crate::ffi::rt_invoke(borrowed(f), argc, argv as *const Value, 0) }.into_raw()
+    unsafe { crate::ffi::rt_invoke(val(f), argc, argv as *const Value) }.bits()
 }
 unsafe extern "C" fn api_throw(
     class: *const u8,
@@ -187,7 +187,7 @@ unsafe extern "C" fn api_native_new(
     data: *mut c_void,
     drop: Option<DropFn>,
 ) -> u64 {
-    native::new(unsafe { s(type_name, len) }, token, data, drop).into_raw()
+    native::new(unsafe { s(type_name, len) }, token, data, drop).bits()
 }
 unsafe extern "C" fn api_native_get(
     v: u64,
@@ -195,7 +195,7 @@ unsafe extern "C" fn api_native_get(
     len: i64,
     token: u64,
 ) -> *mut c_void {
-    let v = borrowed(v);
+    let v = val(v);
     match native::as_native(&v) {
         Some(n) if n.token == token && &*n.type_name == unsafe { s(type_name, len) } => n.data,
         _ => std::ptr::null_mut(),
@@ -229,7 +229,7 @@ unsafe extern "C" fn api_register_fn(
     let proto = func::new_proto(bridge_call, &qualified, arity_mask, variadic_min);
     let f = func::new(proto, 1);
     unsafe { func::set_capture(&f, 0, Value::int(entry as usize as i64)) };
-    crate::ffi::make_immortal(&f);
+    crate::gc::make_permanent(&f);
     ns.intern(name).bind_root(f);
 }
 
@@ -238,22 +238,17 @@ unsafe extern "C" fn api_register_fn(
 /// a conversion built, say) while runtime services it calls may run rscl code (a
 /// lazy seq realising in `to_vector`, a callback through `invoke`). None of that
 /// is visible to the collector, so no collection runs under a library call.
-unsafe extern "C" fn bridge_call(
-    this: *const func::FnObj,
-    argc: i64,
-    argv: *const Value,
-    owned: u64,
-) -> Value {
+unsafe extern "C" fn bridge_call(this: *const func::FnObj, argc: i64, argv: *const Value) -> Value {
     let _hold = crate::gc::hold();
     let addr = unsafe { &*func::capture_ptr_raw(this, 0) }
         .as_fixnum()
         .unwrap_or(0) as usize;
     // The bridge's `Entry` takes `*const c_void`; ours takes `*const FnObj`: same ABI.
     let entry: func::Entry = unsafe { std::mem::transmute::<usize, func::Entry>(addr) };
-    unsafe { entry(this, argc, argv, owned) }
+    unsafe { entry(this, argc, argv) }
 }
 unsafe extern "C" fn api_pr_str(v: u64) -> u64 {
-    string::from_string(crate::printer::pr_str(&borrowed(v))).into_raw()
+    string::from_string(crate::printer::pr_str(&val(v))).bits()
 }
 
 unsafe extern "C" fn api_exc_clear() {
@@ -264,8 +259,6 @@ unsafe extern "C" fn api_exc_clear() {
 pub static RT_API: RtApi = RtApi {
     version: API_VERSION,
     exc: EXC,
-    retain: api_retain,
-    release: api_release,
     type_name: api_type_name,
     is_nil: api_is_nil,
     truthy: api_truthy,

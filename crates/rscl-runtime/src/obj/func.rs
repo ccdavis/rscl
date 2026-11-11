@@ -1,4 +1,4 @@
-//! Function objects and their immortal prototypes.
+//! Function objects and their permanent prototypes.
 //!
 //! Layout is ABI: generated code reads `proto` at `OFF_PROTO`, `entry` at
 //! `PROTO_OFF_ENTRY` inside the proto, and capture `i` at `OFF_CAPTURES + 8*i`.
@@ -9,16 +9,17 @@ use super::{Kind, cast};
 use crate::value::{ObjHeader, Value};
 
 /// The uniform calling convention every rscl function and every builtin uses.
-/// `owned` is non-zero when the argument slots belong to the callee for the
-/// duration of the call: the caller will not read them again, so the callee may
-/// overwrite them (a native that walks a sequence uses its slot as the cursor, see
-/// `core::Taker`). Compiled code always passes non-zero; a native that calls with a
-/// slice it still uses passes 0. The collector does not treat a compiled caller's
-/// argument slots as roots: the callee keeps its arguments reachable (a compiled fn
-/// loads them into its own variables before its first safepoint; a native under
-/// which a collection may run roots its argument list, see `gc::ArgRoot`).
-pub type Entry =
-    unsafe extern "C" fn(f: *const FnObj, argc: i64, argv: *const Value, owned: u64) -> Value;
+///
+/// The `argc` argument slots at `argv` belong to the callee for the duration of the
+/// call: the caller does not read them again, so the callee may overwrite them (a
+/// native that walks a sequence uses its slot as the cursor, see `core::ArgSlots`).
+/// Rust code calls through `ffi::invoke`, which passes a copy of its slice.
+///
+/// The collector does not treat the slots as roots: the callee keeps its arguments
+/// reachable (a compiled fn loads them into its own variables before its first
+/// safepoint; a native under which a collection may run roots its argument list,
+/// see `gc::ArgRoot`).
+pub type Entry = unsafe extern "C" fn(f: *const FnObj, argc: i64, argv: *const Value) -> Value;
 
 #[repr(C)]
 pub struct FnProto {
@@ -40,7 +41,6 @@ pub struct FnObj {
 }
 
 pub const OFF_PROTO: i32 = 16;
-pub const OFF_NCAPTURES: i32 = 24;
 pub const OFF_CAPTURES: i32 = 32;
 pub const PROTO_OFF_ENTRY: i32 = 0;
 
@@ -50,7 +50,7 @@ fn layout(ncaptures: usize) -> Layout {
     Layout::from_size_align(OFF_CAPTURES as usize + 8 * ncaptures, 8).unwrap()
 }
 
-/// Create an immortal prototype. `name` is the qualified name used for printing and
+/// Create a permanent prototype. `name` is the qualified name used for printing and
 /// error messages.
 pub fn new_proto(entry: Entry, name: &str, arity_mask: u64, variadic_min: i64) -> *const FnProto {
     let p = Box::into_raw(Box::new(FnProto {
@@ -77,7 +77,7 @@ pub fn new(proto: *const FnProto, ncaptures: usize) -> Value {
     }
 }
 
-/// Store a capture (takes ownership of `v`). Only valid before the fn is shared.
+/// Store a capture. Only valid before the fn is shared.
 pub unsafe fn set_capture(f: &Value, i: usize, v: Value) {
     unsafe {
         // No write barrier: the fn object was allocated a moment ago and is young.
@@ -131,8 +131,5 @@ impl FnProto {
     pub fn accepts(&self, argc: i64) -> bool {
         (argc < 64 && self.arity_mask & (1u64 << argc) != 0)
             || (self.variadic_min >= 0 && argc >= self.variadic_min)
-    }
-    pub fn is_variadic(&self) -> bool {
-        self.variadic_min >= 0
     }
 }

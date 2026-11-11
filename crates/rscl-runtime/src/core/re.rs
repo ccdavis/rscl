@@ -9,7 +9,7 @@ use crate::value::Value;
 /// Accept a regex object or a string pattern.
 pub fn pattern(v: &Value) -> RtResult<Value> {
     match v.kind() {
-        Some(Kind::Regex) => Ok(v.clone()),
+        Some(Kind::Regex) => Ok(*v),
         Some(Kind::String) => regex::new(string::get(v)),
         _ => err(
             CLASS_CAST,

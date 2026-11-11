@@ -8,7 +8,7 @@ use crate::exc::{RtResult, err};
 use crate::obj::exception::{CLASS_CAST, ILLEGAL_ARGUMENT};
 use crate::obj::var::FLAG_MACRO;
 use crate::obj::{self, Kind, atom, lazyseq, list, symbol, var, vector};
-use crate::value::{VRef, Value};
+use crate::value::Value;
 
 static GENSYM: AtomicU64 = AtomicU64::new(1);
 
@@ -43,13 +43,13 @@ fn expect_var(v: &Value) -> RtResult<&var::VarObj> {
 
 /// `swap!`-style update: call `f` with the current value and extra args until the
 /// compare-and-set succeeds. Returns (old, new).
-fn swap(a: &atom::AtomObj, f: &Value, extra: &[VRef]) -> RtResult<(Value, Value)> {
+fn swap(a: &atom::AtomObj, f: &Value, extra: &[Value]) -> RtResult<(Value, Value)> {
     loop {
         let old = a.deref();
-        let mut fargs = vec![old.clone()];
-        fargs.extend(extra.iter().map(|x| x.owned()));
+        let mut fargs = vec![old];
+        fargs.extend(extra.iter().copied());
         let new = f.call(&fargs)?;
-        if a.compare_and_set(&old, new.clone()) {
+        if a.compare_and_set(&old, new) {
             return Ok((old, new));
         }
     }
@@ -59,30 +59,30 @@ fn swap(a: &atom::AtomObj, f: &Value, extra: &[VRef]) -> RtResult<(Value, Value)
 /// namespace; otherwise return it unchanged.
 pub fn macroexpand_1(form: &Value) -> RtResult<Value> {
     let Some(l) = list::as_list(form) else {
-        return Ok(form.clone());
+        return Ok(*form);
     };
     let items = l.to_vec();
     let Some(head) = items.first().and_then(symbol::as_sym) else {
-        return Ok(form.clone());
+        return Ok(*form);
     };
     let cur = crate::ns::current();
     let Some(v) = crate::ns::resolve(cur, head.ns(), head.name()) else {
-        return Ok(form.clone());
+        return Ok(*form);
     };
     if !v.is_macro() {
-        return Ok(form.clone());
+        return Ok(*form);
     }
     let f = v.root();
     if f.is_unbound() {
-        return Ok(form.clone());
+        return Ok(*form);
     }
-    let mut margs = vec![form.clone(), Value::NIL];
+    let mut margs = vec![*form, Value::NIL];
     margs.extend(items[1..].iter().cloned());
     f.call(&margs)
 }
 
 builtins! {
-    "lazy-seq*" => fn cf_lazy_seq_star(args) [1] { Ok(lazyseq::new(args[0].owned())) }
+    "lazy-seq*" => fn cf_lazy_seq_star(args) [1] { Ok(lazyseq::new(args[0])) }
     "realized?" => fn cf_realized_p(args) [1] {
         match args[0].kind() {
             Some(Kind::LazySeq) => Ok(Value::bool(lazyseq::is_realized(&args[0]))),
@@ -93,13 +93,13 @@ builtins! {
     "doall" => @gc fn cf_doall(args) [1, 2] {
         let s = &args[args.len() - 1];
         for x in coll::seq_iter(s) { x?; }
-        Ok(s.owned())
+        Ok(*s)
     }
-    "dorun" => @gc fn cf_dorun(args; owned = taker) [1, 2] {
-        for x in coll::iter_owned(taker.cursor(args.len() - 1))? { x?; }
+    "dorun" => @gc fn cf_dorun(args; slots = slots) [1, 2] {
+        for x in coll::iter_at(slots.cursor(args.len() - 1))? { x?; }
         Ok(Value::NIL)
     }
-    "atom" => fn cf_atom(args) [; 1] { Ok(atom::new(args[0].owned())) }
+    "atom" => fn cf_atom(args) [; 1] { Ok(atom::new(args[0])) }
     "atom?" => fn cf_atom_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Atom))) }
     "deref" => @gc fn cf_deref(args) [1, 3] {
         if args.len() == 3
@@ -115,7 +115,7 @@ builtins! {
                 if args.len() == 3 {
                     let ms = args::int(&args[1], "timeout-ms")?.max(0) as u64;
                     let timeout = std::time::Duration::from_millis(ms);
-                    Ok(p.deref(Some(timeout))?.unwrap_or_else(|| args[2].owned()))
+                    Ok(p.deref(Some(timeout))?.unwrap_or_else(|| args[2]))
                 } else {
                     Ok(p.deref(None)?.unwrap_or(Value::NIL))
                 }
@@ -128,11 +128,11 @@ builtins! {
             _ => err(CLASS_CAST, format!("{} cannot be cast to IDeref", crate::core::type_name(&args[0]))),
         }
     }
-    "reset!" => fn cf_reset(args) [2] { Ok(expect_atom(&args[0])?.reset(args[1].owned())) }
+    "reset!" => fn cf_reset(args) [2] { Ok(expect_atom(&args[0])?.reset(args[1])) }
     "reset-vals!" => fn cf_reset_vals(args) [2] {
         let a = expect_atom(&args[0])?;
         let old = a.deref();
-        let new = a.reset(args[1].owned());
+        let new = a.reset(args[1]);
         Ok(vector::from_iter(vec![old, new]))
     }
     "swap!" => @gc fn cf_swap(args) [; 2] { Ok(swap(expect_atom(&args[0])?, &args[1], &args[2..])?.1) }
@@ -141,7 +141,7 @@ builtins! {
         Ok(vector::from_iter(vec![old, new]))
     }
     "compare-and-set!" => fn cf_compare_and_set(args) [3] {
-        Ok(Value::bool(expect_atom(&args[0])?.compare_and_set(&args[1], args[2].owned())))
+        Ok(Value::bool(expect_atom(&args[0])?.compare_and_set(&args[1], args[2])))
     }
     "gensym" => fn cf_gensym(args) [0, 1] {
         let prefix = if args.is_empty() { "G__".to_string() } else { crate::printer::str_of(&args[0]) };
@@ -149,12 +149,12 @@ builtins! {
     }
     "set-macro!" => fn cf_set_macro(args) [1] {
         expect_var(&args[0])?.set_flag(FLAG_MACRO, true);
-        Ok(args[0].owned())
+        Ok(args[0])
     }
     "macro?" => fn cf_macro_p(args) [1] { Ok(Value::bool(var::as_var(&args[0]).is_some_and(|v| v.is_macro()))) }
     "macroexpand-1" => fn cf_macroexpand_1(args) [1] { macroexpand_1(&args[0]) }
     "macroexpand" => fn cf_macroexpand(args) [1] {
-        let mut form = args[0].owned();
+        let mut form = args[0];
         loop {
             let next = macroexpand_1(&form)?;
             if next.identical(&form) { return Ok(form); }
@@ -184,17 +184,17 @@ builtins! {
             return err(ILLEGAL_ARGUMENT, "metadata must be a map or nil");
         }
         let copy = match v.kind() {
-            Some(Kind::Symbol) => symbol::with_meta(v, args[1].owned()),
-            Some(Kind::List | Kind::Cons | Kind::LazySeq) => { let c = list::from_iter(coll::to_vec(v)?); obj::set_meta_unshared(&c, args[1].owned()); c }
-            Some(Kind::Vector) => { let c = vector::new(vector::get(v).v.clone()); obj::set_meta_unshared(&c, args[1].owned()); c }
-            Some(Kind::Map) => { let o = obj::map::get(v); let c = match &o.order { Some(k) => obj::map::new_ordered(o.m.clone(), k.to_vec()), None => obj::map::new(o.m.clone()) }; obj::set_meta_unshared(&c, args[1].owned()); c }
-            Some(Kind::Set) => { let o = obj::set::get(v); let c = match &o.order { Some(k) => obj::set::new_ordered(o.s.clone(), k.to_vec()), None => obj::set::new(o.s.clone()) }; obj::set_meta_unshared(&c, args[1].owned()); c }
-            Some(Kind::SortedMap) => { let c = obj::sorted::map_new(obj::sorted::map_get(v).m.clone()); obj::set_meta_unshared(&c, args[1].owned()); c }
-            Some(Kind::SortedSet) => { let c = obj::sorted::set_new(obj::sorted::set_get(v).s.clone()); obj::set_meta_unshared(&c, args[1].owned()); c }
+            Some(Kind::Symbol) => symbol::with_meta(v, args[1]),
+            Some(Kind::List | Kind::Cons | Kind::LazySeq) => { let c = list::from_iter(coll::to_vec(v)?); obj::set_meta_unshared(&c, args[1]); c }
+            Some(Kind::Vector) => { let c = vector::new(vector::get(v).v.clone()); obj::set_meta_unshared(&c, args[1]); c }
+            Some(Kind::Map) => { let o = obj::map::get(v); let c = match &o.order { Some(k) => obj::map::new_ordered(o.m.clone(), k.to_vec()), None => obj::map::new(o.m.clone()) }; obj::set_meta_unshared(&c, args[1]); c }
+            Some(Kind::Set) => { let o = obj::set::get(v); let c = match &o.order { Some(k) => obj::set::new_ordered(o.s.clone(), k.to_vec()), None => obj::set::new(o.s.clone()) }; obj::set_meta_unshared(&c, args[1]); c }
+            Some(Kind::SortedMap) => { let c = obj::sorted::map_new(obj::sorted::map_get(v).m.clone()); obj::set_meta_unshared(&c, args[1]); c }
+            Some(Kind::SortedSet) => { let c = obj::sorted::set_new(obj::sorted::set_get(v).s.clone()); obj::set_meta_unshared(&c, args[1]); c }
             Some(Kind::Instance) => {
                 let i = obj::types::inst(v);
-                let c = obj::types::with(v, i.fields.clone(), i.ext.clone());
-                obj::set_meta_unshared(&c, args[1].owned());
+                let c = obj::types::with(v, i.fields.clone(), i.ext);
+                obj::set_meta_unshared(&c, args[1]);
                 c
             }
             _ => return err(CLASS_CAST, format!("{} cannot be cast to IObj", crate::core::type_name(v))),

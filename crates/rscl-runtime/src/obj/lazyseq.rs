@@ -59,14 +59,14 @@ pub fn is_realized(v: &Value) -> bool {
     )
 }
 
-/// Force the seq; returns the realised seq (`nil` or a seq object), owned.
+/// Force the seq; returns the realised seq (`nil` or a seq object).
 pub fn realize(v: &Value) -> RtResult<Value> {
     let obj = get(v);
     let me = thread_id();
     let thunk = loop {
         let mut g = obj.state.lock().unwrap_or_else(|e| e.into_inner());
         match &*g {
-            State::Realized(s) => return Ok(s.clone()),
+            State::Realized(s) => return Ok(*s),
             State::Realizing(t) if *t == me => {
                 drop(g);
                 return err(
@@ -97,7 +97,7 @@ pub fn realize(v: &Value) -> RtResult<Value> {
     let mut g = obj.state.lock().unwrap_or_else(|e| e.into_inner());
     match result {
         Ok(s) => {
-            *g = State::Realized(s.clone());
+            *g = State::Realized(s);
             crate::gc::write_barrier(obj);
             Ok(s)
         }

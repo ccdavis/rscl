@@ -15,10 +15,10 @@ fn type_name(v: &Value) -> &'static str {
 }
 
 fn entry(k: &Value, v: &Value) -> Value {
-    vector::from_slice(&[k.clone(), v.clone()])
+    vector::from_slice(&[*k, *v])
 }
 
-/// Materialise any seqable value as a `Vec` of owned elements (realising lazy seqs).
+/// Materialise any seqable value as a `Vec` of its elements (realising lazy seqs).
 pub fn to_vec(v: &Value) -> RtResult<Vec<Value>> {
     Ok(match v.kind() {
         None if v.is_nil() => Vec::new(),
@@ -33,7 +33,7 @@ pub fn to_vec(v: &Value) -> RtResult<Vec<Value>> {
             .iter()
             .map(|(k, x)| entry(&k.0, x))
             .collect(),
-        Some(Kind::SortedSet) => sorted::set_get(v).s.iter().map(|k| k.0.clone()).collect(),
+        Some(Kind::SortedSet) => sorted::set_get(v).s.iter().map(|k| k.0).collect(),
         Some(Kind::Instance) if types::is_record(v) => types::inst(v)
             .entries()
             .into_iter()
@@ -72,12 +72,12 @@ pub fn is_seq(v: &Value) -> bool {
     matches!(v.kind(), Some(Kind::List | Kind::Cons | Kind::LazySeq))
 }
 
-/// Where a sequence walk keeps its position. A caller that hands a sequence over
-/// (see `Taker`) gives up its argument slot, and the walk then uses that very slot
-/// as its cursor: the head is never copied into a native frame, where a stale copy
-/// would keep every cell behind the cursor alive for the conservative stack scan.
+/// Where a sequence walk keeps its position. A native that walks one of its
+/// arguments uses the argument slot itself as the cursor (see `core::ArgSlots`):
+/// the head is never copied into a native frame, where a stale copy would keep
+/// every cell behind the cursor alive for the conservative stack scan.
 pub enum Cursor {
-    /// The caller's argument slot (it gave the slot up).
+    /// An argument slot of the native doing the walk.
     Slot(*mut Value),
     Own(Value),
 }
@@ -87,7 +87,7 @@ impl Cursor {
     pub fn get(&self) -> Value {
         match self {
             Cursor::Slot(p) => unsafe { std::ptr::read_volatile(*p) },
-            Cursor::Own(v) => v.clone(),
+            Cursor::Own(v) => *v,
         }
     }
     /// Is the value a cons or lazy seq? Looks through the slot without copying the
@@ -116,12 +116,12 @@ pub struct SeqIter {
 }
 
 pub fn seq_iter(v: &Value) -> SeqIter {
-    seq_iter_owned(Cursor::Own(v.clone()))
+    seq_iter_at(Cursor::Own(*v))
 }
 
-/// Walk a sequence the caller hands over: as the iterator advances, nothing else
+/// Walk a sequence from a cursor: as the iterator advances, nothing else
 /// refers to the cells behind it, so a lazy sequence is collected as it is consumed.
-pub fn seq_iter_owned(cur: Cursor) -> SeqIter {
+pub fn seq_iter_at(cur: Cursor) -> SeqIter {
     SeqIter { cur, done: false }
 }
 
@@ -131,9 +131,9 @@ pub fn is_lazy_kind(v: &Value) -> bool {
     matches!(v.kind(), Some(Kind::Cons | Kind::LazySeq))
 }
 
-/// Elements of a value the caller hands over: a lazy sequence streams (its cells are
+/// Elements of the value at a cursor: a lazy sequence streams (its cells are
 /// freed as it is walked), any other collection is materialised once.
-pub enum OwnedIter {
+pub enum CursorIter {
     Seq(SeqIter),
     /// The materialised elements stay rooted while the iterator exists: some are
     /// fresh objects (map entries) that nothing else refers to, and the consumer
@@ -141,42 +141,42 @@ pub enum OwnedIter {
     Vec(std::vec::IntoIter<Value>, crate::gc::SliceRoot<'static>),
 }
 
-impl Iterator for OwnedIter {
+impl Iterator for CursorIter {
     type Item = RtResult<Value>;
     fn next(&mut self) -> Option<RtResult<Value>> {
         match self {
-            OwnedIter::Seq(it) => it.next(),
-            OwnedIter::Vec(it, _) => it.next().map(Ok),
+            CursorIter::Seq(it) => it.next(),
+            CursorIter::Vec(it, _) => it.next().map(Ok),
         }
     }
 }
 
-pub fn iter_owned(c: Cursor) -> RtResult<OwnedIter> {
+pub fn iter_at(c: Cursor) -> RtResult<CursorIter> {
     Ok(if c.is_lazy() {
-        OwnedIter::Seq(seq_iter_owned(c))
+        CursorIter::Seq(seq_iter_at(c))
     } else {
         let items = to_vec(&c.get())?;
         // SAFETY: the buffer belongs to the iterator stored next to the guard.
         let root = unsafe { crate::gc::root_words(items.as_ptr() as *const u64, items.len()) };
-        OwnedIter::Vec(items.into_iter(), root)
+        CursorIter::Vec(items.into_iter(), root)
     })
 }
 
-/// `count` of a value the caller hands over (streams lazy sequences).
-pub fn count_owned(v: Cursor) -> RtResult<i64> {
+/// `count` of the value at a cursor (streams lazy sequences).
+pub fn count_at(v: Cursor) -> RtResult<i64> {
     if !v.is_lazy() {
         return count(&v.get());
     }
     let mut n = 0;
-    for x in seq_iter_owned(v) {
+    for x in seq_iter_at(v) {
         x?;
         n += 1;
     }
     Ok(n)
 }
 
-/// `last` of a value the caller hands over (streams lazy sequences).
-pub fn last_owned(v: Cursor) -> RtResult<Value> {
+/// `last` of the value at a cursor (streams lazy sequences).
+pub fn last_at(v: Cursor) -> RtResult<Value> {
     if v.get().is_kind(Kind::Vector) {
         return Ok(vector::get(&v.get())
             .v
@@ -185,19 +185,19 @@ pub fn last_owned(v: Cursor) -> RtResult<Value> {
             .unwrap_or(Value::NIL));
     }
     let mut last = Value::NIL;
-    for x in iter_owned(v)? {
+    for x in iter_at(v)? {
         last = x?;
     }
     Ok(last)
 }
 
-/// `nth` of a value the caller hands over (streams lazy sequences).
-pub fn nth_owned(coll: Cursor, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
+/// `nth` of the value at a cursor (streams lazy sequences).
+pub fn nth_at(coll: Cursor, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
     if !coll.is_lazy() || i < 0 {
         return nth(&coll.get(), i, not_found);
     }
     let mut n = 0i64;
-    for x in seq_iter_owned(coll) {
+    for x in seq_iter_at(coll) {
         let x = x?;
         if n == i {
             return Ok(x);
@@ -205,7 +205,7 @@ pub fn nth_owned(coll: Cursor, i: i64, not_found: Option<&Value>) -> RtResult<Va
         n += 1;
     }
     match not_found {
-        Some(v) => Ok(v.clone()),
+        Some(v) => Ok(*v),
         None => err(
             INDEX_OUT_OF_BOUNDS,
             format!("index {i} out of bounds for length {n}"),
@@ -254,7 +254,7 @@ pub fn count(v: &Value) -> RtResult<i64> {
         Some(Kind::SortedMap) => sorted::map_get(v).m.len() as i64,
         Some(Kind::SortedSet) => sorted::set_get(v).s.len() as i64,
         Some(Kind::Instance) if types::is_record(v) => types::inst(v).count() as i64,
-        Some(Kind::Cons | Kind::LazySeq) => count_owned(Cursor::Own(v.clone()))?,
+        Some(Kind::Cons | Kind::LazySeq) => count_at(Cursor::Own(*v))?,
         _ => {
             return err(
                 UNSUPPORTED,
@@ -272,9 +272,9 @@ pub fn seq(v: &Value) -> RtResult<Value> {
         Some(Kind::List) => Ok(if list::get(v).is_empty() {
             Value::NIL
         } else {
-            v.clone()
+            *v
         }),
-        Some(Kind::Cons) => Ok(v.clone()),
+        Some(Kind::Cons) => Ok(*v),
         Some(Kind::LazySeq) => lazyseq::realize(v),
         _ => {
             let items = to_vec(v)?;
@@ -290,8 +290,8 @@ pub fn seq(v: &Value) -> RtResult<Value> {
 pub fn first(v: &Value) -> RtResult<Value> {
     Ok(match v.kind() {
         None if v.is_nil() => Value::NIL,
-        Some(Kind::List) => list::get(v).first.clone(),
-        Some(Kind::Cons) => cons::get(v).first.clone(),
+        Some(Kind::List) => list::get(v).first,
+        Some(Kind::Cons) => cons::get(v).first,
         Some(Kind::LazySeq) => first(&lazyseq::realize(v)?)?,
         Some(Kind::Vector) => vector::get(v).v.front().cloned().unwrap_or(Value::NIL),
         Some(Kind::String) => string::get(v)
@@ -315,10 +315,10 @@ pub fn rest(v: &Value) -> RtResult<Value> {
                     if list::get(more).is_empty() {
                         list::empty()
                     } else {
-                        more.clone()
+                        *more
                     }
                 }
-                Some(Kind::Cons | Kind::LazySeq) => more.clone(),
+                Some(Kind::Cons | Kind::LazySeq) => *more,
                 _ => {
                     let s = seq(more)?;
                     if s.is_nil() { list::empty() } else { s }
@@ -356,7 +356,7 @@ pub fn second(v: &Value) -> RtResult<Value> {
 }
 
 pub fn last(v: &Value) -> RtResult<Value> {
-    last_owned(Cursor::Own(v.clone()))
+    last_at(Cursor::Own(*v))
 }
 
 /// `cons`: onto `nil` or a list gives a list; onto anything else a cons cell whose
@@ -366,7 +366,7 @@ pub fn cons(x: Value, coll: &Value) -> RtResult<Value> {
         return Ok(list::from_iter(vec![x]));
     }
     if coll.is_kind(Kind::List) {
-        return Ok(list::cons(x, coll.clone()));
+        return Ok(list::cons(x, *coll));
     }
     if !is_seqable(coll) {
         return err(
@@ -374,14 +374,14 @@ pub fn cons(x: Value, coll: &Value) -> RtResult<Value> {
             format!("Don't know how to create ISeq from: {}", type_name(coll)),
         );
     }
-    Ok(cons::new(x, coll.clone()))
+    Ok(cons::new(x, *coll))
 }
 
 pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
     match coll.kind() {
         None if coll.is_nil() => Ok(list::from_iter(vec![x])),
-        Some(Kind::List) => Ok(list::cons(x, coll.clone())),
-        Some(Kind::Cons | Kind::LazySeq) => Ok(cons::new(x, coll.clone())),
+        Some(Kind::List) => Ok(list::cons(x, *coll)),
+        Some(Kind::Cons | Kind::LazySeq) => Ok(cons::new(x, *coll)),
         Some(Kind::Vector) => {
             let mut v = vector::get(coll).v.clone();
             v.push_back(x);
@@ -391,7 +391,7 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
             let old = &set::get(coll).s;
             // An equal element is already there (`1` for `1N`): keep it.
             if old.contains(&x) {
-                return Ok(coll.clone());
+                return Ok(*coll);
             }
             let mut s = old.clone();
             s.insert(x);
@@ -402,11 +402,11 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
             match x.kind() {
                 Some(Kind::Vector) if vector::get(&x).v.len() == 2 => {
                     let e = &vector::get(&x).v;
-                    map::put(&mut m, e[0].clone(), e[1].clone());
+                    map::put(&mut m, e[0], e[1]);
                 }
                 Some(Kind::Map) => {
                     for (k, v) in map::get(&x).m.iter() {
-                        map::put(&mut m, k.clone(), v.clone());
+                        map::put(&mut m, *k, *v);
                     }
                 }
                 None if x.is_nil() => {}
@@ -414,7 +414,7 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
                 Some(Kind::SortedMap | Kind::Instance) if is_map_like(&x) => {
                     for e in to_vec(&x)? {
                         let e = &vector::get(&e).v;
-                        map::put(&mut m, e[0].clone(), e[1].clone());
+                        map::put(&mut m, e[0], e[1]);
                     }
                 }
                 _ => return err(ILLEGAL_ARGUMENT, "Vector arg to map conj must be a pair"),
@@ -435,16 +435,16 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
                     ),
                 );
             }
-            let mut c = coll.clone();
+            let mut c = *coll;
             match x.kind() {
                 Some(Kind::Vector) if vector::get(&x).v.len() == 2 => {
                     let e = &vector::get(&x).v;
-                    c = assoc(&c, e[0].clone(), e[1].clone())?;
+                    c = assoc(&c, e[0], e[1])?;
                 }
                 Some(Kind::Map | Kind::SortedMap | Kind::Instance) => {
                     for e in to_vec(&x)? {
                         let e = &vector::get(&e).v;
-                        c = assoc(&c, e[0].clone(), e[1].clone())?;
+                        c = assoc(&c, e[0], e[1])?;
                     }
                 }
                 None if x.is_nil() => {}
@@ -500,7 +500,7 @@ pub fn get(coll: &Value, k: &Value, not_found: Option<&Value>) -> RtResult<Value
             .unwrap_or_else(nf),
         Some(Kind::SortedSet) => {
             if sorted::set_contains(&sorted::set_get(coll).s, k)? {
-                k.clone()
+                *k
             } else {
                 nf()
             }
@@ -515,7 +515,7 @@ pub fn get(coll: &Value, k: &Value, not_found: Option<&Value>) -> RtResult<Value
 pub fn nth(coll: &Value, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
     let oob = |len: usize| -> RtResult<Value> {
         match not_found {
-            Some(v) => Ok(v.clone()),
+            Some(v) => Ok(*v),
             None => err(
                 INDEX_OUT_OF_BOUNDS,
                 format!("index {i} out of bounds for length {len}"),
@@ -530,7 +530,7 @@ pub fn nth(coll: &Value, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
         Some(Kind::Vector) => {
             let v = &vector::get(coll).v;
             match v.get(i as usize) {
-                Some(x) => Ok(x.clone()),
+                Some(x) => Ok(*x),
                 None => oob(v.len()),
             }
         }
@@ -544,11 +544,11 @@ pub fn nth(coll: &Value, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
         Some(Kind::List) => {
             let l = list::get(coll);
             match l.iter().nth(i as usize) {
-                Some(x) => Ok(x.clone()),
+                Some(x) => Ok(*x),
                 None => oob(l.count as usize),
             }
         }
-        Some(Kind::Cons | Kind::LazySeq) => nth_owned(Cursor::Own(coll.clone()), i, not_found),
+        Some(Kind::Cons | Kind::LazySeq) => nth_at(Cursor::Own(*coll), i, not_found),
         _ => err(
             UNSUPPORTED,
             format!("nth not supported on this type: {}", type_name(coll)),
@@ -598,7 +598,7 @@ pub fn assoc(coll: &Value, k: Value, v: Value) -> RtResult<Value> {
             let mut fields = i.fields.clone();
             if let Some(ix) = i.ty().field_kws.iter().position(|fk| fk.identical(&k)) {
                 fields[ix] = v;
-                return Ok(types::with(coll, fields, i.ext.clone()));
+                return Ok(types::with(coll, fields, i.ext));
             }
             let mut ext = map::as_map(&i.ext).map_or_else(map::empty_map, |m| m.m.clone());
             map::put(&mut ext, k, v);
@@ -738,7 +738,7 @@ pub fn map_entries(v: &Value, what: &str) -> RtResult<Vec<(Value, Value)>> {
         .iter()
         .map(|e| {
             let e = &vector::get(e).v;
-            (e[0].clone(), e[1].clone())
+            (e[0], e[1])
         })
         .collect())
 }
@@ -756,10 +756,7 @@ pub fn keys(coll: &Value) -> RtResult<Value> {
         None if coll.is_nil() => Ok(Value::NIL),
         Some(Kind::Map) => Ok(list_or_nil(map::get(coll).m.keys().cloned().collect())),
         _ if is_map_like(coll) => {
-            let ks = to_vec(coll)?
-                .iter()
-                .map(|e| vector::get(e).v[0].clone())
-                .collect();
+            let ks = to_vec(coll)?.iter().map(|e| vector::get(e).v[0]).collect();
             Ok(list_or_nil(ks))
         }
         _ => err(
@@ -774,10 +771,7 @@ pub fn vals(coll: &Value) -> RtResult<Value> {
         None if coll.is_nil() => Ok(Value::NIL),
         Some(Kind::Map) => Ok(list_or_nil(map::get(coll).m.values().cloned().collect())),
         _ if is_map_like(coll) => {
-            let vs = to_vec(coll)?
-                .iter()
-                .map(|e| vector::get(e).v[1].clone())
-                .collect();
+            let vs = to_vec(coll)?.iter().map(|e| vector::get(e).v[1]).collect();
             Ok(list_or_nil(vs))
         }
         _ => err(
@@ -792,7 +786,7 @@ pub fn peek(coll: &Value) -> RtResult<Value> {
     match coll.kind() {
         None if coll.is_nil() => Ok(Value::NIL),
         Some(Kind::Vector) => Ok(vector::get(coll).v.back().cloned().unwrap_or(Value::NIL)),
-        Some(Kind::List) => Ok(list::get(coll).first.clone()),
+        Some(Kind::List) => Ok(list::get(coll).first),
         _ => err(
             CLASS_CAST,
             format!("{} cannot be cast to IPersistentStack", type_name(coll)),

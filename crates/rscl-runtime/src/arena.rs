@@ -449,13 +449,6 @@ pub fn in_heap(addr: usize) -> bool {
     addr >= l.base && addr < USED_END.load(Ordering::Relaxed)
 }
 
-/// Bytes of the slot that holds the object at `addr`.
-pub fn slot_size(addr: usize) -> usize {
-    let l = layout();
-    let block = (addr - l.base) >> BLOCK_SHIFT;
-    class_size(unsafe { *class_ptr(l, block) } as usize)
-}
-
 /// Number of objects in the heap (counted from the bitmaps: a diagnostic).
 pub fn object_count() -> usize {
     let l = layout();

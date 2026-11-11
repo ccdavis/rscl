@@ -8,7 +8,6 @@ pub const ARITHMETIC: &str = "ArithmeticException";
 pub const ILLEGAL_ARGUMENT: &str = "IllegalArgumentException";
 pub const ARITY: &str = "ArityException";
 pub const CLASS_CAST: &str = "ClassCastException";
-pub const NULL_POINTER: &str = "NullPointerException";
 pub const INDEX_OUT_OF_BOUNDS: &str = "IndexOutOfBoundsException";
 pub const UNSUPPORTED: &str = "UnsupportedOperationException";
 pub const ILLEGAL_STATE: &str = "IllegalStateException";

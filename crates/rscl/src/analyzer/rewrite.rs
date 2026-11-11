@@ -84,11 +84,9 @@ fn defnative(form: &Value, args: &[Value]) -> CResult<Value> {
             return fail(p, "defnative parameters must be symbols with a ^type tag");
         };
         let tag = rscl_runtime::obj::map::as_map(&sym.meta).and_then(|m| {
-            m.m.get(&keyword::intern(None, "tag")).cloned().or_else(|| {
-                m.m.iter()
-                    .find(|(_, v)| v.is_true())
-                    .map(|(k, _)| k.clone())
-            })
+            m.m.get(&keyword::intern(None, "tag"))
+                .cloned()
+                .or_else(|| m.m.iter().find(|(_, v)| v.is_true()).map(|(k, _)| *k))
         });
         let Some(tag) = tag else {
             return fail(
@@ -110,17 +108,17 @@ fn defnative(form: &Value, args: &[Value]) -> CResult<Value> {
     let mut call = vec![
         sym("native-call*"),
         rscl_runtime::obj::string::new(&cname),
-        ret.clone(),
+        *ret,
         vector::from_slice(&types),
     ];
     call.extend(param_syms.iter().cloned());
     let f = lst(&[
         sym("fn*"),
-        name.clone(),
+        *name,
         vector::from_slice(&param_syms),
         lst(&call),
     ]);
-    Ok(lst(&[sym("def"), name.clone(), f]))
+    Ok(lst(&[sym("def"), *name, f]))
 }
 
 /// `(defmacro name doc? attr? [params] body...)` or multi-arity →
@@ -166,10 +164,10 @@ fn defmacro(form: &Value, args: &[Value]) -> CResult<Value> {
     }
     Ok(lst(&[
         sym("do"),
-        lst(&[sym("def"), name.clone(), lst(&f)]),
+        lst(&[sym("def"), *name, lst(&f)]),
         lst(&[
             symbol::new(Some("clojure.core"), "set-macro!"),
-            lst(&[sym("var"), name.clone()]),
+            lst(&[sym("var"), *name]),
         ]),
     ]))
 }
@@ -195,5 +193,5 @@ fn defn(form: &Value, args: &[Value]) -> CResult<Value> {
     // Unnamed, like the `defn` of core.clj: recursion goes through the var.
     let mut f = vec![sym("fn*")];
     f.extend_from_slice(rest);
-    Ok(lst(&[sym("def"), name.clone(), lst(&f)]))
+    Ok(lst(&[sym("def"), *name, lst(&f)]))
 }

@@ -4,9 +4,9 @@ use std::cmp::Ordering;
 use crate::builtins;
 use crate::exc::RtResult;
 use crate::num::{self, Num, expect_num, to_value};
-use crate::value::{VRef, Value};
+use crate::value::Value;
 
-fn fold(args: &[VRef], init: Num, op: fn(Num, Num) -> RtResult<Num>) -> RtResult<Value> {
+fn fold(args: &[Value], init: Num, op: fn(Num, Num) -> RtResult<Num>) -> RtResult<Value> {
     let mut acc = init;
     for a in args {
         acc = op(acc, expect_num(a)?)?;
@@ -14,7 +14,7 @@ fn fold(args: &[VRef], init: Num, op: fn(Num, Num) -> RtResult<Num>) -> RtResult
     Ok(to_value(acc))
 }
 
-fn chain(args: &[VRef], ok: fn(Option<Ordering>) -> bool) -> RtResult<Value> {
+fn chain(args: &[Value], ok: fn(Option<Ordering>) -> bool) -> RtResult<Value> {
     let mut prev = expect_num(&args[0])?;
     for a in &args[1..] {
         let cur = expect_num(a)?;
@@ -26,7 +26,7 @@ fn chain(args: &[VRef], ok: fn(Option<Ordering>) -> bool) -> RtResult<Value> {
     Ok(Value::TRUE)
 }
 
-fn parity(args: &[VRef], want_even: bool) -> RtResult<Value> {
+fn parity(args: &[Value], want_even: bool) -> RtResult<Value> {
     match num::is_even(&expect_num(&args[0])?) {
         Some(even) => Ok(Value::bool(even == want_even)),
         None => crate::exc::err(

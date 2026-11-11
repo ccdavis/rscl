@@ -125,12 +125,12 @@ pub fn ordered_entries(v: &Value) -> Vec<(Value, Value)> {
         && keys.len() == o.m.len()
         && let Some(entries) = keys
             .iter()
-            .map(|k| o.m.get(k).map(|x| (k.clone(), x.clone())))
+            .map(|k| o.m.get(k).map(|x| (*k, *x)))
             .collect::<Option<Vec<_>>>()
     {
         return entries;
     }
-    o.m.iter().map(|(k, x)| (k.clone(), x.clone())).collect()
+    o.m.iter().map(|(k, x)| (*k, *x)).collect()
 }
 
 /// Associate `k` with `v`. A key equal to one already present keeps the stored key
@@ -150,12 +150,12 @@ pub fn empty_map() -> Map_ {
     Map_::with_hasher(Hasher)
 }
 
-/// Build from alternating key/value pairs (borrowed). Later duplicates win.
+/// Build from alternating key/value pairs. Later duplicates win.
 pub fn from_pairs(kvs: &[Value]) -> Value {
     debug_assert!(kvs.len().is_multiple_of(2));
     let mut m = empty_map();
     for kv in kvs.chunks(2) {
-        m.insert(kv[0].clone(), kv[1].clone());
+        m.insert(kv[0], kv[1]);
     }
     new(m)
 }

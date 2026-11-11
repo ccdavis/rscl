@@ -9,10 +9,10 @@ use crate::obj::exception::{ILLEGAL_ARGUMENT, ILLEGAL_STATE};
 use crate::obj::func;
 use crate::obj::types::{self, KEY_NIL, KEY_OBJECT};
 use crate::obj::{self, Kind, atom, keyword, list, map, sorted, string, symbol, var, vector};
-use crate::value::{VRef, Value};
+use crate::value::Value;
 use crate::{builtins, native_fns};
 
-/// A native closure with its own immortal prototype, so each protocol fn and
+/// A native closure with its own permanent prototype, so each protocol fn and
 /// multimethod prints and traces under its own name.
 fn closure(entry: func::Entry, name: &str, vmin: i64, captures: Vec<Value>) -> Value {
     let p = func::new_proto(entry, name, 0, vmin);
@@ -23,8 +23,8 @@ fn closure(entry: func::Entry, name: &str, vmin: i64, captures: Vec<Value>) -> V
     f
 }
 
-fn cap(this: VRef, i: usize) -> Value {
-    func::capture(&this, i).clone()
+fn cap(this: Value, i: usize) -> Value {
+    *func::capture(&this, i)
 }
 
 /// The name of a symbol, keyword or string argument.
@@ -108,13 +108,11 @@ native_fns! {
                 ),
             );
         };
-        let owned: Vec<Value> = args.iter().map(|a| a.owned()).collect();
-        f.call(&owned)
+        f.call(args)
     }
     // captures: [name, dispatch-fn, methods-atom, default-dispatch-value]
     "multi-fn" => @gc fn nf_multi_fn(args, this) [; 0] {
-        let owned: Vec<Value> = args.iter().map(|a| a.owned()).collect();
-        let dv = cap(this, 1).call(&owned)?;
+        let dv = cap(this, 1).call(args)?;
         let table = atom::get(&cap(this, 2)).deref();
         let mut f = coll::get(&table, &dv, Some(&Value::UNBOUND))?;
         if f.is_unbound() {
@@ -130,7 +128,7 @@ native_fns! {
                 ),
             );
         }
-        f.call(&owned)
+        f.call(args)
     }
 }
 
@@ -148,9 +146,9 @@ fn multi_parts(v: &Value) -> RtResult<(Value, Value, Value)> {
         );
     }
     Ok((
-        func::capture(v, 0).clone(),
-        func::capture(v, 2).clone(),
-        func::capture(v, 3).clone(),
+        *func::capture(v, 0),
+        *func::capture(v, 2),
+        *func::capture(v, 3),
     ))
 }
 
@@ -162,7 +160,7 @@ builtins! {
         Ok(types::new_type(&name, fields, args[2].truthy()))
     }
     "instance*" => fn ct_instance(args) [; 1] {
-        let fields: Vec<Value> = args[1..].iter().map(|a| a.owned()).collect();
+        let fields: Vec<Value> = args[1..].to_vec();
         types::instance(&args[0], fields, Value::NIL)
     }
     "map->instance*" => fn ct_map_instance(args) [2] {
@@ -191,7 +189,7 @@ builtins! {
         };
         let name = named(&args[1], "field")?;
         match i.field_index(&name) {
-            Some(ix) => Ok(i.fields[ix].clone()),
+            Some(ix) => Ok(i.fields[ix]),
             None => err(ILLEGAL_ARGUMENT, format!("No matching field found: {name} for class {}", i.ty().name)),
         }
     }
@@ -203,7 +201,7 @@ builtins! {
         };
         let ix = args::int(&args[1], "field index")?;
         match usize::try_from(ix).ok().and_then(|ix| i.fields.get(ix)) {
-            Some(v) => Ok(v.clone()),
+            Some(v) => Ok(*v),
             None => err(ILLEGAL_ARGUMENT, format!("No field {ix} in class {}", i.ty().name)),
         }
     }
@@ -238,7 +236,7 @@ builtins! {
             return err(ILLEGAL_ARGUMENT, format!("Protocol {} has no method {m}", p.name));
         }
         let name = format!("{}/{m}", p.name);
-        Ok(closure(nf_protocol_fn, &name, 0, vec![args[0].owned(), string::new(&m)]))
+        Ok(closure(nf_protocol_fn, &name, 0, vec![args[0], string::new(&m)]))
     }
     "extend*" => fn ct_extend(args) [3] {
         let p = expect_protocol(&args[0], "protocol")?;
@@ -287,7 +285,7 @@ builtins! {
             return err(ILLEGAL_ARGUMENT, "dispatch fn must be callable");
         }
         let table = atom::new(map::new(map::empty_map()));
-        Ok(closure(nf_multi_fn, &name, 0, vec![args[0].owned(), args[1].owned(), table, args[2].owned()]))
+        Ok(closure(nf_multi_fn, &name, 0, vec![args[0], args[1], table, args[2]]))
     }
     "multi?" => fn ct_multi_p(args) [1] { Ok(Value::bool(is_multi(&args[0]))) }
     "add-method*" => fn ct_add_method(args) [3] {
@@ -295,10 +293,10 @@ builtins! {
         let a = atom::get(&table);
         loop {
             let old = a.deref();
-            let new = coll::assoc(&old, args[1].owned(), args[2].owned())?;
+            let new = coll::assoc(&old, args[1], args[2])?;
             if a.compare_and_set(&old, new) { break; }
         }
-        Ok(args[0].owned())
+        Ok(args[0])
     }
     "remove-method" => fn ct_remove_method(args) [2] {
         let (_, table, _) = multi_parts(&args[0])?;
@@ -308,12 +306,12 @@ builtins! {
             let new = coll::dissoc(&old, &args[1])?;
             if a.compare_and_set(&old, new) { break; }
         }
-        Ok(args[0].owned())
+        Ok(args[0])
     }
     "remove-all-methods" => fn ct_remove_all_methods(args) [1] {
         let (_, table, _) = multi_parts(&args[0])?;
         atom::get(&table).reset(map::new(map::empty_map()));
-        Ok(args[0].owned())
+        Ok(args[0])
     }
     "methods" => fn ct_methods(args) [1] {
         let (_, table, _) = multi_parts(&args[0])?;
@@ -335,7 +333,7 @@ builtins! {
             if !v.has_flag(var::FLAG_DYNAMIC) {
                 return err(ILLEGAL_STATE, format!("Can't dynamically bind non-dynamic var: {}", v.qualified()));
             }
-            // SAFETY: vars are immortal, so the reference outlives the entry.
+            // SAFETY: vars are permanent, so the reference outlives the entry.
             let v: &'static var::VarObj = unsafe { &*(v as *const var::VarObj) };
             frame.push((v, val));
         }
@@ -358,21 +356,21 @@ builtins! {
     "set-dynamic!" => fn ct_set_dynamic(args) [1, 2] {
         let v = expect_var(&args[0], "var")?;
         v.set_flag(var::FLAG_DYNAMIC, args.get(1).is_none_or(|b| b.truthy()));
-        Ok(args[0].owned())
+        Ok(args[0])
     }
     "dynamic?" => fn ct_dynamic_p(args) [1] {
         Ok(Value::bool(expect_var(&args[0], "var")?.has_flag(var::FLAG_DYNAMIC)))
     }
     "alter-meta!" => fn ct_alter_meta(args) [; 2] {
         let mut call_args: Vec<Value> = vec![obj::meta(&args[0]).unwrap_or(Value::NIL)];
-        call_args.extend(args[2..].iter().map(|a| a.owned()));
+        call_args.extend(args[2..].iter().copied());
         let m = args[1].call(&call_args)?;
-        set_ref_meta(&args[0], m.clone())?;
+        set_ref_meta(&args[0], m)?;
         Ok(m)
     }
     "reset-meta!" => fn ct_reset_meta(args) [2] {
-        set_ref_meta(&args[0], args[1].owned())?;
-        Ok(args[1].owned())
+        set_ref_meta(&args[0], args[1])?;
+        Ok(args[1])
     }
 
     // ---- sorted collections ---------------------------------------------------------
@@ -382,14 +380,14 @@ builtins! {
         }
         let mut m = sorted::OMap::new();
         for kv in args.chunks(2) {
-            m = sorted::map_assoc(&m, kv[0].owned(), kv[1].owned())?;
+            m = sorted::map_assoc(&m, kv[0], kv[1])?;
         }
         Ok(sorted::map_new(m))
     }
     "sorted-set" => fn ct_sorted_set(args) [; 0] {
         let mut s = sorted::OSet::new();
         for x in args {
-            s = sorted::set_insert(&s, x.owned())?;
+            s = sorted::set_insert(&s, *x)?;
         }
         Ok(sorted::set_new(s))
     }
@@ -408,15 +406,15 @@ builtins! {
         // (subseq coll test key) / (subseq coll start-test start-key end-test end-key)
         let items = coll::to_vec(&args[0])?;
         let key_of = |e: &Value| -> Value {
-            if args[0].is_kind(Kind::SortedMap) { vector::get(e).v[0].clone() } else { e.clone() }
+            if args[0].is_kind(Kind::SortedMap) { vector::get(e).v[0] } else { *e }
         };
         let mut out = Vec::new();
         for e in &items {
             let k = key_of(e);
-            if args[1].call(&[k.clone(), args[2].owned()])?.truthy()
-                && (args.len() == 3 || args[3].call(&[k, args[4].owned()])?.truthy())
+            if args[1].call(&[k, args[2]])?.truthy()
+                && (args.len() == 3 || args[3].call(&[k, args[4]])?.truthy())
             {
-                out.push(e.clone());
+                out.push(*e);
             }
         }
         Ok(if out.is_empty() { Value::NIL } else { list::from_iter(out) })

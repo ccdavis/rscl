@@ -27,7 +27,6 @@ rustyline = { workspace = true }
 libloading = { workspace = true }
 
 [dev-dependencies]
-rscl-runtime = { path = "../rscl-runtime", default-features = false, features = ["live-count"] }
 # Built for its cdylib: the bridge tests load target/<profile>/librscl_demo.so.
 rscl-demo = { path = "../../examples/native-demo" }
 

@@ -1,12 +1,10 @@
 //! Runtime entry points called from generated code (see `api.rs` for the table that
-//! the compiler uses to declare them). Conventions: pointer-ish arguments are
-//! borrowed (`VRef`) unless documented as consumed (`Value`); results are owned.
-use std::ffi::c_char;
+//! the compiler uses to declare them).
 
 use crate::exc::{self, RtResult};
 use crate::obj::func::{self, Entry, FnObj, FnProto};
 use crate::obj::{self, Kind, exception, keyword, list, map, set, string, symbol, vector};
-use crate::value::{VRef, Value};
+use crate::value::Value;
 
 /// View a (pointer, length) pair passed by generated code as a `&str`; null or empty
 /// yields `""`. The compiler only ever passes UTF-8 it produced itself.
@@ -17,11 +15,11 @@ pub(crate) unsafe fn str_arg<'a>(ptr: *const u8, len: i64) -> &'a str {
     unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) }
 }
 
-unsafe fn args_slice<'a>(argv: *const Value, argc: i64) -> &'a [VRef] {
+unsafe fn args_slice<'a>(argv: *const Value, argc: i64) -> &'a [Value] {
     if argc == 0 || argv.is_null() {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(argv as *const VRef, argc as usize) }
+        unsafe { std::slice::from_raw_parts(argv, argc as usize) }
     }
 }
 
@@ -30,7 +28,7 @@ unsafe fn args_slice<'a>(argv: *const Value, argc: i64) -> &'a [VRef] {
 /// Unbox a number as `f64` for primitive arithmetic (`nil` on success, `EXC` with a
 /// `ClassCastException` otherwise, the error the boxed operator would raise).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_unbox_double(v: VRef, out: *mut f64) -> Value {
+pub unsafe extern "C" fn rt_unbox_double(v: Value, out: *mut f64) -> Value {
     match crate::num::expect_num(&v) {
         Ok(n) => {
             unsafe { *out = crate::num::f(&n) };
@@ -43,7 +41,7 @@ pub unsafe extern "C" fn rt_unbox_double(v: VRef, out: *mut f64) -> Value {
 /// Unbox an integer as `i64`. `strict` (a `^long` binding) rejects doubles like a
 /// primitive parameter would; otherwise a double is truncated as `(long d)` does.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_unbox_long(v: VRef, out: *mut i64, strict: i64) -> Value {
+pub unsafe extern "C" fn rt_unbox_long(v: Value, out: *mut i64, strict: i64) -> Value {
     match crate::num::expect_num(&v) {
         Ok(crate::num::Num::I(n)) => {
             unsafe { *out = n };
@@ -144,7 +142,7 @@ pub unsafe extern "C" fn rt_read_const(ptr: *const u8, len: i64) -> Value {
 
 // ---- functions ---------------------------------------------------------------------
 
-/// Create an immortal prototype for a compiled function.
+/// Create the (permanent) prototype of a compiled function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_fnproto_new(
     entry: *const u8,
@@ -167,15 +165,15 @@ pub unsafe extern "C" fn rt_fn_new(proto: *const FnProto, ncaptures: i64) -> Val
     func::new(proto, ncaptures as usize)
 }
 
-/// Store capture `i` (ownership of `v` transferred).
+/// Store capture `i` of a fn object under construction.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_fn_set_capture(f: VRef, i: i64, v: Value) {
+pub unsafe extern "C" fn rt_fn_set_capture(f: Value, i: i64, v: Value) {
     unsafe { func::set_capture(&f, i as usize, v) }
 }
 
 /// Arity failure for a compiled function.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_throw_arity(f: VRef, argc: i64) -> Value {
+pub unsafe extern "C" fn rt_throw_arity(f: Value, argc: i64) -> Value {
     let name = func::as_fn(&f)
         .map(|fo| fo.proto().name.to_string())
         .unwrap_or_else(|| "fn".to_string());
@@ -183,24 +181,25 @@ pub unsafe extern "C" fn rt_throw_arity(f: VRef, argc: i64) -> Value {
 }
 
 /// The general call path: anything callable that is not a plain fn object (keywords,
-/// maps, vectors, sets, vars), plus the "not a function" error. Owned arguments are
-/// released here, after the call.
+/// maps, vectors, sets, vars), plus the "not a function" error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_invoke(f: VRef, argc: i64, argv: *const Value, owned: u64) -> Value {
+pub unsafe extern "C" fn rt_invoke(f: Value, argc: i64, argv: *const Value) -> Value {
     let args = unsafe { args_slice(argv, argc) };
-    let _ = owned;
     match invoke(&f, args) {
         Ok(v) => v,
         Err(_) => Value::EXC,
     }
 }
 
+/// Calls from Rust with at most this many arguments copy them to the stack.
+const INLINE_ARGS: usize = 8;
+
 /// Invoke any callable from Rust.
-pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
+pub fn invoke(f: &Value, args: &[Value]) -> RtResult<Value> {
     // The arguments may live nowhere but in this slice (a `Vec` built by a native,
     // or a compiled caller's argument slots, which the collector does not read):
     // they are roots until the call returns.
-    let root = crate::gc::ArgRoot::new(args.as_ptr() as *const Value, args.len() as i64);
+    let root = crate::gc::ArgRoot::new(args.as_ptr(), args.len() as i64);
     let _rooted = root.enter();
     match f.kind() {
         Some(Kind::Fn) => {
@@ -212,13 +211,19 @@ pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
                     args.len() as i64,
                 )));
             }
-            let argv = if args.is_empty() {
-                std::ptr::null()
+            // The callee may overwrite its argument slots (see `Entry`): it gets a
+            // copy of the slice.
+            let mut inline = [Value::NIL; INLINE_ARGS];
+            let mut spill = Vec::new();
+            let argv = if args.len() <= INLINE_ARGS {
+                inline[..args.len()].copy_from_slice(args);
+                inline.as_mut_ptr()
             } else {
-                args.as_ptr() as *const Value
+                spill.extend_from_slice(args);
+                spill.as_mut_ptr()
             };
             let r = crate::gc::enter_compiled(|| unsafe {
-                (proto.entry)(f.ptr() as *const FnObj, args.len() as i64, argv, 0)
+                (proto.entry)(f.ptr() as *const FnObj, args.len() as i64, argv)
             });
             exc::check(r)
         }
@@ -257,18 +262,14 @@ pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
     }
 }
 
-fn lookup_call(f: &Value, args: &[VRef]) -> RtResult<Value> {
+fn lookup_call(f: &Value, args: &[Value]) -> RtResult<Value> {
     if args.is_empty() || args.len() > 2 {
         return Err(exc::Exc_from(crate::core::arity_error(
             crate::core::type_name(f),
             args.len() as i64,
         )));
     }
-    let not_found = if args.len() == 2 {
-        args[1].owned()
-    } else {
-        Value::NIL
-    };
+    let not_found = if args.len() == 2 { args[1] } else { Value::NIL };
     // A keyword looks itself up in its argument; a map or set looks the argument up.
     match f.kind() {
         Some(Kind::Keyword) => crate::coll::get(&args[0], f, Some(&not_found)),
@@ -277,59 +278,50 @@ fn lookup_call(f: &Value, args: &[VRef]) -> RtResult<Value> {
 }
 
 impl Value {
-    /// Call this value as a function with borrowed arguments.
+    /// Call this value as a function.
     pub fn call(&self, args: &[Value]) -> RtResult<Value> {
-        // SAFETY: Value and VRef share a layout.
-        let refs = unsafe { std::slice::from_raw_parts(args.as_ptr() as *const VRef, args.len()) };
-        invoke(self, refs)
+        invoke(self, args)
     }
 }
 
 // ---- collections -------------------------------------------------------------------
 
-/// Copy the values out of `items` (slots the caller gave up are cleared).
-unsafe fn take_slice(items: *const Value, n: i64, owned: u64) -> Vec<Value> {
-    let t = crate::core::Taker::new(items, n, owned);
-    (0..n.max(0) as usize).map(|i| t.take(i)).collect()
-}
-
 /// Build the rest-argument list of a variadic call: `nil` when there are no extra
 /// arguments (Clojure semantics), otherwise a list.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_list_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
+pub unsafe extern "C" fn rt_list_from_slice(items: *const Value, n: i64) -> Value {
     if n <= 0 {
         return Value::NIL;
     }
-    list::from_iter(unsafe { take_slice(items, n, owned) })
+    list::from_slice(unsafe { args_slice(items, n) })
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_vector_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
-    vector::from_iter(unsafe { take_slice(items, n, owned) })
+pub unsafe extern "C" fn rt_vector_from_slice(items: *const Value, n: i64) -> Value {
+    vector::from_slice(unsafe { args_slice(items, n) })
 }
 
 /// Alternating keys and values.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_map_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
-    // Hashing a key can run rscl code (a lazy seq realising); the items are in a
-    // `Vec` here.
+pub unsafe extern "C" fn rt_map_from_slice(items: *const Value, n: i64) -> Value {
+    // Hashing a key can run rscl code (a lazy seq realising), and the collector does
+    // not look at the caller's slots or the map under construction.
     let _hold = crate::gc::hold();
     let mut m = map::empty_map();
-    let mut it = unsafe { take_slice(items, n, owned) }.into_iter();
-    while let (Some(k), Some(v)) = (it.next(), it.next()) {
-        map::put(&mut m, k, v);
+    for kv in unsafe { args_slice(items, n) }.as_chunks::<2>().0 {
+        map::put(&mut m, kv[0], kv[1]);
     }
     map::new(m)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_set_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
+pub unsafe extern "C" fn rt_set_from_slice(items: *const Value, n: i64) -> Value {
     let _hold = crate::gc::hold();
     let mut s = set::empty_set();
-    for x in unsafe { take_slice(items, n, owned) } {
+    for x in unsafe { args_slice(items, n) } {
         // An equal element already there stays (as `hash-set` does).
-        if !s.contains(&x) {
-            s.insert(x);
+        if !s.contains(x) {
+            s.insert(*x);
         }
     }
     set::new(s)
@@ -339,22 +331,18 @@ pub unsafe extern "C" fn rt_set_from_slice(items: *const Value, n: i64, owned: u
 /// for the rest of the process, so it is a root. Everything it contains is flagged
 /// too (the reader does not attach positions to shared constants).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_make_immortal(v: VRef) {
-    make_immortal(&v);
-}
-
-pub fn make_immortal(v: &Value) {
+pub unsafe extern "C" fn rt_make_constant(v: Value) {
     let Some(h) = v.header() else { return };
-    if h.is_immortal() {
+    if h.is_permanent() {
         return;
     }
-    crate::gc::make_permanent(v);
-    flag_contents(v);
+    crate::gc::make_permanent(&v);
+    flag_contents(&v);
 }
 
 fn flag(v: &Value) {
     let Some(h) = v.header() else { return };
-    if h.is_immortal() {
+    if h.is_permanent() {
         return;
     }
     h.flags.fetch_or(
@@ -376,7 +364,7 @@ fn flag_contents(v: &Value) {
                     break;
                 }
                 let h = cell.rest.header().unwrap();
-                if h.is_immortal() {
+                if h.is_permanent() {
                     break;
                 }
                 h.flags.fetch_or(
@@ -412,19 +400,6 @@ fn flag_contents(v: &Value) {
 
 // ---- printing ----------------------------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_pr_str(v: VRef) -> Value {
-    string::from_string(crate::printer::pr_str(&v))
-}
-
-/// Print a value followed by a newline (the top-level form printer of AOT binaries).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_prn(v: VRef) {
-    let mut s = crate::printer::pr_str(&v);
-    s.push('\n');
-    crate::core::basic::emit(&s);
-}
-
 /// Report the pending exception on stderr; returns the process exit code (1).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_report_uncaught() -> i32 {
@@ -458,16 +433,5 @@ pub unsafe extern "C" fn rt_run_main(v: *const obj::var::VarObj) -> i32 {
     match root.call(&args) {
         Ok(_) => 0,
         Err(_) => unsafe { rt_report_uncaught() },
-    }
-}
-
-/// Borrow a string's bytes as a NUL-terminated C string (kept alive by `v`); null for
-/// non-strings.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_string_cstr(v: VRef) -> *const c_char {
-    if v.is_kind(Kind::String) {
-        string::cstr(&v)
-    } else {
-        std::ptr::null()
     }
 }

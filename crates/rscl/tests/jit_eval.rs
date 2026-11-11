@@ -104,7 +104,7 @@ fn locals_loops_closures() {
 }
 
 #[test]
-fn recur_releases_locals_bound_in_the_body() {
+fn recur_with_locals_bound_in_the_body() {
     with_jit(|j| {
         assert_eq!(
             eval(
@@ -144,7 +144,7 @@ fn arities_and_vars() {
         assert_eq!(def(j, "(def x \"first\")"), "#'user/x");
         def(j, "(defn get-x [] x)");
         assert_eq!(eval(j, "(get-x)"), "\"first\"");
-        eval(j, "(def x \"second\")"); // rebinding releases the old root: no growth
+        eval(j, "(def x \"second\")");
         assert_eq!(eval(j, "(get-x)"), "\"second\"");
         assert_eq!(eval(j, "(var x)"), "#'user/x");
         assert_eq!(def(j, "(def y)"), "#'user/y");
@@ -156,15 +156,15 @@ fn arities_and_vars() {
 }
 
 #[test]
-fn exceptions_release_temporaries() {
+fn exceptions_with_live_temporaries() {
     with_jit(|j| {
-        // The owned string "a" must be released when the second argument throws.
+        // The string "a" is a live temporary when the second argument throws.
         assert_eq!(
             eval(j, "(str (str \"a\") (+ 1 nil))"),
             "EXC ClassCastException: nil cannot be cast to Number"
         );
         assert_eq!(
-            eval(j, "(let [s (str \"owned\")] (+ s 1))"),
+            eval(j, "(let [s (str \"local\")] (+ s 1))"),
             "EXC ClassCastException: String cannot be cast to Number"
         );
         assert_eq!(
@@ -252,7 +252,7 @@ fn exceptions_try_catch_finally() {
             ),
             "\"x!\""
         );
-        // Uncaught through a try without a matching clause: temporaries still released.
+        // Uncaught through a try without a matching clause, with a live temporary.
         assert_eq!(
             eval(
                 j,
@@ -268,7 +268,7 @@ fn exceptions_try_catch_finally() {
             ),
             "EXC ExceptionInfo: second"
         );
-        // Catch body throwing propagates outward with locals released.
+        // Catch body throwing propagates outward.
         assert_eq!(
             eval(
                 j,
@@ -499,7 +499,6 @@ fn types_protocols_multimethods() {
         );
         def(j, "(defmethod strict \"x\" [x] (str x x))");
         assert_eq!(eval(j, "(strict (str \"x\"))"), "\"xx\"");
-        // Removing the method frees it (it lived in the method table), so no leak check.
         def(j, "(remove-method strict \"x\")");
         assert_eq!(eval(j, "(count (methods strict))"), "0");
         def(j, "(defmulti by-type type)");
@@ -602,7 +601,7 @@ fn dynamic_vars_and_sorted_colls() {
 }
 
 #[test]
-fn primitives_do_not_leak() {
+fn primitive_locals_and_hints() {
     with_jit(|j| {
         assert_eq!(
             eval(
@@ -680,13 +679,13 @@ fn primitives_do_not_leak() {
 }
 
 #[test]
-fn locals_clearing_and_argument_ownership() {
+fn value_lifetimes_across_calls() {
     with_jit(|j| {
         // Consumers stream: the head of a lazy seq is not held by the caller.
         assert_eq!(eval(j, "(reduce + (range 100000))"), "4999950000");
         assert_eq!(eval(j, "(count (filter even? (range 100000)))"), "50000");
         assert_eq!(eval(j, "(last (map inc (range 1000)))"), "1000");
-        // A borrowed operand pending while a later argument transfers the local.
+        // An operand pending while a later argument uses the same local.
         assert_eq!(
             eval(j, "(let [r (map inc (range 3))] (cons r (list (count r))))"),
             "((1 2 3) 3)"
@@ -724,7 +723,7 @@ fn locals_clearing_and_argument_ownership() {
             ),
             "[[\"a\" \"b\"] [\"0\" \"1\"] []]"
         );
-        // Exceptions thrown after a transfer release everything exactly once.
+        // Exceptions thrown part-way through evaluating arguments.
         assert_eq!(
             eval(
                 j,
@@ -783,7 +782,7 @@ fn dynamic_keywords_are_collected() {
 }
 
 #[test]
-fn futures_promises_delays_do_not_leak() {
+fn futures_promises_delays() {
     with_jit(|j| {
         assert_eq!(eval(j, "@(future (str \"a\" \"b\"))"), "\"ab\"");
         assert_eq!(
@@ -798,7 +797,7 @@ fn futures_promises_delays_do_not_leak() {
             "[false \"d\" \"d\"]"
         );
         // The future outlives the timed-out deref; wait for it so nothing is in flight
-        // when the live count is compared.
+        // when the next evaluation starts.
         assert_eq!(
             eval(
                 j,
@@ -876,7 +875,7 @@ fn cycles_are_collected() {
 }
 
 #[test]
-fn bigints_do_not_leak() {
+fn bigints() {
     with_jit(|j| {
         assert_eq!(
             eval(j, "(+' 9223372036854775807 1)"),
@@ -1116,8 +1115,6 @@ fn third_pass_review_regressions() {
         assert!(after - before < 20, "{} collections", after - before);
         // Syntax-quoted and plain map literals evaluate in source order.
         def(j, "(def order (atom []))");
-        // Settle the collector's candidates before the leak-checked evaluations.
-        def(j, "(gc)");
         assert_eq!(
             eval(
                 j,

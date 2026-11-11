@@ -281,7 +281,7 @@ pub fn set_print_protocol(p: &Value) {
 
 fn print_protocol() -> Option<Value> {
     let bits = PRINT_PROTOCOL.load(std::sync::atomic::Ordering::Acquire);
-    // SAFETY: protocols are immortal; the stored bits stay valid for the process.
+    // SAFETY: protocols are permanent; the stored bits stay valid for the process.
     (bits != 0).then(|| unsafe { Value::from_raw(bits) })
 }
 
@@ -290,7 +290,7 @@ fn write_instance(out: &mut String, v: &Value, readably: bool, depth: usize) {
     if let Some(p) = print_protocol()
         && let Some(f) = obj::types::proto(&p).find(i.ty().id, "-pr")
     {
-        match f.call(&[v.clone(), Value::bool(readably)]) {
+        match f.call(&[*v, Value::bool(readably)]) {
             Ok(s) => {
                 out.push_str(&print_str(&s));
                 return;

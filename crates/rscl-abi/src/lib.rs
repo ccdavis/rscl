@@ -6,30 +6,25 @@
 //! runtime (one interning table, one heap). Values cross the boundary as raw 64-bit
 //! words.
 //!
-//! Lifetimes (API version 5): the runtime has a tracing garbage collector. No
-//! collection runs while a library function is being called, so every value it
-//! receives, creates or extracts stays alive for the call, wherever the library
-//! keeps it. A library must not keep values in storage of its own *beyond* a
-//! call: the collector does not see them there, and `retain` and `release` (which
-//! remain in the table) do nothing. Version 4 libraries relied on them and are
-//! rejected at load. The destructor of a native object runs some time after the
+//! Lifetimes: the runtime has a tracing garbage collector. No collection runs
+//! while a library function is being called, so every value it receives, creates
+//! or extracts stays alive for the call, wherever the library keeps it. A library
+//! must not keep values in storage of its own *beyond* a call: the collector does
+//! not see them there. The destructor of a native object runs some time after the
 //! object becomes unreachable (see the runtime's `obj/native.rs`), not at once.
 #![no_std]
 
 use core::ffi::c_void;
 
 /// Bump when `RtApi` changes incompatibly.
-pub const API_VERSION: u32 = 5;
+pub const API_VERSION: u32 = 6;
 
 /// The symbol every bridge library exports.
 pub const REGISTER_SYMBOL: &str = "rscl_module_register";
 
-/// The uniform calling convention of every rscl fn (compiled or native). `owned` is
-/// non-zero when the argument slots belong to the callee for the duration of the
-/// call (the caller will not read them again, so the callee may overwrite them),
-/// and zero when they are memory the caller still uses.
-pub type Entry =
-    unsafe extern "C" fn(f: *const c_void, argc: i64, argv: *const u64, owned: u64) -> u64;
+/// The uniform calling convention of every rscl fn (compiled or native): the fn
+/// object, and `argc` argument words at `argv`.
+pub type Entry = unsafe extern "C" fn(f: *const c_void, argc: i64, argv: *const u64) -> u64;
 
 /// Destructor for a native object's payload.
 pub type DropFn = unsafe extern "C" fn(data: *mut c_void);
@@ -40,8 +35,6 @@ pub struct RtApi {
     pub version: u32,
     /// The "exception pending" sentinel returned by throwing calls.
     pub exc: u64,
-    pub retain: unsafe extern "C" fn(v: u64),
-    pub release: unsafe extern "C" fn(v: u64),
     /// Static type name of a value, for error messages.
     pub type_name: unsafe extern "C" fn(v: u64, out: *mut *const u8, len: *mut i64),
     pub is_nil: unsafe extern "C" fn(v: u64) -> i32,
@@ -62,19 +55,19 @@ pub struct RtApi {
         unsafe extern "C" fn(ns: *const u8, ns_len: i64, name: *const u8, name_len: i64) -> u64,
     /// 1 and writes the name (without namespace) if `v` is a keyword or symbol.
     pub named_name: unsafe extern "C" fn(v: u64, out: *mut *const u8, len: *mut i64) -> i32,
-    /// Any seqable value as a vector (+1), or `exc`.
+    /// Any seqable value as a vector, or `exc`.
     pub to_vector: unsafe extern "C" fn(v: u64) -> u64,
     pub vector_len: unsafe extern "C" fn(v: u64) -> i64,
-    /// Element `i` (+1); `nil` when out of range.
+    /// Element `i`; `nil` when out of range.
     pub vector_get: unsafe extern "C" fn(v: u64, i: i64) -> u64,
     pub vector_new: unsafe extern "C" fn(items: *const u64, n: i64) -> u64,
     /// Alternating keys and values.
     pub map_new: unsafe extern "C" fn(kvs: *const u64, n: i64) -> u64,
-    /// Value for `k` (+1) or `not_found` (+1).
+    /// Value for `k`, or `not_found`.
     pub map_get: unsafe extern "C" fn(m: u64, k: u64, not_found: u64) -> u64,
-    /// Vector of `[k v]` vectors (+1), or `exc` if `m` is not a map.
+    /// Vector of `[k v]` vectors, or `exc` if `m` is not a map.
     pub map_entries: unsafe extern "C" fn(m: u64) -> u64,
-    /// Call an rscl fn; returns the result (+1) or `exc`.
+    /// Call an rscl fn; returns the result or `exc`.
     pub invoke: unsafe extern "C" fn(f: u64, argc: i64, argv: *const u64) -> u64,
     /// Throw a new exception of `class` with `message`; returns `exc`.
     pub throw:
@@ -103,7 +96,7 @@ pub struct RtApi {
         arity_mask: u64,
         variadic_min: i64,
     ),
-    /// `pr-str` of a value (+1 string).
+    /// `pr-str` of a value (a string).
     pub pr_str: unsafe extern "C" fn(v: u64) -> u64,
     /// Drop the calling thread's pending exception, if any.
     pub exc_clear: unsafe extern "C" fn(),

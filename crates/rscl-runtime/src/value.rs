@@ -12,13 +12,11 @@
 //! | `0x202` / `0x302`   | `EXC` (exception pending) / `UNBOUND` (var has no root) |
 //! | `0x06 | cp << 8`    | char                                                 |
 //!
-//! A `Value` is a plain reference: copying and dropping it cost nothing, and the
-//! tracing collector (`gc.rs`) decides when an object dies. `VRef` is the same word,
-//! `Copy`, used for FFI parameters.
+//! A `Value` is a plain `Copy` reference; the tracing collector (`gc.rs`) decides
+//! when an object dies.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::obj;
@@ -60,65 +58,27 @@ impl ObjHeader {
     }
     /// Header of an object that is never freed. The creator registers the object
     /// with `gc::register_permanent`.
-    pub fn immortal(kind: Kind) -> Self {
+    pub fn permanent(kind: Kind) -> Self {
         ObjHeader {
             flags: AtomicU64::new(PERMANENT),
             kind,
             pos: 0,
         }
     }
-    pub fn is_immortal(&self) -> bool {
+    pub fn is_permanent(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & PERMANENT != 0
     }
 }
 
-/// Number of heap objects the collector knows about (a diagnostic: it only goes
-/// down when a collection runs).
-pub fn live_objects() -> i64 {
-    crate::gc::object_count() as i64
-}
-
 /// A reference to an rscl value: one word, freely copied. Heap objects are kept
-/// alive by the tracing collector, which finds the references held in machine
-/// stacks conservatively (see `gc.rs`).
-#[repr(transparent)]
-pub struct Value(u64);
-
-/// A value as an FFI parameter: the same word, `Copy`.
+/// alive by the tracing collector (see `gc.rs`).
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct VRef(u64);
+pub struct Value(u64);
 
 // Heap objects are either immutable or internally synchronised.
 unsafe impl Send for Value {}
 unsafe impl Sync for Value {}
-unsafe impl Send for VRef {}
-unsafe impl Sync for VRef {}
-
-impl Deref for VRef {
-    type Target = Value;
-    #[inline]
-    fn deref(&self) -> &Value {
-        // SAFETY: identical repr(transparent) layout; the borrow lifetime bounds use.
-        unsafe { &*(self as *const VRef as *const Value) }
-    }
-}
-
-impl VRef {
-    #[inline]
-    pub const fn from_raw(bits: u64) -> VRef {
-        VRef(bits)
-    }
-    #[inline]
-    pub fn bits(self) -> u64 {
-        self.0
-    }
-    /// Take an owned copy (+1).
-    #[inline]
-    pub fn owned(self) -> Value {
-        (*self).clone()
-    }
-}
 
 impl Value {
     pub const NIL: Value = Value(NIL);
@@ -129,23 +89,17 @@ impl Value {
 
     // ---- construction ------------------------------------------------------------
 
-    /// Wrap raw bits as an owned value. The caller transfers one reference.
+    /// Wrap raw bits as a value.
+    ///
+    /// # Safety
+    /// `bits` must be a valid encoding: an immediate, or a pointer to a live object.
     #[inline]
     pub const unsafe fn from_raw(bits: u64) -> Value {
         Value(bits)
     }
-    /// Give up ownership and return the raw bits (no release).
-    #[inline]
-    pub fn into_raw(self) -> u64 {
-        self.0
-    }
     #[inline]
     pub fn bits(&self) -> u64 {
         self.0
-    }
-    #[inline]
-    pub fn as_ref(&self) -> VRef {
-        VRef(self.0)
     }
     #[inline]
     pub fn bool(b: bool) -> Value {
@@ -188,10 +142,6 @@ impl Value {
     #[inline]
     pub fn is_ptr(&self) -> bool {
         self.0 & 0b11 == 0 && self.0 != 0
-    }
-    #[inline]
-    pub fn is_immediate(&self) -> bool {
-        self.0 & 0b11 == 0b10
     }
     #[inline]
     pub fn is_exc(&self) -> bool {
@@ -293,13 +243,6 @@ impl Value {
         } else {
             None
         }
-    }
-}
-
-impl Clone for Value {
-    #[inline]
-    fn clone(&self) -> Value {
-        Value(self.0)
     }
 }
 

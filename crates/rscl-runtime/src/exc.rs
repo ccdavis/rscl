@@ -21,7 +21,7 @@ pub type RtResult<T> = Result<T, Exc>;
 /// Make `v` the pending exception (replacing any previous one).
 pub fn throw(v: Value) -> Exc {
     exception::fill_trace(&v);
-    PENDING.with(|p| p.set(v.into_raw()));
+    PENDING.with(|p| p.set(v.bits()));
     Exc
 }
 
@@ -97,14 +97,14 @@ pub fn format_exception_with_trace(v: &Value) -> String {
 
 // ---- FFI ----------------------------------------------------------------------------
 
-/// Throw `v` (ownership transferred) and return `EXC`.
+/// Throw `v` and return `EXC`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_throw(v: Value) -> Value {
     throw(v);
     unsafe { Value::from_raw(EXC) }
 }
 
-/// Claim the pending exception (owned) or `nil` if none is pending.
+/// Claim the pending exception, or `nil` if none is pending.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_take_exception() -> Value {
     take().unwrap_or(Value::NIL)

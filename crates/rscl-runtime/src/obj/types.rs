@@ -1,6 +1,6 @@
 //! User types (`deftype`, `defrecord`), their instances, and protocols.
 //!
-//! A `TypeObj` is immortal (redefining a type at the REPL creates a new one; old
+//! A `TypeObj` is permanent (redefining a type at the REPL creates a new one; old
 //! instances keep the old type). Built-in kinds are represented by cached `TypeObj`s
 //! too, so `(type x)` and protocol dispatch use one notion of type.
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ pub struct TypeObj {
 fn type_value(id: u64, name: &str, fields: Vec<String>, is_record: bool) -> Value {
     let field_kws = fields.iter().map(|f| keyword::intern(None, f)).collect();
     let p = super::alloc_raw(TypeObj {
-        hdr: ObjHeader::immortal(Kind::Type),
+        hdr: ObjHeader::permanent(Kind::Type),
         id,
         name: name.into(),
         fields: fields.into_iter().map(Into::into).collect(),
@@ -201,7 +201,7 @@ pub fn builtin_keys() -> Vec<u64> {
 }
 
 struct BuiltinTypes(HashMap<u64, usize>);
-// SAFETY: stores addresses of immortal type objects.
+// SAFETY: stores addresses of permanent type objects.
 unsafe impl Send for BuiltinTypes {}
 unsafe impl Sync for BuiltinTypes {}
 
@@ -245,7 +245,7 @@ pub struct InstanceObj {
     pub meta: Value,
 }
 
-// SAFETY: `ty` is immortal.
+// SAFETY: `ty` is permanent.
 unsafe impl Send for InstanceObj {}
 unsafe impl Sync for InstanceObj {}
 
@@ -260,7 +260,7 @@ impl InstanceObj {
     pub fn get_kw(&self, k: &Value) -> Option<Value> {
         let ty = self.ty();
         if let Some(i) = ty.field_kws.iter().position(|fk| fk.identical(k)) {
-            return Some(self.fields[i].clone());
+            return Some(self.fields[i]);
         }
         super::map::as_map(&self.ext).and_then(|m| m.m.get(k).cloned())
     }
@@ -274,7 +274,7 @@ impl InstanceObj {
             .zip(self.fields.iter().cloned())
             .collect();
         if let Some(m) = super::map::as_map(&self.ext) {
-            out.extend(m.m.iter().map(|(k, v)| (k.clone(), v.clone())));
+            out.extend(m.m.iter().map(|(k, v)| (*k, *v)));
         }
         out
     }
@@ -335,7 +335,7 @@ pub fn with(v: &Value, fields: Vec<Value>, ext: Value) -> Value {
         ty: i.ty,
         fields,
         ext,
-        meta: i.meta.clone(),
+        meta: i.meta,
     })
 }
 
@@ -351,7 +351,7 @@ pub struct ProtocolObj {
 
 pub fn protocol_new(name: &str, methods: Vec<String>) -> Value {
     let p = super::alloc_raw(ProtocolObj {
-        hdr: ObjHeader::immortal(Kind::Protocol),
+        hdr: ObjHeader::permanent(Kind::Protocol),
         name: name.into(),
         methods: methods.into_iter().map(Into::into).collect(),
         impls: RwLock::new(HashMap::new()),

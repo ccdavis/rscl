@@ -71,10 +71,13 @@ pub fn throw(class: &str, message: &str) -> Exc {
     Exc::pending()
 }
 
-/// An owned reference to an rscl value. It must stay on the thread rscl called the
-/// library on (it is neither `Send` nor `Sync`): the runtime's collector and its
-/// pending-exception slot only know about threads the runtime itself started.
+/// A reference to an rscl value: one word, freely copied. It is valid for the call
+/// it was received or created in (see `rscl_abi`), and must stay on the thread rscl
+/// called the library on (it is neither `Send` nor `Sync`): the runtime's collector
+/// and its pending-exception slot only know about threads the runtime itself
+/// started.
 #[repr(transparent)]
+#[derive(Clone, Copy)]
 pub struct Val(u64, std::marker::PhantomData<*const ()>);
 
 const fn val(bits: u64) -> Val {
@@ -82,18 +85,12 @@ const fn val(bits: u64) -> Val {
 }
 
 impl Val {
-    /// Wrap raw bits, taking over one reference.
+    /// Wrap raw bits.
     ///
     /// # Safety
-    /// `bits` must be a value word the caller owns one reference to (as returned by
-    /// an `RtApi` function that hands out `+1` results).
+    /// `bits` must be a value word the runtime handed out during the current call.
     pub unsafe fn from_raw(bits: u64) -> Val {
         val(bits)
-    }
-    pub fn into_raw(self) -> u64 {
-        let b = self.0;
-        std::mem::forget(self);
-        b
     }
     pub fn bits(&self) -> u64 {
         self.0
@@ -155,7 +152,7 @@ impl Val {
         let s = unsafe { val((api().pr_str)(self.0)) };
         s.as_str().unwrap_or("").to_string()
     }
-    /// Materialise a seqable value as a vector of owned elements.
+    /// Materialise a seqable value as a vector of its elements.
     pub fn to_vec(&self) -> Result<Vec<Val>> {
         let v = check(unsafe { (api().to_vector)(self.0) })?;
         let n = unsafe { (api().vector_len)(v.0) };
@@ -164,8 +161,7 @@ impl Val {
             .collect())
     }
     pub fn vector(items: Vec<Val>) -> Val {
-        // `vector_new` retains its elements; `items` releases its own references
-        // when it drops. `Val` is a transparent `u64`.
+        // `Val` is a transparent `u64`.
         unsafe {
             val((api().vector_new)(
                 items.as_ptr() as *const u64,
@@ -194,19 +190,6 @@ impl Val {
     }
     pub fn boolean(b: bool) -> Val {
         unsafe { val((api().bool_new)(b as i32)) }
-    }
-}
-
-impl Clone for Val {
-    fn clone(&self) -> Val {
-        unsafe { (api().retain)(self.0) };
-        val(self.0)
-    }
-}
-
-impl Drop for Val {
-    fn drop(&mut self) {
-        unsafe { (api().release)(self.0) }
     }
 }
 
@@ -241,7 +224,7 @@ fn cast_err<T>(v: &Val, what: &str, expected: &str) -> Result<T> {
 
 impl<'a> FromVal<'a> for Val {
     fn from_val(v: &'a Val, _: &str) -> Result<Self> {
-        Ok(v.clone())
+        Ok(*v)
     }
 }
 impl<'a> FromVal<'a> for &'a Val {
@@ -445,7 +428,6 @@ impl<T: IntoVal> IntoVal for Vec<T> {
 /// Keys stay strings, so a map round-trips through Rust unchanged.
 impl<V: IntoVal> IntoVal for HashMap<String, V> {
     fn into_val(self) -> Result<Val> {
-        // Owned `Val`s: a conversion that fails part-way releases what was built.
         let mut kvs: Vec<Val> = Vec::with_capacity(self.len() * 2);
         for (k, v) in self {
             kvs.push(Val::string(&k));
@@ -498,7 +480,8 @@ unsafe extern "C" fn drop_native<T>(data: *mut c_void) {
 }
 
 /// The payload is shared with every rscl thread that gets hold of the value, and is
-/// dropped on whichever releases it last: it must be `Send + Sync`.
+/// dropped on whichever thread the collector finalises it on: it must be
+/// `Send + Sync`.
 impl<T: Send + Sync + 'static> IntoVal for Native<T> {
     fn into_val(self) -> Result<Val> {
         let name = std::any::type_name::<T>();
@@ -580,18 +563,6 @@ pub unsafe fn wrap(
     name: &str,
     argc: i64,
     argv: *const u64,
-    owned: u64,
-    arity: i64,
-    f: impl FnOnce(&[Val]) -> Result<Val>,
-) -> u64 {
-    let _ = owned;
-    wrap_borrowed(name, argc, argv, arity, f)
-}
-
-fn wrap_borrowed(
-    name: &str,
-    argc: i64,
-    argv: *const u64,
     arity: i64,
     f: impl FnOnce(&[Val]) -> Result<Val>,
 ) -> u64 {
@@ -608,7 +579,7 @@ fn wrap_borrowed(
         unsafe { std::slice::from_raw_parts(argv as *const Val, argc as usize) }
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(args))) {
-        Ok(Ok(v)) => v.into_raw(),
+        Ok(Ok(v)) => v.bits(),
         Ok(Err(_)) => api().exc,
         Err(payload) => {
             let msg = payload
@@ -667,10 +638,10 @@ macro_rules! exports {
                 // The export's attributes apply to its wrapper too (`#[cfg(..)]`
                 // removes both).
                 $(#[$meta])*
-                pub unsafe extern "C" fn $name(_f: *const ::std::ffi::c_void, argc: i64, argv: *const u64, owned: u64) -> u64 {
+                pub unsafe extern "C" fn $name(_f: *const ::std::ffi::c_void, argc: i64, argv: *const u64) -> u64 {
                     const ARITY: i64 = $crate::__count!($($arg)*);
                     const _: () = assert!(ARITY < 64, "an export takes at most 63 parameters");
-                    unsafe { $crate::wrap(stringify!($name), argc, argv, owned, ARITY, |args| {
+                    unsafe { $crate::wrap(stringify!($name), argc, argv, ARITY, |args| {
                         #[allow(unused_variables, unused_mut)]
                         let mut i = 0usize;
                         $(

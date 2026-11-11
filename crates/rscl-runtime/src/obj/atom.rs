@@ -45,21 +45,20 @@ pub fn as_atom(v: &Value) -> Option<&AtomObj> {
 
 impl AtomObj {
     pub fn deref(&self) -> Value {
-        self.value.lock().unwrap().clone()
+        *self.value.lock().unwrap()
     }
     pub fn meta(&self) -> Value {
-        self.meta.lock().unwrap().clone()
+        *self.meta.lock().unwrap()
     }
     pub fn set_meta(&self, m: Value) {
         *self.meta.lock().unwrap() = m;
         crate::gc::write_barrier(self);
     }
-    /// Store `v`, returning it (+1) like `reset!`.
+    /// Store `v`, returning it like `reset!`.
     pub fn reset(&self, v: Value) -> Value {
-        let r = v.clone();
         *self.value.lock().unwrap() = v;
         crate::gc::write_barrier(self);
-        r
+        v
     }
     pub fn compare_and_set(&self, expected: &Value, new: Value) -> bool {
         let mut g = self.value.lock().unwrap();

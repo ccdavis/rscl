@@ -151,8 +151,8 @@ builtins! {
     "use" => fn cf_use(args) [; 0] {
         for spec in args {
             let spec = match spec.kind() {
-                Some(Kind::Symbol) => vector::from_slice(&[spec.owned(), keyword::intern(None, "refer"), keyword::intern(None, "all")]),
-                _ => spec.owned(),
+                Some(Kind::Symbol) => vector::from_slice(&[*spec, keyword::intern(None, "refer"), keyword::intern(None, "all")]),
+                _ => *spec,
             };
             require_spec(&spec, false)?;
         }
@@ -214,7 +214,7 @@ builtins! {
         let target = the_ns(&args[0])?;
         let mut spec = vec![symbol::new(None, &target.name)];
         if args.len() == 1 { spec.push(keyword::intern(None, "refer")); spec.push(keyword::intern(None, "all")); }
-        spec.extend(args[1..].iter().map(|a| a.owned()));
+        spec.extend(args[1..].iter().copied());
         require_spec(&vector::from_iter(spec), false).map(|_| Value::NIL)
     }
     "ns-resolve" => fn cf_ns_resolve(args) [2] {

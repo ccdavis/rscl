@@ -551,7 +551,7 @@ impl Analyzer {
         {
             let with_meta = ns::core().intern("with-meta").root();
             let bare = with_meta
-                .call(&[form.clone(), Value::NIL])
+                .call(&[*form, Value::NIL])
                 .or_else(|_| fail(form, "cannot strip literal metadata"))?;
             let call = list::from_slice(&[
                 symbol::new(Some("clojure.core"), "with-meta"),
@@ -570,7 +570,7 @@ impl Analyzer {
             }
             Some(Kind::Map) => {
                 if is_constant(form) {
-                    return Ok(Node::Const(form.clone()));
+                    return Ok(Node::Const(*form));
                 }
                 // In the order the entries were written (the reader records it), so
                 // the value expressions run left to right.
@@ -583,7 +583,7 @@ impl Analyzer {
             }
             Some(Kind::Set) => {
                 if is_constant(form) {
-                    return Ok(Node::Const(form.clone()));
+                    return Ok(Node::Const(*form));
                 }
                 let items = rscl_runtime::obj::set::ordered_items(form);
                 self.analyze_coll(form, CollKind::Set, &items)
@@ -593,8 +593,8 @@ impl Analyzer {
             Some(Kind::SortedMap) => {
                 let mut items = vec![symbol::new(Some("clojure.core"), "sorted-map")];
                 for (k, v) in rscl_runtime::obj::sorted::map_get(form).m.iter() {
-                    items.push(k.0.clone());
-                    items.push(v.clone());
+                    items.push(k.0);
+                    items.push(*v);
                 }
                 self.analyze_list(&list::from_iter(items), tail)
             }
@@ -604,7 +604,7 @@ impl Analyzer {
                     rscl_runtime::obj::sorted::set_get(form)
                         .s
                         .iter()
-                        .map(|k| k.0.clone()),
+                        .map(|k| k.0),
                 );
                 self.analyze_list(&list::from_iter(items), tail)
             }
@@ -619,14 +619,14 @@ impl Analyzer {
             Some(Kind::Var) => Ok(Node::TheVar(VarPtr(form.ptr() as *const VarObj))),
             _ => {
                 check_embeddable(form, form)?;
-                Ok(Node::Const(form.clone()))
+                Ok(Node::Const(*form))
             }
         }
     }
 
     fn analyze_coll(&mut self, form: &Value, kind: CollKind, items: &[Value]) -> CResult<Node> {
         if items.iter().all(is_constant) {
-            return Ok(Node::Const(form.clone()));
+            return Ok(Node::Const(*form));
         }
         let nodes = items
             .iter()
@@ -685,7 +685,7 @@ impl Analyzer {
                 {
                     let expanded = list::from_slice(&[
                         symbol::new(Some("clojure.core"), "field*"),
-                        items[1].clone(),
+                        items[1],
                         list::from_slice(&[symbol::new(None, "quote"), symbol::new(None, field)]),
                     ]);
                     self.stamp_expansion(form, &expanded);
@@ -752,7 +752,7 @@ impl Analyzer {
             return fail(form, format!("macro {} is unbound", var.get().qualified()));
         }
         let mut args = Vec::with_capacity(items.len() + 1);
-        args.push(form.clone());
+        args.push(*form);
         args.push(Value::NIL);
         args.extend(items[1..].iter().cloned());
         match f.call(&args) {
@@ -774,7 +774,7 @@ impl Analyzer {
     /// A macro or rewrite may hand back one of the original sub-forms (`(or x)` → x);
     /// only a freshly built form takes the position of the form it replaces.
     fn stamp_expansion(&self, form: &Value, expanded: &Value) {
-        if pos::pos_id(expanded) == 0 && expanded.header().is_some_and(|h| !h.is_immortal()) {
+        if pos::pos_id(expanded) == 0 && expanded.header().is_some_and(|h| !h.is_permanent()) {
             pos::set_pos(expanded, pos::pos_id(form));
         }
     }
@@ -794,7 +794,7 @@ impl Analyzer {
                     return fail(form, "Wrong number of args to quote");
                 }
                 check_embeddable(form, &items[1])?;
-                Ok(Node::Const(items[1].clone()))
+                Ok(Node::Const(items[1]))
             }
             "if" => {
                 if items.len() < 3 || items.len() > 4 {
@@ -923,7 +923,7 @@ impl Analyzer {
                 if !items[2].is_kind(Kind::String) {
                     return fail(form, "Too many arguments to def");
                 }
-                (Some(items[2].clone()), Some(&items[3]))
+                (Some(items[2]), Some(&items[3]))
             }
         };
         // Symbol metadata (`^:dynamic`, `^{:doc ..}`) plus a docstring become var meta.
@@ -1330,7 +1330,7 @@ impl Analyzer {
                         "Only catch or finally clause can follow catch in try expression",
                     );
                 }
-                body_forms.push(it.clone());
+                body_forms.push(*it);
             }
         }
         self.frame().try_depth += 1;
@@ -1406,7 +1406,7 @@ pub fn split_do(form: &Value) -> Vec<Value> {
     {
         return items.iter().skip(1).flat_map(split_do).collect();
     }
-    vec![form.clone()]
+    vec![*form]
 }
 
 /// The elements of a list, cons or lazy seq form (`None` for anything else). Lazy
@@ -1429,19 +1429,16 @@ pub fn seq_items(v: &Value) -> Option<Vec<Value>> {
 /// evaluating the map leaves it alone.
 fn quote_tag(meta: &Value) -> Value {
     let Some(m) = map::as_map(meta) else {
-        return meta.clone();
+        return *meta;
     };
     let tag = keyword::intern(None, "tag");
     match m.m.get(&tag) {
         Some(t) if t.is_kind(Kind::Symbol) => {
             let mut out = m.m.clone();
-            out.insert(
-                tag,
-                list::from_slice(&[symbol::new(None, "quote"), t.clone()]),
-            );
+            out.insert(tag, list::from_slice(&[symbol::new(None, "quote"), *t]));
             map::new(out)
         }
-        _ => meta.clone(),
+        _ => *meta,
     }
 }
 

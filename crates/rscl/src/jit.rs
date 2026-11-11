@@ -62,11 +62,11 @@ impl Jit {
         rscl_runtime::entry::init();
         let flags = [
             ("opt_level", "none"),
-            // The default register allocator, not the single-pass one: without
-            // retain/release the IR is small enough that start-up is fast anyway,
-            // and the single-pass allocator spills every value that crosses a
-            // block boundary, which leaves dead references in frames for the
-            // collector's conservative stack scan to find.
+            // The default register allocator, not the single-pass one, which starts
+            // up 15% faster but leaves dead references where the conservative part
+            // of the stack scan finds them (in registers that natives then save in
+            // their frames): `(reduce + (range 3000000))` then keeps the whole
+            // sequence, 316 MB against 84 MB.
             ("use_colocated_libcalls", "false"),
             ("is_pic", "false"),
             ("preserve_frame_pointers", "true"),
@@ -94,12 +94,6 @@ impl Jit {
         };
         crate::boot::load_core(&mut jit).map_err(|e| format!("error loading core.clj: {e}"))?;
         Ok(jit)
-    }
-
-    /// Compile an analysed form into the JIT and run it.
-    pub fn compile_and_run(&mut self, node: &Node, an: &Analyzer) -> Result<Value, EvalError> {
-        let unit = self.compile(node, an)?;
-        Jit::run(unit)
     }
 
     /// Compile and finalise a unit, returning its entry points. Running them is a

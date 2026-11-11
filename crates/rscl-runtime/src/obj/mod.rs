@@ -162,23 +162,23 @@ pub(crate) unsafe fn cast<T>(v: &Value) -> &T {
 /// Metadata of a value that supports it (`nil` when none); `None` for other kinds.
 pub fn meta(v: &Value) -> Option<Value> {
     Some(match v.kind()? {
-        Kind::Symbol => symbol::get(v).meta.clone(),
-        Kind::List => list::get(v).meta.clone(),
-        Kind::Vector => vector::get(v).meta.clone(),
-        Kind::Map => map::get(v).meta.clone(),
-        Kind::Set => set::get(v).meta.clone(),
+        Kind::Symbol => symbol::get(v).meta,
+        Kind::List => list::get(v).meta,
+        Kind::Vector => vector::get(v).meta,
+        Kind::Map => map::get(v).meta,
+        Kind::Set => set::get(v).meta,
         Kind::Atom => atom::get(v).meta(),
         Kind::Var => var::get(v).meta(),
-        Kind::Fn => func::get(v).proto().meta.clone(),
-        Kind::Instance => types::inst(v).meta.clone(),
-        Kind::SortedMap => sorted::map_get(v).meta.clone(),
-        Kind::SortedSet => sorted::set_get(v).meta.clone(),
+        Kind::Fn => func::get(v).proto().meta,
+        Kind::Instance => types::inst(v).meta,
+        Kind::SortedMap => sorted::map_get(v).meta,
+        Kind::SortedSet => sorted::set_get(v).meta,
         _ => return None,
     })
 }
 
 /// Overwrite the metadata of a value that no one else references yet (the reader
-/// calls this on forms it just created). Takes ownership of `meta`.
+/// calls this on forms it just created).
 pub fn set_meta_unshared(v: &Value, meta_: Value) {
     unsafe {
         let p = v.ptr();

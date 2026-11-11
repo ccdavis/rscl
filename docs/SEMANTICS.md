@@ -154,8 +154,8 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   checked by `TypeId`. A map argument converted to `HashMap<String, V>` keeps a
   keyword's namespace in the key (`user/id`) and rejects two keys with the same
   name. `clear_exception` drops an error the library handles itself. An export
-  takes at most 63 parameters. The ABI is at version 5 (version 4 libraries, built
-  for reference counting, are rejected at load).
+  takes at most 63 parameters. A library built against another version of the ABI
+  (now 6) is rejected at load.
 - Native objects (`Native<T>`) print as `#object[type 0x...]`, compare by identity,
   and are dropped (running `T`'s destructor in the library) some time after they
   become unreachable, by the collector. They
@@ -250,7 +250,7 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   fns are always called through their var, so REPL redefinition works; `+ - * inc
   dec < <= > >= = == not= zero? pos? neg?` on two fixnums are inlined with a
   fallback to the fn.
-- A `fn` without captures is one immortal object shared by every evaluation of the
+- A `fn` without captures is one permanent object shared by every evaluation of the
   form (**divergence**: Clojure creates a new object per evaluation, so two
   evaluations are not `identical?` there; here they are). A bound, non-dynamic var is read without
   locking.
@@ -361,11 +361,7 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   (collect at every n-th safepoint), `RSCL_GC_VERIFY` (check every traced
   reference and stack-map slot, and after each collection that no survivor refers
   to an object that was not reached, which is what a missing write barrier would
-  cause), `RSCL_GC_CHAIN` (report the longest chain of
-  live objects and the root that holds it), `RSCL_GC_EXPLAIN` (report every root
-  that refers to a sequence cell), `RSCL_GC_CONSERVATIVE` (ignore the stack maps
-  and scan compiled frames conservatively) and `RSCL_GC_FULL` (make every
-  collection a full one), both for comparison.
+  cause).
 - The heap has a soft limit: `RSCL_MAX_HEAP_MB` (`0` for none), by default half of
   the physical memory or of the cgroup limit, whichever is smaller. The allocator
   keeps count of the bytes in use; the thread whose allocation crosses the limit

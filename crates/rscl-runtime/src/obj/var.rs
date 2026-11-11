@@ -32,10 +32,10 @@ pub struct VarObj {
 pub const OFF_FAST: i32 = 16;
 const _: () = assert!(std::mem::offset_of!(VarObj, fast) == OFF_FAST as usize);
 
-/// Create an immortal var with no root. Only `ns.rs` should call this.
+/// Create a permanent var with no root. Only `ns.rs` should call this.
 pub(crate) fn new(ns: &str, name: &str) -> *const VarObj {
     let p = super::alloc_raw(VarObj {
-        hdr: ObjHeader::immortal(Kind::Var),
+        hdr: ObjHeader::permanent(Kind::Var),
         fast: AtomicU64::new(crate::value::UNBOUND),
         ns: ns.into(),
         name: name.into(),
@@ -111,7 +111,7 @@ pub fn snapshot_bindings() -> Vec<(usize, Value)> {
         let mut flat: HashMap<usize, Value> = HashMap::new();
         for frame in b.borrow().iter() {
             for (k, v) in frame {
-                flat.insert(*k, v.clone());
+                flat.insert(*k, *v);
             }
         }
         flat.into_iter().collect()
@@ -165,7 +165,7 @@ impl VarObj {
         {
             return v;
         }
-        self.root.lock().unwrap().clone()
+        *self.root.lock().unwrap()
     }
     /// Bound by a root or (for a dynamic var) by a thread binding.
     pub fn is_bound(&self) -> bool {
@@ -209,7 +209,7 @@ impl VarObj {
         self.has_flag(FLAG_MACRO)
     }
     pub fn meta(&self) -> Value {
-        self.meta.lock().unwrap().clone()
+        *self.meta.lock().unwrap()
     }
     /// Replace the metadata. The `:dynamic`, `:private` and `:macro` flags follow it: a
     /// key that is absent or falsy clears the flag, so `(defn f ...)` after

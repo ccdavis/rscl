@@ -129,16 +129,6 @@ pub fn read_str(s: &str) -> ReadResult<Value> {
     }
 }
 
-/// Read every form in `s`.
-pub fn read_all(s: &str) -> ReadResult<Vec<Value>> {
-    let mut r = Reader::new(s, &DefaultEnv);
-    let mut out = Vec::new();
-    while let Some(v) = r.read()? {
-        out.push(v);
-    }
-    Ok(out)
-}
-
 fn is_ws(c: char) -> bool {
     c.is_whitespace() || c == ','
 }
@@ -248,9 +238,9 @@ impl<'a> Reader<'a> {
     }
 
     fn stamp(&self, v: Value, at: SrcPos) -> Value {
-        // Interned keywords (and other immortal objects) are shared: never write
+        // Interned keywords (and other permanent objects) are shared: never write
         // into their headers.
-        if self.record_pos && v.header().is_some_and(|h| !h.is_immortal()) {
+        if self.record_pos && v.header().is_some_and(|h| !h.is_permanent()) {
             pos::set_pos(&v, pos::add(at));
         }
         v
@@ -404,7 +394,7 @@ impl<'a> Reader<'a> {
                     self.syntax(format!("Duplicate key: {}", crate::printer::pr_str(&kv[0])))
                 );
             }
-            m.insert(kv[0].clone(), kv[1].clone());
+            m.insert(kv[0], kv[1]);
         }
         // The source order of the entries, for the compiler and syntax-quote.
         let keys: Vec<Value> = items.iter().step_by(2).cloned().collect();
@@ -571,7 +561,7 @@ impl<'a> Reader<'a> {
                     Some(existing) if !existing.is_nil() => {
                         let mut m = map::get(&existing).m.clone();
                         for (k, v) in map::get(&meta).m.iter() {
-                            m.insert(k.clone(), v.clone());
+                            m.insert(*k, *v);
                         }
                         map::new(m)
                     }
@@ -599,7 +589,7 @@ impl<'a> Reader<'a> {
                             self.syntax(format!("Duplicate key: {}", crate::printer::pr_str(x)))
                         );
                     }
-                    s.insert(x.clone());
+                    s.insert(*x);
                 }
                 Ok(set::new_ordered(s, items))
             }
@@ -639,7 +629,7 @@ impl<'a> Reader<'a> {
                 }
                 if let Some(rest) = env.get(&-1) {
                     params.push(symbol::new(None, "&"));
-                    params.push(rest.clone());
+                    params.push(*rest);
                 }
                 Ok(list::from_slice(&[
                     symbol::new(None, "fn*"),
@@ -693,7 +683,7 @@ impl<'a> Reader<'a> {
         }
         let env = self.arg_env.as_mut().unwrap();
         if let Some(s) = env.get(&idx) {
-            return Ok(s.clone());
+            return Ok(*s);
         }
         let name = if idx == -1 {
             "rest".to_string()
@@ -704,7 +694,7 @@ impl<'a> Reader<'a> {
             None,
             &format!("{name}__{}#", crate::core::lazy::next_gensym()),
         );
-        env.insert(idx, s.clone());
+        env.insert(idx, s);
         Ok(s)
     }
 
@@ -741,13 +731,13 @@ impl<'a> Reader<'a> {
         let base = &name[..name.len() - 1];
         let table = self.gensyms.last_mut().expect("inside syntax-quote");
         if let Some(s) = table.get(name) {
-            return s.clone();
+            return *s;
         }
         let s = symbol::new(
             None,
             &format!("{base}__{}__auto__", crate::core::lazy::next_gensym()),
         );
-        table.insert(name.to_string(), s.clone());
+        table.insert(name.to_string(), s);
         s
     }
 
@@ -759,7 +749,7 @@ impl<'a> Reader<'a> {
             Some(Kind::Symbol) => {
                 let s = symbol::get(form);
                 let resolved = if s.ns().is_some() || is_special(s.name()) {
-                    form.clone()
+                    *form
                 } else if s.name().ends_with('#') && s.name().len() > 1 {
                     self.gensym_for(s.name())
                 } else {
@@ -814,9 +804,9 @@ impl<'a> Reader<'a> {
                 ]))
             }
             None | Some(Kind::Keyword | Kind::String | Kind::Long | Kind::Double | Kind::Regex) => {
-                Ok(form.clone())
+                Ok(*form)
             }
-            _ => Ok(quote(form.clone())),
+            _ => Ok(quote(*form)),
         }
     }
 
@@ -1026,7 +1016,7 @@ mod tests {
         assert_eq!(forms.len(), 2);
         let p = pos::pos_of(&forms[1]).unwrap();
         assert_eq!((p.line, p.col), (2, 3));
-        let a = list::get(&forms[0]).iter().next().unwrap().clone();
+        let a = *list::get(&forms[0]).iter().next().unwrap();
         assert_eq!(pos::pos_of(&a).map(|p| (p.line, p.col)), Some((1, 2)));
     }
 

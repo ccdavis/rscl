@@ -183,9 +183,9 @@ impl PendingObj {
 
     fn finished(&self, st: std::sync::MutexGuard<'_, State>) -> RtResult<Option<Value>> {
         match &*st {
-            State::Done(v) => Ok(Some(v.clone())),
+            State::Done(v) => Ok(Some(*v)),
             State::Failed(e) => {
-                let e = e.clone();
+                let e = *e;
                 drop(st);
                 Err(exc::throw(e))
             }
@@ -240,8 +240,8 @@ impl PendingObj {
         let mut slot =
             crate::native::blocking(|| self.thunk.lock().unwrap_or_else(|e| e.into_inner()));
         match &*self.lock() {
-            State::Done(v) => return Ok(v.clone()),
-            State::Failed(e) => return Err(exc::throw(e.clone())),
+            State::Done(v) => return Ok(*v),
+            State::Failed(e) => return Err(exc::throw(*e)),
             _ => {}
         }
         let Some(thunk) = slot.take() else {
@@ -252,13 +252,13 @@ impl PendingObj {
         self.forcing.store(0, Ordering::Release);
         match r {
             Ok(v) => {
-                *self.lock() = State::Done(v.clone());
+                *self.lock() = State::Done(v);
                 crate::gc::write_barrier(self);
                 Ok(v)
             }
             Err(Exc) => {
                 let e = exc::take().unwrap_or(Value::NIL);
-                *self.lock() = State::Failed(e.clone());
+                *self.lock() = State::Failed(e);
                 crate::gc::write_barrier(self);
                 Err(exc::throw(e))
             }

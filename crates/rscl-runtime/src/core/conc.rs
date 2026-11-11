@@ -67,12 +67,12 @@ pub fn future_call(f: Value) -> RtResult<Value> {
     let fut = pending::new(Flavor::Future, None);
     // The closure lives on the Rust heap until the thread runs: what it refers to
     // is pinned until then (and, harmlessly, for the thread's whole life).
-    let pins: Vec<crate::gc::Pinned> = [f.clone(), fut.clone()]
+    let pins: Vec<crate::gc::Pinned> = [f, fut]
         .into_iter()
         .chain(var::snapshot_bindings().into_iter().map(|(_, v)| v))
         .map(crate::gc::Pinned::new)
         .collect();
-    let fut2 = fut.clone();
+    let fut2 = fut;
     let bindings = var::snapshot_bindings();
     let spawned = std::thread::Builder::new()
         .name("rscl-future".into())
@@ -86,7 +86,7 @@ pub fn future_call(f: Value) -> RtResult<Value> {
             let _guard = WorkerGuard {
                 bindings: var::install_bindings(bindings),
             };
-            crate::native::set_current_future(Some(fut2.clone()));
+            crate::native::set_current_future(Some(fut2));
             let p = pending::get(&fut2);
             if !p.cancel.load(std::sync::atomic::Ordering::Acquire) {
                 match f.call(&[]) {
@@ -259,7 +259,7 @@ builtins! {
         if func::as_fn(&args[0]).is_none() {
             return err(ILLEGAL_ARGUMENT, "future-call requires a fn");
         }
-        future_call(args[0].owned())
+        future_call(args[0])
     }
     "future?" => fn cc_future_p(args) [1] {
         Ok(Value::bool(pending::as_pending(&args[0]).is_some_and(|p| p.flavor == Flavor::Future)))
@@ -273,13 +273,13 @@ builtins! {
         if p.flavor != Flavor::Promise {
             return err(ILLEGAL_ARGUMENT, "deliver requires a promise");
         }
-        Ok(if p.deliver(args[1].owned()) { args[0].owned() } else { Value::NIL })
+        Ok(if p.deliver(args[1]) { args[0] } else { Value::NIL })
     }
     "delay*" => fn cc_delay_star(args) [1] {
         if func::as_fn(&args[0]).is_none() {
             return err(ILLEGAL_ARGUMENT, "delay requires a fn");
         }
-        Ok(pending::new(Flavor::Delay, Some(args[0].owned())))
+        Ok(pending::new(Flavor::Delay, Some(args[0])))
     }
     "delay?" => fn cc_delay_p(args) [1] {
         Ok(Value::bool(pending::as_pending(&args[0]).is_some_and(|p| p.flavor == Flavor::Delay)))
@@ -287,7 +287,7 @@ builtins! {
     "force" => @gc fn cc_force(args) [1] {
         match pending::as_pending(&args[0]) {
             Some(p) if p.flavor == Flavor::Delay => Ok(p.deref(None)?.unwrap_or(Value::NIL)),
-            _ => Ok(args[0].owned()),
+            _ => Ok(args[0]),
         }
     }
     "lock*" => @gc fn cc_lock(args) [1] {

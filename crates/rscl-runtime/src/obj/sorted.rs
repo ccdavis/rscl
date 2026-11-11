@@ -137,25 +137,25 @@ fn lookup_check(existing: Option<&Value>, k: &Value) -> RtResult<()> {
 
 pub fn map_lookup<'a>(m: &'a OMap, k: &Value) -> RtResult<Option<&'a Value>> {
     lookup_check(witness(m.keys()), k)?;
-    Ok(m.get(&Key(k.clone())))
+    Ok(m.get(&Key(*k)))
 }
 
 pub fn set_contains(s: &OSet, k: &Value) -> RtResult<bool> {
     lookup_check(witness(s.iter()), k)?;
-    Ok(s.contains(&Key(k.clone())))
+    Ok(s.contains(&Key(*k)))
 }
 
 pub fn map_remove(m: &OMap, k: &Value) -> RtResult<OMap> {
     lookup_check(witness(m.keys()), k)?;
     let mut n = m.clone();
-    n.remove(&Key(k.clone()));
+    n.remove(&Key(*k));
     Ok(n)
 }
 
 pub fn set_remove(s: &OSet, k: &Value) -> RtResult<OSet> {
     lookup_check(witness(s.iter()), k)?;
     let mut n = s.clone();
-    n.remove(&Key(k.clone()));
+    n.remove(&Key(*k));
     Ok(n)
 }
 

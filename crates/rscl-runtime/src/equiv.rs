@@ -100,15 +100,11 @@ fn map_equiv(a: &Value, b: &Value) -> bool {
 
 fn map_entries(v: &Value) -> Vec<(Value, Value)> {
     match v.kind() {
-        Some(Kind::Map) => obj::map::get(v)
-            .m
-            .iter()
-            .map(|(k, x)| (k.clone(), x.clone()))
-            .collect(),
+        Some(Kind::Map) => obj::map::get(v).m.iter().map(|(k, x)| (*k, *x)).collect(),
         Some(Kind::SortedMap) => obj::sorted::map_get(v)
             .m
             .iter()
-            .map(|(k, x)| (k.0.clone(), x.clone()))
+            .map(|(k, x)| (k.0, *x))
             .collect(),
         _ => Vec::new(),
     }
@@ -130,11 +126,7 @@ fn set_equiv(a: &Value, b: &Value) -> bool {
 fn set_items(v: &Value) -> Vec<Value> {
     match v.kind() {
         Some(Kind::Set) => obj::set::get(v).s.iter().cloned().collect(),
-        Some(Kind::SortedSet) => obj::sorted::set_get(v)
-            .s
-            .iter()
-            .map(|k| k.0.clone())
-            .collect(),
+        Some(Kind::SortedSet) => obj::sorted::set_get(v).s.iter().map(|k| k.0).collect(),
         _ => Vec::new(),
     }
 }

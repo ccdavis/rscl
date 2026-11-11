@@ -9,14 +9,14 @@ use crate::jit::EvalError;
 
 /// Expand macros at the head of a top-level form until it is not a macro call.
 pub fn macroexpand(form: &Value) -> Result<Value, EvalError> {
-    let mut cur = form.clone();
+    let mut cur = *form;
     loop {
         match rscl_runtime::core::lazy::macroexpand_1(&cur) {
             Ok(next) => {
                 if next.identical(&cur) {
                     return Ok(cur);
                 }
-                if pos::pos_id(&next) == 0 && next.header().is_some_and(|h| !h.is_immortal()) {
+                if pos::pos_id(&next) == 0 && next.header().is_some_and(|h| !h.is_permanent()) {
                     pos::set_pos(&next, pos::pos_id(form));
                 }
                 cur = next;

@@ -55,7 +55,7 @@ pub fn stored(s: &Set_, k: &Value) -> Option<Value> {
     ) {
         return s.iter().find(|x| crate::equiv::equiv(x, k)).cloned();
     }
-    Some(k.clone())
+    Some(*k)
 }
 
 pub fn empty_set() -> Set_ {
@@ -65,7 +65,7 @@ pub fn empty_set() -> Set_ {
 pub fn from_slice(items: &[Value]) -> Value {
     let mut s = empty_set();
     for x in items {
-        s.insert(x.clone());
+        s.insert(*x);
     }
     new(s)
 }
@@ -73,12 +73,4 @@ pub fn from_slice(items: &[Value]) -> Value {
 pub fn get(v: &Value) -> &SetObj {
     debug_assert!(v.is_kind(Kind::Set));
     unsafe { cast::<SetObj>(v) }
-}
-
-pub fn as_set(v: &Value) -> Option<&SetObj> {
-    if v.is_kind(Kind::Set) {
-        Some(get(v))
-    } else {
-        None
-    }
 }

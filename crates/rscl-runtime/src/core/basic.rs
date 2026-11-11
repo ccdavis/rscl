@@ -3,9 +3,9 @@ use std::io::Write;
 
 use crate::builtins;
 use crate::obj::{self, Kind, string};
-use crate::value::{VRef, Value};
+use crate::value::Value;
 
-fn join_args(args: &[VRef], readably: bool, sep: &str) -> String {
+fn join_args(args: &[Value], readably: bool, sep: &str) -> String {
     let mut out = String::new();
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
@@ -39,7 +39,7 @@ builtins! {
     "identical?" => fn cf_identical_p(args) [2] { Ok(Value::bool(args[0].identical(&args[1]))) }
     "not" => fn cf_not(args) [1] { Ok(Value::bool(!args[0].truthy())) }
     "boolean" => fn cf_boolean(args) [1] { Ok(Value::bool(args[0].truthy())) }
-    "identity" => fn cf_identity(args) [1] { Ok(args[0].owned()) }
+    "identity" => fn cf_identity(args) [1] { Ok(args[0]) }
     "nil?" => fn cf_nil_p(args) [1] { Ok(Value::bool(args[0].is_nil())) }
     "some?" => fn cf_some_p(args) [1] { Ok(Value::bool(!args[0].is_nil())) }
     "true?" => fn cf_true_p(args) [1] { Ok(Value::bool(args[0].is_true())) }
@@ -74,7 +74,7 @@ builtins! {
     "name" => fn cf_name(args) [1] {
         let v = &args[0];
         match v.kind() {
-            Some(Kind::String) => Ok(v.owned()),
+            Some(Kind::String) => Ok(*v),
             Some(Kind::Symbol) => Ok(string::new(obj::symbol::get(v).name())),
             Some(Kind::Keyword) => Ok(string::new(obj::keyword::get(v).name())),
             _ => crate::exc::err(obj::exception::CLASS_CAST, format!("{} cannot be cast to Named", crate::core::type_name(v))),
@@ -97,7 +97,7 @@ builtins! {
         }
         let v = &args[0];
         match v.kind() {
-            Some(Kind::Keyword) => Ok(v.owned()),
+            Some(Kind::Keyword) => Ok(*v),
             Some(Kind::String) => Ok(obj::keyword::parse(string::get(v))),
             Some(Kind::Symbol) => { let s = obj::symbol::get(v); Ok(obj::keyword::intern(s.ns(), s.name())) }
             _ => Ok(Value::NIL),
@@ -111,7 +111,7 @@ builtins! {
         }
         let v = &args[0];
         match v.kind() {
-            Some(Kind::Symbol) => Ok(v.owned()),
+            Some(Kind::Symbol) => Ok(*v),
             Some(Kind::String) => Ok(obj::symbol::parse(string::get(v))),
             Some(Kind::Keyword) => { let k = obj::keyword::get(v); Ok(obj::symbol::new(k.ns(), k.name())) }
             _ => crate::exc::err(obj::exception::ILLEGAL_ARGUMENT, format!("no conversion to symbol from {}", crate::core::type_name(v))),
@@ -122,16 +122,16 @@ builtins! {
         if !args[1].is_kind(Kind::Map) {
             return crate::exc::err(obj::exception::ILLEGAL_ARGUMENT, "ex-info data must be a map");
         }
-        let cause = if args.len() == 3 { args[2].owned() } else { Value::NIL };
-        Ok(obj::exception::new(obj::exception::EXCEPTION_INFO, Some(msg), args[1].owned(), cause))
+        let cause = if args.len() == 3 { args[2] } else { Value::NIL };
+        Ok(obj::exception::new(obj::exception::EXCEPTION_INFO, Some(msg), args[1], cause))
     }
     "ex-message" => fn cf_ex_message(args) [1] {
-        Ok(obj::exception::as_exc(&args[0]).map_or(Value::NIL, |e| e.message.clone()))
+        Ok(obj::exception::as_exc(&args[0]).map_or(Value::NIL, |e| e.message))
     }
     "ex-data" => fn cf_ex_data(args) [1] {
-        Ok(obj::exception::as_exc(&args[0]).map_or(Value::NIL, |e| e.data.clone()))
+        Ok(obj::exception::as_exc(&args[0]).map_or(Value::NIL, |e| e.data))
     }
     "ex-cause" => fn cf_ex_cause(args) [1] {
-        Ok(obj::exception::as_exc(&args[0]).map_or(Value::NIL, |e| e.cause.clone()))
+        Ok(obj::exception::as_exc(&args[0]).map_or(Value::NIL, |e| e.cause))
     }
 }

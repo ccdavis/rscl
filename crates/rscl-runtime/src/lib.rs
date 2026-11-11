@@ -1,12 +1,13 @@
 //! rscl runtime: values, objects, reader, printer, namespaces and core builtins.
 //! No Cranelift dependency: this crate is also linked into AOT-built executables.
 //!
-//! Ownership conventions at the FFI boundary: arguments are borrowed (`VRef`) unless
-//! documented as consumed (`Value`); results are owned (+1). An `EXC` result means an
-//! exception is pending in the thread-local slot (see `exc`).
+//! Values are plain words kept alive by the tracing collector (see `gc`). At the FFI
+//! boundary an `EXC` result means an exception is pending in the thread-local slot
+//! (see `exc`).
 
-// Every `pub unsafe extern "C" fn` is an FFI entry point whose contract is the
-// ownership convention above; per-function `# Safety` sections would only repeat it.
+// Every `pub unsafe extern "C" fn` is an FFI entry point called by generated code
+// with arguments the compiler produced; per-function `# Safety` sections would
+// only repeat that.
 #![allow(clippy::missing_safety_doc)]
 
 pub mod api;
@@ -35,7 +36,7 @@ pub const CORE_CLJ: &str = include_str!("../core/core.clj");
 
 pub use exc::{Exc, RtResult};
 pub use obj::Kind;
-pub use value::{VRef, Value, live_objects};
+pub use value::Value;
 
 /// Allocation-heavy workloads (persistent collections, lazy seqs) spend a quarter of
 /// their time in malloc; mimalloc roughly halves that. The staticlib carries it into

@@ -54,7 +54,6 @@ runtime_fns! {
     InternVar     = "rt_intern_var"     => crate::ns::rt_intern_var : (I64, I64, I64, I64) -> I64;
     VarRoot       = "rt_var_root"       => crate::ns::rt_var_root : (I64) -> I64;
     VarBindRoot   = "rt_var_bind_root"  => crate::ns::rt_var_bind_root : (I64, I64) -> I64;
-    VarSetFlag    = "rt_var_set_flag"   => crate::ns::rt_var_set_flag : (I64, I64, I64);
     VarSet        = "rt_var_set"        => crate::ns::rt_var_set : (I64, I64) -> I64;
     VarSetMeta    = "rt_var_set_meta"   => crate::ns::rt_var_set_meta : (I64, I64);
     BoxDouble     = "rt_box_double"     => crate::ffi::rt_box_double : (F64) -> I64;
@@ -70,14 +69,12 @@ runtime_fns! {
     FnNew         = "rt_fn_new"         => crate::ffi::rt_fn_new : (I64, I64) -> I64;
     FnSetCapture  = "rt_fn_set_capture" => crate::ffi::rt_fn_set_capture : (I64, I64, I64);
     ThrowArity    = "rt_throw_arity"    => crate::ffi::rt_throw_arity : (I64, I64) -> I64;
-    Invoke        = "rt_invoke"         => crate::ffi::rt_invoke : (I64, I64, I64, I64) -> I64;
-    ListFromSlice = "rt_list_from_slice" => crate::ffi::rt_list_from_slice : (I64, I64, I64) -> I64;
-    VectorFromSlice = "rt_vector_from_slice" => crate::ffi::rt_vector_from_slice : (I64, I64, I64) -> I64;
-    MapFromSlice  = "rt_map_from_slice" => crate::ffi::rt_map_from_slice : (I64, I64, I64) -> I64;
-    SetFromSlice  = "rt_set_from_slice" => crate::ffi::rt_set_from_slice : (I64, I64, I64) -> I64;
-    MakeImmortal  = "rt_make_immortal"  => crate::ffi::rt_make_immortal : (I64);
-    PrStr         = "rt_pr_str"         => crate::ffi::rt_pr_str : (I64) -> I64;
-    Prn           = "rt_prn"            => crate::ffi::rt_prn : (I64);
+    Invoke        = "rt_invoke"         => crate::ffi::rt_invoke : (I64, I64, I64) -> I64;
+    ListFromSlice = "rt_list_from_slice" => crate::ffi::rt_list_from_slice : (I64, I64) -> I64;
+    VectorFromSlice = "rt_vector_from_slice" => crate::ffi::rt_vector_from_slice : (I64, I64) -> I64;
+    MapFromSlice  = "rt_map_from_slice" => crate::ffi::rt_map_from_slice : (I64, I64) -> I64;
+    SetFromSlice  = "rt_set_from_slice" => crate::ffi::rt_set_from_slice : (I64, I64) -> I64;
+    MakeConstant  = "rt_make_constant"  => crate::ffi::rt_make_constant : (I64);
     ReportUncaught = "rt_report_uncaught" => crate::ffi::rt_report_uncaught : () -> I32;
     RunMain       = "rt_run_main"       => crate::ffi::rt_run_main : (I64) -> I32;
     StackCheck    = "rt_stack_check"    => crate::native::rt_stack_check : (I64) -> I64;
@@ -93,9 +90,7 @@ runtime_fns! {
     CurrentNs     = "rt_current_ns"     => crate::ns::rt_current_ns : () -> I64;
     RegisterCode  = "rt_register_code"  => crate::trace::rt_register_code : (I64, I64, I64, I64, I64, I64, I64);
     RegisterFrames = "rt_register_frames" => crate::trace::rt_register_frames : (I64, I64, I64, I64, I64);
-    RuntimeInit   = "rt_runtime_init"   => crate::entry::rt_runtime_init : (I32, I64);
     Main          = "rt_main"           => crate::entry::rt_main : (I32, I64, I64) -> I32;
-    Shutdown      = "rt_shutdown"       => crate::entry::rt_shutdown : ();
 }
 
 /// Immediate encodings the compiler needs (kept here so there is one source of truth).
@@ -105,7 +100,6 @@ pub mod consts {
     pub const OFF_KIND: i32 = 8;
     pub const OFF_VAR_FAST: i32 = crate::obj::var::OFF_FAST;
     pub const OFF_PROTO: i32 = crate::obj::func::OFF_PROTO;
-    pub const OFF_NCAPTURES: i32 = crate::obj::func::OFF_NCAPTURES;
     pub const OFF_CAPTURES: i32 = crate::obj::func::OFF_CAPTURES;
     pub const PROTO_OFF_ENTRY: i32 = crate::obj::func::PROTO_OFF_ENTRY;
 }

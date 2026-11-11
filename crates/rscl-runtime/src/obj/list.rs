@@ -23,7 +23,7 @@ pub fn empty() -> Value {
     })
 }
 
-/// Prepend `x` to `tail` (a list or `nil`, treated as empty). Takes ownership of both.
+/// Prepend `x` to `tail` (a list or `nil`, treated as empty).
 pub fn cons(x: Value, tail: Value) -> Value {
     let count = if tail.is_kind(Kind::List) {
         get(&tail).count
@@ -40,11 +40,11 @@ pub fn cons(x: Value, tail: Value) -> Value {
     })
 }
 
-/// Build a list from borrowed elements.
+/// Build a list of the elements of a slice.
 pub fn from_slice(items: &[Value]) -> Value {
     let mut l = empty();
     for x in items.iter().rev() {
-        l = cons(x.clone(), l);
+        l = cons(*x, l);
     }
     l
 }
@@ -82,13 +82,9 @@ impl ListObj {
             cur: if self.count == 0 { None } else { Some(self) },
         }
     }
-    /// The tail as an owned list value (the empty list for a one-element list).
+    /// The tail as a list value (the empty list for a one-element list).
     pub fn rest(&self) -> Value {
-        if self.count <= 1 {
-            empty()
-        } else {
-            self.rest.clone()
-        }
+        if self.count <= 1 { empty() } else { self.rest }
     }
     pub fn to_vec(&self) -> Vec<Value> {
         self.iter().cloned().collect()

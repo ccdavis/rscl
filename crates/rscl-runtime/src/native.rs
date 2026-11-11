@@ -222,7 +222,7 @@ thread_local! {
     static BLOCKED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// A small per-thread id (lazy seq ownership, locks, delays).
+/// A small per-thread id (which thread is realising a lazy seq, locks, delays).
 pub fn thread_id() -> u64 {
     THREAD_ID.with(|t| {
         if t.get() == 0 {
@@ -463,7 +463,7 @@ pub unsafe extern "C" fn rt_throw_unresolved_native(name: *const u8, len: i64) -
 
 /// Write the integer value of `v` to `out`; returns `nil` or `EXC`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_to_long(v: crate::value::VRef, out: *mut i64) -> Value {
+pub unsafe extern "C" fn rt_to_long(v: crate::value::Value, out: *mut i64) -> Value {
     match v.int_value() {
         Some(n) => {
             unsafe { *out = n };
@@ -489,7 +489,7 @@ pub unsafe extern "C" fn rt_to_long(v: crate::value::VRef, out: *mut i64) -> Val
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_to_double(v: crate::value::VRef, out: *mut f64) -> Value {
+pub unsafe extern "C" fn rt_to_double(v: crate::value::Value, out: *mut f64) -> Value {
     match crate::num::num(&v) {
         Some(n) => {
             unsafe { *out = crate::num::f(&n) };
@@ -510,7 +510,7 @@ pub unsafe extern "C" fn rt_to_double(v: crate::value::VRef, out: *mut f64) -> V
 
 /// Write a NUL-terminated pointer (valid while the string value lives); `nil` → null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_to_cstr(v: crate::value::VRef, out: *mut *const c_char) -> Value {
+pub unsafe extern "C" fn rt_to_cstr(v: crate::value::Value, out: *mut *const c_char) -> Value {
     if v.is_nil() {
         unsafe { *out = std::ptr::null() };
         return Value::NIL;
@@ -545,7 +545,7 @@ pub unsafe extern "C" fn rt_string_from_cstr(p: *const c_char) -> Value {
 /// `catch` matching: does `e` belong to `class`?
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_exception_instance(
-    e: crate::value::VRef,
+    e: crate::value::Value,
     class: *const u8,
     len: i64,
 ) -> i64 {

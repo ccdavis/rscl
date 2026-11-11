@@ -13,7 +13,6 @@
 //!   `trace::FrameInfo`). The collector finds the compiled frames on a stack by
 //!   walking the frame-pointer chain and marks exactly the slots the map of each
 //!   frame's current call lists; a value that is dead at that call is not a root.
-//!   (x86-64; elsewhere compiled frames are scanned like native ones.)
 //! * **Native frames and registers**, scanned *conservatively*: any word that is
 //!   the address of an object (or, for some kinds, points inside one) keeps that
 //!   object alive. So Rust code needs no handles: a `Value` in a local is safe.
@@ -22,11 +21,12 @@
 //!   address range, thread-local storage is not scanned, the dead part of the
 //!   stack is zeroed before long-lived frames and at collections, and a collection
 //!   prefers a safepoint without short-lived native frames above it).
-//! * **Argument lists** of calls in progress. A compiled caller's argument slots
-//!   are not in its stack maps, so the callee keeps its arguments reachable: a
-//!   compiled fn loads them into its own variables before its first safepoint, a
-//!   native under which a collection may run roots the list ([`ArgRoot`]), and
-//!   [`crate::ffi::invoke`] roots the slice a native passes.
+//! * **Argument lists** of calls in progress. A call's argument slots belong to
+//!   the callee (see `func::Entry`) and are in no stack map, so the callee keeps
+//!   its arguments reachable: a compiled fn loads them into its own variables
+//!   before its first safepoint, a native under which a collection may run roots
+//!   the list ([`ArgRoot`]), and [`crate::ffi::invoke`] roots the slice a native
+//!   passes.
 //! * **Permanent objects**: vars (and through them every root value), namespaces,
 //!   types, protocols, compiled constants, fn prototypes' metadata.
 //! * **Thread-local runtime state**: the pending exception, `binding` frames, the
@@ -103,8 +103,6 @@ struct Heap {
     remembered: Vec<usize>,
     /// Fn prototypes (not objects; their metadata is a root).
     protos: Vec<usize>,
-    /// Constant tables of compiled units: (address, words).
-    ranges: Vec<(usize, usize)>,
     /// Pinned values and how many pins each has.
     pins: HashMap<u64, usize>,
 }
@@ -117,7 +115,6 @@ fn heap() -> MutexGuard<'static, Heap> {
             new_permanent: Vec::new(),
             remembered: Vec::new(),
             protos: Vec::new(),
-            ranges: Vec::new(),
             pins: HashMap::new(),
         })
     })
@@ -223,14 +220,6 @@ fn remember(h: &ObjHeader) {
     }
 }
 
-/// Register a table of values as roots (a compiled unit's constant table). The
-/// memory must stay valid for the rest of the process.
-pub fn add_root_range(addr: *const u64, words: usize) {
-    if words > 0 {
-        heap().ranges.push((addr as usize, words));
-    }
-}
-
 /// Keep `v` alive until a matching `unpin`.
 pub fn pin(v: &Value) {
     if v.is_ptr() {
@@ -262,7 +251,7 @@ impl Pinned {
         Pinned(v)
     }
     pub fn get(&self) -> Value {
-        self.0.clone()
+        self.0
     }
 }
 
@@ -384,11 +373,6 @@ pub fn enter_compiled<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// Number of objects the collector knows about.
-pub fn object_count() -> usize {
-    crate::arena::object_count()
-}
-
 // ---- deferring collections -------------------------------------------------------------
 
 /// While this guard exists, the calling thread neither collects nor stops for a
@@ -484,14 +468,6 @@ struct Config {
     debug: bool,
     /// Check every traced reference against the registry.
     verify: bool,
-    /// Report the stack slots that refer to sequence cells.
-    explain: bool,
-    /// Scan compiled frames conservatively too (for comparison and debugging).
-    conservative: bool,
-    /// Report the longest chain of reachable objects and what roots it.
-    chain: bool,
-    /// Make every collection a full one (no generations; for comparison).
-    always_full: bool,
 }
 
 fn config() -> &'static Config {
@@ -506,10 +482,6 @@ fn config() -> &'static Config {
             stress: num("RSCL_GC_STRESS").unwrap_or(0),
             debug: std::env::var_os("RSCL_GC_DEBUG").is_some(),
             verify: std::env::var_os("RSCL_GC_VERIFY").is_some(),
-            explain: std::env::var_os("RSCL_GC_EXPLAIN").is_some(),
-            conservative: std::env::var_os("RSCL_GC_CONSERVATIVE").is_some(),
-            chain: std::env::var_os("RSCL_GC_CHAIN").is_some(),
-            always_full: std::env::var_os("RSCL_GC_FULL").is_some(),
         }
     })
 }
@@ -538,10 +510,10 @@ pub(crate) fn stress_tick() -> bool {
 // ---- stopping the world ------------------------------------------------------------------
 
 /// Callee-saved registers captured when a thread stops.
-#[cfg(target_arch = "x86_64")]
 const NREGS: usize = 6;
-#[cfg(target_arch = "aarch64")]
-const NREGS: usize = 12;
+
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("the collector reads stacks and registers on x86-64 only");
 
 /// Where a stopped thread's live state is: its stack from `sp` up, and the
 /// callee-saved registers it had when it stopped.
@@ -551,7 +523,6 @@ struct Frame {
     regs: [usize; NREGS],
 }
 
-#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn capture() -> Frame {
     let mut regs = [0usize; NREGS];
@@ -572,31 +543,6 @@ fn capture() -> Frame {
     }
     Frame { sp, regs }
 }
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn capture() -> Frame {
-    let mut regs = [0usize; NREGS];
-    let sp: usize;
-    unsafe {
-        std::arch::asm!(
-            "stp x19, x20, [{b}]",
-            "stp x21, x22, [{b}, #16]",
-            "stp x23, x24, [{b}, #32]",
-            "stp x25, x26, [{b}, #48]",
-            "stp x27, x28, [{b}, #64]",
-            "str x29, [{b}, #80]",
-            "mov {sp}, sp",
-            b = in(reg) regs.as_mut_ptr(),
-            sp = out(reg) sp,
-            options(nostack, preserves_flags),
-        );
-    }
-    Frame { sp, regs }
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-compile_error!("the collector's stack scan supports x86-64 and aarch64 only");
 
 /// Run `f` with the calling thread's stack pointer and callee-saved registers
 /// recorded. The frame of this function stays on the stack while `f` runs, so every
@@ -624,13 +570,11 @@ pub fn clear_dead_stack() {
     // The sweep cannot clear its own frame, which is exactly where the caller's
     // next callee will put its frame: that strip is zeroed by a function without a
     // frame of its own.
-    #[cfg(target_arch = "x86_64")]
     rscl_zero_below_sp();
 }
 
 /// Zero the kilobyte below the caller's stack pointer (all but the return address
 /// of this call). No frame, registers only, so nothing it uses lies in the range.
-#[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 extern "C" fn rscl_zero_below_sp() {
@@ -1260,15 +1204,10 @@ pub(crate) struct Marker {
     track: bool,
     young_child: bool,
     keep: Vec<usize>,
-    /// Diagnostics: the stack slot being scanned, and for each object reached
-    /// straight from a root, the slot it was found in.
-    root_at: usize,
-    root_slots: HashMap<usize, usize>,
     /// Compiled frames read through their stack maps, and the slots they listed.
     frames: usize,
     slots: usize,
-    /// `RSCL_GC_EXPLAIN`: who first reached each object (0: a root).
-    parents: Option<HashMap<usize, usize>>,
+    /// The object being traced (named when verification fails).
     current: usize,
 }
 
@@ -1283,12 +1222,6 @@ impl Marker {
     fn object(&mut self, addr: usize) {
         if crate::arena::mark(addr, !self.full) {
             self.stack.push(addr);
-            if let Some(p) = &mut self.parents {
-                p.insert(addr, self.current);
-                if self.current <= 16 {
-                    self.root_slots.insert(addr, self.root_at);
-                }
-            }
         }
     }
 
@@ -1395,25 +1328,14 @@ impl Marker {
 /// Scan `[from, to)` word by word. The memory may hold anything (dead stack slots
 /// included), which is why this function has a name tools can suppress on.
 #[inline(never)]
-fn scan_conservative(m: &mut Marker, from: usize, to: usize, base: usize) {
+fn scan_conservative(m: &mut Marker, from: usize, to: usize) {
     let mut p = (from + 7) & !7;
-    let explain = config().explain;
     while p + 8 <= to {
         let w = unsafe { std::ptr::read_volatile(p as *const usize) };
-        if explain {
-            explain_root(m, p, w, base);
-        }
-        m.root_at = p;
         m.stack_word(w);
         p += 8;
     }
 }
-
-/// Whether compiled frames are read through their stack maps on this target. Where
-/// they are not, they are scanned conservatively like Rust frames (which is always
-/// safe, only less exact), and generated code clears argument slots it has taken
-/// over.
-pub const PRECISE_FRAMES: bool = cfg!(target_arch = "x86_64");
 
 /// A compiled function's frame on a stack: `[lo, hi)` is its memory below its
 /// frame record, `slots` the addresses of the references live at its current call.
@@ -1431,12 +1353,8 @@ struct CompiledFrame {
 /// Anything the walk cannot identify is simply left to the conservative scan. Rust
 /// code keeps frame pointers too (the workspace forces them), so the chain runs
 /// through runtime frames; it ends at the first record that does not look like one.
-#[cfg(target_arch = "x86_64")]
 fn compiled_frames(frame: &Frame, base: usize) -> Vec<CompiledFrame> {
     let mut out = Vec::new();
-    if config().conservative {
-        return out;
-    }
     let code = crate::trace::code_table();
     let mut fp = frame.regs[1];
     let mut prev = 0usize;
@@ -1481,34 +1399,16 @@ fn compiled_frames(frame: &Frame, base: usize) -> Vec<CompiledFrame> {
     out
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn compiled_frames(_frame: &Frame, _base: usize) -> Vec<CompiledFrame> {
-    Vec::new()
-}
-
 /// Scan one thread's stack from its published stack pointer up to `base`:
 /// compiled frames through their stack maps, everything else conservatively.
 fn scan_stack(m: &mut Marker, frame: &Frame, base: usize) {
-    let explain = config().explain;
     let mut from = frame.sp;
     for f in compiled_frames(frame, base) {
-        scan_conservative(m, from, f.lo, base);
+        scan_conservative(m, from, f.lo);
         m.frames += 1;
         m.slots += f.slots.len();
-        if explain {
-            eprintln!(
-                "[gc] compiled frame {:#x}..{:#x}, {} slots",
-                f.lo,
-                f.hi,
-                f.slots.len()
-            );
-        }
-        let outer = std::mem::replace(&mut m.current, 9);
         for slot in f.slots {
             let w = unsafe { std::ptr::read_volatile(slot as *const usize) };
-            if explain {
-                explain_root(m, slot, w, base);
-            }
             if m.verify
                 && w & 3 == 0
                 && crate::arena::in_heap(w)
@@ -1518,50 +1418,9 @@ fn scan_stack(m: &mut Marker, frame: &Frame, base: usize) {
             }
             m.word(w);
         }
-        m.current = outer;
         from = f.hi;
     }
-    scan_conservative(m, from, base, base);
-}
-
-/// Diagnostic landmarks: label an address on the stack (`RSCL_GC_EXPLAIN`).
-pub fn landmark(name: &str) {
-    if config().explain {
-        let m = 0usize;
-        eprintln!("[gc] landmark {name} at {:#x}", &m as *const usize as usize);
-    }
-}
-
-/// `RSCL_GC_EXPLAIN`: report each stack slot that refers to a sequence cell, with
-/// the compiled fns whose return addresses lie above it (the frames it may be in).
-fn explain_root(m: &Marker, slot: usize, w: usize, to: usize) {
-    let _ = m;
-    if w & 7 != 0 || crate::arena::find(w) != Some(w) {
-        return;
-    }
-    let kind = header(w).kind;
-    if !matches!(kind, Kind::LazySeq | Kind::Cons | Kind::List | Kind::Fn) {
-        return;
-    }
-    let mut frames = Vec::new();
-    let mut q = slot + 8;
-    while q + 8 <= to && frames.len() < 3 && q < slot + 4096 {
-        let ra = unsafe { std::ptr::read_volatile(q as *const usize) };
-        if let Some(name) = crate::trace::fn_at(ra) {
-            frames.push(format!("{name}@+{}", q - slot));
-        }
-        q += 8;
-    }
-    let first = if kind == Kind::Cons {
-        unsafe { (*(w as *const cons::ConsObj)).first.bits() as i64 >> 1 }
-    } else {
-        -1
-    };
-    eprintln!(
-        "[gc] root {kind:?} {w:#x} (first {first}) in slot {slot:#x} ({} below base); above: {}",
-        to - slot,
-        frames.join(", ")
-    );
+    scan_conservative(m, from, base);
 }
 
 /// Visit every value the object at `addr` holds.
@@ -1690,8 +1549,7 @@ fn full_collection_due() -> bool {
     let due = base
         .saturating_mul(2)
         .max(base.saturating_add(crate::heap::nursery()));
-    config().always_full
-        || LAST_LIVE.load(Ordering::Relaxed) >= due
+    LAST_LIVE.load(Ordering::Relaxed) >= due
         // Stress mode exercises both kinds.
         || (config().stress > 0 && COLLECTIONS.load(Ordering::Relaxed) % 4 == 3)
 }
@@ -1731,11 +1589,8 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
         track: false,
         young_child: false,
         keep: Vec::new(),
-        root_at: 0,
-        root_slots: HashMap::new(),
         frames: 0,
         slots: 0,
-        parents: (config().explain || config().chain).then(HashMap::new),
         current: 0,
     };
     // The remembered set is rebuilt by this collection: an old object stays in it
@@ -1745,7 +1600,6 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
         header(r).flags.fetch_and(!REMEMBERED, Ordering::Relaxed);
     }
     crate::arena::begin_marks(full);
-    m.current = 1;
     if full {
         for &p in &h.permanent {
             m.object(p);
@@ -1760,41 +1614,20 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
             m.remembered(r);
         }
     }
-    m.current = 2;
     for &p in &h.protos {
         m.value(unsafe { &(*(p as *const func::FnProto)).meta });
     }
-    m.current = 3;
     for &bits in h.pins.keys() {
         m.word(bits as usize);
     }
-    m.current = 4;
-    for &(addr, words) in &h.ranges {
-        for i in 0..words {
-            m.word(unsafe { *(addr as *const usize).add(i) });
-        }
-    }
     // This thread, then the stopped ones.
-    m.current = 5;
     scan_stack(&mut m, frame, l.stack_base.get());
-    m.current = 6;
     for &r in &frame.regs {
-        if config().explain && crate::arena::find(r) == Some(r) {
-            eprintln!("[gc] root {:?} {r:#x} in a register", header(r).kind);
-        }
         m.stack_word(r);
     }
-    m.current = 7;
     for &r in &own_roots {
-        if config().explain && crate::arena::find(r as usize) == Some(r as usize) {
-            eprintln!(
-                "[gc] root {:?} {r:#x} in thread state",
-                header(r as usize).kind
-            );
-        }
         m.word(r as usize);
     }
-    m.current = 8;
     for (base, s) in others {
         scan_stack(&mut m, &s.frame, *base);
         for &r in &s.frame.regs {
@@ -1819,67 +1652,6 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
         });
         m.checking = false;
     }
-    if let Some(parents) = &m.parents {
-        // The longest chain of objects, printed from its root end.
-        let mut depth: HashMap<usize, u32> = HashMap::new();
-        let mut best = (0u32, 0usize);
-        for &start in parents.keys() {
-            let mut path = Vec::new();
-            let mut a = start;
-            let base = loop {
-                if let Some(&d) = depth.get(&a) {
-                    break d;
-                }
-                path.push(a);
-                match parents.get(&a) {
-                    Some(&p) if p > 16 => a = p,
-                    _ => break 0,
-                }
-            };
-            for (i, &x) in path.iter().rev().enumerate() {
-                depth.insert(x, base + i as u32 + 1);
-            }
-            let d = base + path.len() as u32;
-            if d > best.0 {
-                best = (d, start);
-            }
-        }
-        let mut chain = Vec::new();
-        let mut a = best.1;
-        let tag = loop {
-            chain.push(a);
-            match parents.get(&a) {
-                Some(&p) if p > 16 => a = p,
-                Some(&p) => break p,
-                None => break 99,
-            }
-        };
-        let tail: Vec<String> = chain
-            .iter()
-            .rev()
-            .take(8)
-            .map(|&a| format!("{:?}@{a:#x}", header(a).kind))
-            .collect();
-        eprintln!(
-            "[gc] longest chain: {} objects, root kind {tag} (1 permanent, 2 proto, 3 pin, 4 table, 5 stack, 6 register, 7 thread state, 8 other thread, 9 compiled frame slot): {}",
-            best.0,
-            tail.join(" -> ")
-        );
-        if let Some(&slot) = chain.last().and_then(|a| m.root_slots.get(a)) {
-            let base = l.stack_base.get();
-            let spans: Vec<String> = compiled_frames(frame, base)
-                .iter()
-                .map(|f| format!("{:#x}..{:#x}", f.lo, f.hi))
-                .collect();
-            eprintln!(
-                "[gc]   found in slot {slot:#x} ({} below the stack base, {} above the collector's frame); compiled frames: {}",
-                base.wrapping_sub(slot),
-                slot.wrapping_sub(frame.sp),
-                spans.join(" ")
-            );
-        }
-    }
-
     // Sweep: an unmarked object is finalised (a keyword leaves the intern table
     // first) and its slot released.
     let mut promoted: Vec<usize> = Vec::new();

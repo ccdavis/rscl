@@ -209,9 +209,8 @@ nil
 
 Unboxed `long`/`double` locals (inferred from literals and arithmetic, or forced with
 `^long`/`^double`), inline fixnum and primitive arithmetic and comparisons, direct
-calls to Rust builtins, lock-free var reads for immortal roots, capture-less fns as
-shared immortal objects, inline refcount guards, mimalloc, the single-pass register
-allocator for the JIT, and `--gc-sections` for built binaries.
+calls to Rust builtins, lock-free var reads for permanent roots, capture-less fns as
+shared permanent objects, mimalloc, and `--gc-sections` for built binaries.
 
 ```
 $ scripts/bench.sh --runs 5          # bench/*.clj; same source for Clojure 1.12 on OpenJDK 21; CPython 3.14
@@ -264,12 +263,8 @@ user=> (let [f (future (sleep 10000))] [(future-cancel f) (try @f (catch Excepti
 [true "future was cancelled"]
 ```
 
-Memory hardening landed with this phase: locals are cleared at their last use and
-callers hand arguments over to callees, so `(reduce + (range 3000000))` runs in 13 MB
-(it took 273 MB before); reference cycles through atoms, promises and lazy seqs are
-collected (`(let [a (atom nil)] (reset! a (fn [] @a)))` two hundred thousand times
-runs in flat memory); keywords are interned weakly; `RSCL_HASH_SEED=random` protects
-maps keyed by untrusted input.
+Memory hardening landed with this phase: keywords are interned weakly, and
+`RSCL_HASH_SEED=random` protects maps keyed by untrusted input.
 
 ## After the plan — BigInt, source lines, heap limit (done)
 
@@ -290,3 +285,22 @@ Uncaught exception: OutOfMemoryError: heap limit exceeded: 64 MB in use, limit 6
 
 The same traces and the same `OutOfMemoryError` come out of built binaries.
 
+## After the plan — tracing garbage collector (done)
+
+Memory is managed by a generational mark-and-sweep collector; compiled frames are
+scanned through Cranelift stack maps (see the Memory section of `SEMANTICS.md`).
+Lazy sequences are collected as they are consumed, and cycles need nothing special.
+
+```
+user=> [(reduce + (range 3000000)) (gc-count)]
+[4499998500000 12]
+user=> (let [a (atom nil)] (reset! a (fn [] @a)) (gc))    ; objects freed
+32279
+$ RSCL_GC_DEBUG=1 rscl -e '(count (map inc (range 2000000)))'
+[gc] minor: 741871 objects, 740370 freed, 1501 live, 2 threads, 2 compiled frames (2 slots), 2.80 ms, heap 1420 KB
+...
+2000000
+```
+
+`RSCL_GC_STRESS=n` collects at every n-th safepoint and `RSCL_GC_VERIFY` checks each
+collection's work; the corpus passes under both.

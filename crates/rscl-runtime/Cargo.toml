@@ -23,5 +23,3 @@ rscl-abi = { path = "../rscl-abi" }
 default = ["mimalloc"]
 # Global allocator; off for valgrind runs, which cannot see mimalloc's heap.
 mimalloc = ["dep:mimalloc"]
-# Count live heap objects (used by tests to catch leaks without valgrind).
-live-count = []

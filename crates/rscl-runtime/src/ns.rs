@@ -1,4 +1,4 @@
-//! Namespaces and the global var registry. Namespaces and vars are immortal.
+//! Namespaces and the global var registry. Namespaces and vars are permanent.
 //!
 //! Resolution of an unqualified symbol looks in the namespace's own mappings and
 //! then falls back to `clojure.core` (an implicit `refer`), so user code can shadow a
@@ -23,7 +23,7 @@ pub struct NsObj {
 }
 
 struct Registry(HashMap<String, usize>);
-// SAFETY: stores addresses of leaked immortal objects.
+// SAFETY: stores addresses of leaked permanent objects.
 unsafe impl Send for Registry {}
 unsafe impl Sync for Registry {}
 
@@ -53,7 +53,7 @@ pub fn find_or_create(name: &str) -> &'static NsObj {
     }
     let ns: &'static mut NsObj = unsafe {
         &mut *crate::obj::alloc_raw(NsObj {
-            hdr: ObjHeader::immortal(Kind::Namespace),
+            hdr: ObjHeader::permanent(Kind::Namespace),
             name: name.into(),
             mappings: RwLock::new(HashMap::new()),
             aliases: RwLock::new(HashMap::new()),
@@ -202,7 +202,7 @@ pub fn resolve(ns: &NsObj, sym_ns: Option<&str>, name: &str) -> Option<&'static 
 
 // ---- FFI ----------------------------------------------------------------------------
 
-/// Find or create the var `ns/name`. Returns an immortal pointer.
+/// Find or create the var `ns/name`. Returns a permanent pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_intern_var(
     ns: *const u8,
@@ -234,7 +234,7 @@ pub unsafe extern "C" fn rt_var_root(v: *const VarObj) -> Value {
     root
 }
 
-/// `def`: bind the root (ownership of `val` transferred) and return the var as a value.
+/// `def`: bind the root and return the var as a value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_var_bind_root(v: *const VarObj, val: Value) -> Value {
     let var = unsafe { &*v };
@@ -243,11 +243,11 @@ pub unsafe extern "C" fn rt_var_bind_root(v: *const VarObj, val: Value) -> Value
 }
 
 /// `set!` on a var: replaces the thread binding of a dynamic var. Returns the value
-/// (+1) or `EXC`.
+/// or `EXC`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_var_set(v: *const VarObj, val: Value) -> Value {
     let var = unsafe { &*v };
-    if var.has_flag(var::FLAG_DYNAMIC) && var::set_binding(var, val.clone()) {
+    if var.has_flag(var::FLAG_DYNAMIC) && var::set_binding(var, val) {
         return val;
     }
     let _ = val;
@@ -265,12 +265,6 @@ pub unsafe extern "C" fn rt_var_set(v: *const VarObj, val: Value) -> Value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_var_set_meta(v: *const VarObj, meta: Value) {
     unsafe { (*v).set_meta(meta) }
-}
-
-/// Set or clear a var flag (`FLAG_MACRO`, ...).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_var_set_flag(v: *const VarObj, flag: i64, on: i64) {
-    unsafe { (*v).set_flag(flag as u32, on != 0) }
 }
 
 // ---- loading namespaces --------------------------------------------------------------
@@ -317,10 +311,6 @@ pub fn register_static_loader(key: &str, f: StaticLoader) {
         .unwrap()
         .static_loaders
         .insert(key.to_string(), f as usize);
-}
-
-pub fn is_loaded(key: &str) -> bool {
-    loading().read().unwrap().loaded.contains(key)
 }
 
 pub fn loaded_libs() -> Vec<String> {
@@ -408,7 +398,7 @@ pub unsafe extern "C" fn rt_register_ns_loader(name: *const u8, len: i64, f: *co
     register_static_loader(name, f);
 }
 
-/// `*ns*`: the current namespace as a value (immortal).
+/// `*ns*`: the current namespace as a value (permanent).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_current_ns() -> Value {
     current().as_value()

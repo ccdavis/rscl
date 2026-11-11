@@ -91,7 +91,7 @@ enum ConstEntry {
         mask: u64,
         vmin: i64,
     },
-    /// An immortal fn object for a capture-less fn: created once per unit, shared by
+    /// A permanent fn object for a capture-less fn: created once per unit, shared by
     /// every evaluation of the `fn*` form (Clojure's non-closure fns are singletons too).
     FnObj {
         func: FuncId,
@@ -198,11 +198,11 @@ fn internal(e: impl std::fmt::Display) -> CompileError {
     CompileError::new(format!("internal compiler error: {e}"), 0)
 }
 
-/// The uniform calling convention: `(f, argc, argv) -> value`.
-/// `entry(f, argc, argv, owned) -> Value`: see `rscl_runtime::obj::func::Entry`.
+/// The uniform calling convention, `entry(f, argc, argv) -> Value`: see
+/// `rscl_runtime::obj::func::Entry`.
 pub fn fn_signature<M: Module>(module: &M) -> Signature {
     let mut sig = module.make_signature();
-    for _ in 0..4 {
+    for _ in 0..3 {
         sig.params.push(AbiParam::new(types::I64));
     }
     sig.returns.push(AbiParam::new(types::I64));
@@ -657,7 +657,7 @@ impl<M: Module> Compiler<M> {
             fc.b.switch_to_block(entry);
             fc.b.seal_block(entry);
             let params = fc.b.block_params(entry).to_vec();
-            let (fv, argc, argv, owned) = (params[0], params[1], params[2], params[3]);
+            let (fv, argc, argv) = (params[0], params[1], params[2]);
             fc.gc(fv);
             fc.start(argv_cap, locals)?;
 
@@ -701,7 +701,7 @@ impl<M: Module> Compiler<M> {
             for (i, a) in f.arities.iter().enumerate() {
                 fc.b.switch_to_block(blocks[i]);
                 fc.b.seal_block(blocks[i]);
-                fc.compile_arity(a, argv, argc, owned, f.pos)?;
+                fc.compile_arity(a, argv, argc, f.pos)?;
             }
             Ok(())
         })
@@ -806,7 +806,7 @@ impl<M: Module> Compiler<M> {
                         | ConstEntry::Edn(_)
                         | ConstEntry::FnObj { .. }
                 ) {
-                    fc.call_rt(RtFn::MakeImmortal, &[v]);
+                    fc.call_rt(RtFn::MakeConstant, &[v]);
                 }
                 fc.b.ins()
                     .store(MemFlagsData::trusted(), v, table, 8 * i as i32);
@@ -1139,12 +1139,6 @@ impl<'a, M: Module> FnCtx<'a, M> {
     fn gc(&mut self, v: Value) -> Value {
         self.b.declare_value_needs_stack_map(v);
         v
-    }
-
-    /// The `owned` argument of a call from compiled code: the argument slots belong
-    /// to the callee for the duration of the call (this code never reads them again).
-    fn scratch_args(&mut self) -> Value {
-        self.b.ins().iconst(types::I64, -1)
     }
 
     fn bind_local(&mut self, id: LocalId, val: Value) -> Variable {
@@ -2272,7 +2266,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         }
     }
 
-    /// `builtin(null, argc, argv, owned)` with the exception check.
+    /// `builtin(null, argc, argv)` with the exception check.
     fn direct_call(
         &mut self,
         desc: &'static BuiltinDesc,
@@ -2280,11 +2274,10 @@ impl<'a, M: Module> FnCtx<'a, M> {
         pos: u32,
     ) -> CResult<Value> {
         let (argv, argc) = self.store_ops(ops);
-        let owned = self.scratch_args();
         let fref = self.builtin_ref(desc)?;
         let this = self.b.ins().iconst(types::I64, 0);
         self.srcloc(pos);
-        let inst = self.b.ins().call(fref, &[this, argc, argv, owned]);
+        let inst = self.b.ins().call(fref, &[this, argc, argv]);
         self.srcloc(0);
         let r = self.b.inst_results(inst)[0];
         self.check_exc(r);
@@ -2397,7 +2390,6 @@ impl<'a, M: Module> FnCtx<'a, M> {
         let fv = self.compile(f)?;
         let ops = self.eval_args(args)?;
         let (argv, argc) = self.store_ops(&ops);
-        let owned = self.scratch_args();
 
         // Fast path: a heap pointer whose kind is Fn → call its entry directly.
         let low = self.b.ins().band_imm_s(fv, 3);
@@ -2443,7 +2435,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         let inst = self
             .b
             .ins()
-            .call_indirect(self.call_sig, entry, &[fv, argc, argv, owned]);
+            .call_indirect(self.call_sig, entry, &[fv, argc, argv]);
         self.srcloc(0);
         let r1 = self.b.inst_results(inst)[0];
         self.b.ins().jump(merge, &[BlockArg::Value(r1)]);
@@ -2451,9 +2443,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.b.switch_to_block(slow);
         self.b.seal_block(slow);
         self.srcloc(pos);
-        let r2 = self
-            .call_rt(RtFn::Invoke, &[fv, argc, argv, owned])
-            .unwrap();
+        let r2 = self.call_rt(RtFn::Invoke, &[fv, argc, argv]).unwrap();
         self.srcloc(0);
         self.b.ins().jump(merge, &[BlockArg::Value(r2)]);
 
@@ -2467,26 +2457,18 @@ impl<'a, M: Module> FnCtx<'a, M> {
     fn compile_coll(&mut self, kind: CollKind, items: &[Node]) -> CResult<Value> {
         let ops = self.eval_args(items)?;
         let (addr, n) = self.store_ops(&ops);
-        let owned = self.scratch_args();
         let f = match kind {
             CollKind::Vector => RtFn::VectorFromSlice,
             CollKind::Map => RtFn::MapFromSlice,
             CollKind::Set => RtFn::SetFromSlice,
         };
-        let r = self.call_rt(f, &[addr, n, owned]).unwrap();
+        let r = self.call_rt(f, &[addr, n]).unwrap();
         Ok(self.gc(r))
     }
 
     /// Body of one fn arity: bind params (and rest), check the stack, compile the
     /// body as the recur target, return.
-    fn compile_arity(
-        &mut self,
-        a: &Arity,
-        argv: Value,
-        argc: Value,
-        owned: Value,
-        pos: u32,
-    ) -> CResult<()> {
+    fn compile_arity(&mut self, a: &Arity, argv: Value, argc: Value, pos: u32) -> CResult<()> {
         // The arguments move from the caller's argument slots into this function's
         // own variables before anything here can reach a safepoint: the collector
         // does not look at the caller's slots.
@@ -2499,32 +2481,11 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 self.gc(v)
             })
             .collect();
-        if !rscl_runtime::gc::PRECISE_FRAMES && !vals.is_empty() {
-            // Where compiled frames are scanned conservatively, the caller's slots
-            // are cleared (when they are the callee's to clear) so they do not keep,
-            // say, the head of a lazy sequence alive while this function walks it.
-            let clear = self.b.create_block();
-            let cont = self.b.create_block();
-            self.b.ins().brif(owned, clear, &[], cont, &[]);
-            self.b.switch_to_block(clear);
-            self.b.seal_block(clear);
-            let nil = self.b.ins().iconst(types::I64, 0);
-            for j in 0..vals.len() {
-                self.b
-                    .ins()
-                    .store(MemFlagsData::trusted(), nil, argv, 8 * j as i32);
-            }
-            self.b.ins().jump(cont, &[]);
-            self.b.switch_to_block(cont);
-            self.b.seal_block(cont);
-        }
         let rest = a.rest.map(|_| {
             let nfixed = a.params.len() as i64;
             let extra = self.b.ins().iadd_imm_s(argc, -nfixed);
             let addr = self.b.ins().iadd_imm_s(argv, 8 * nfixed);
-            let r = self
-                .call_rt(RtFn::ListFromSlice, &[addr, extra, owned])
-                .unwrap();
+            let r = self.call_rt(RtFn::ListFromSlice, &[addr, extra]).unwrap();
             self.gc(r)
         });
         let mut vars: Vec<(LocalId, Variable)> = Vec::new();
