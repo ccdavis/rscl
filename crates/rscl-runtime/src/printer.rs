@@ -193,7 +193,7 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
             write(out, &obj::atom::get(v).deref(), readably, depth + 1);
             out.push_str(&format!(" 0x{:x}]", v.bits()));
         }
-        Kind::Cons | Kind::LazySeq => {
+        Kind::Cons | Kind::LazySeq | Kind::VecSeq => {
             out.push('(');
             let mut first = true;
             for x in crate::coll::seq_iter(v) {

@@ -95,6 +95,10 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   cons cell returns its tail unrealised. Printing, equality, `count` and `hash` realise
   the whole seq. A lazy seq whose body throws stays unrealised and can be retried.
 - `(range 0)` and other empty lazy seqs are `()`, not `nil`; `(seq ())` is `nil`.
+- The seq of a vector is a position in it: `seq`, `rest` and `next` of a vector
+  cost one small object whatever its size, and `count` and `nth` of the result are
+  constant-time. It is a seq, not a list (`list?` is false, as in Clojure). The
+  seq of a map, set or string copies the elements into a vector once.
 - Sequential collections of every kind (list, vector, cons, lazy seq) are `=` when
   their elements are, and hash alike.
 - `letfn` and transducers are not implemented yet.

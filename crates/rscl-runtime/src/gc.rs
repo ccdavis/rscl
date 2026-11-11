@@ -86,7 +86,7 @@ use std::time::{Duration, Instant};
 
 use crate::obj::{
     self, Kind, atom, cons, exception, func, lazyseq, list, map, pending, set, sorted, symbol,
-    types, var, vector,
+    types, var, vecseq, vector,
 };
 use crate::value::{ObjHeader, PERMANENT, REMEMBERED, Value};
 
@@ -1282,6 +1282,7 @@ impl Marker {
                 header(obj).kind,
                 Kind::LazySeq
                     | Kind::Cons
+                    | Kind::VecSeq
                     | Kind::List
                     | Kind::Fn
                     | Kind::Atom
@@ -1439,6 +1440,7 @@ unsafe fn trace(addr: usize, m: &mut Marker) {
                 m.value(&o.first);
                 m.value(&o.more);
             }
+            Kind::VecSeq => m.value(&(*(p as *const vecseq::VecSeqObj)).vec),
             Kind::Symbol => m.value(&(*(p as *const symbol::SymObj)).meta),
             Kind::Fn => {
                 let o = &*(p as *const func::FnObj);

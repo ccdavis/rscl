@@ -2063,6 +2063,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
             | Kind::Regex
             | Kind::Cons
             | Kind::LazySeq
+            | Kind::VecSeq
             | Kind::BigInt => ConstEntry::Edn(printer::pr_str_meta(v)),
             k => {
                 return Err(internal(format!(

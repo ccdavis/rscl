@@ -23,6 +23,7 @@ pub mod string;
 pub mod symbol;
 pub mod types;
 pub mod var;
+pub mod vecseq;
 pub mod vector;
 
 /// Object kind tag stored in `ObjHeader::kind`. Values are part of the ABI that
@@ -57,6 +58,8 @@ pub enum Kind {
     Pending = 24,
     /// Arbitrary-precision integer (`123N`).
     BigInt = 25,
+    /// A seq over a vector (see `vecseq.rs`).
+    VecSeq = 26,
 }
 
 impl Kind {
@@ -87,6 +90,7 @@ impl Kind {
             Kind::SortedSet => "SortedSet",
             Kind::Pending => "Pending",
             Kind::BigInt => "BigInt",
+            Kind::VecSeq => "VecSeq",
         }
     }
 }
@@ -107,7 +111,7 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
             Kind::Vector => free_obj(p as *mut vector::VecObj),
             Kind::Map => free_obj(p as *mut map::MapObj),
             Kind::Set => free_obj(p as *mut set::SetObj),
-            Kind::Fn => {}
+            Kind::Fn | Kind::VecSeq => {}
             Kind::Exception => free_obj(p as *mut exception::ExcObj),
             Kind::Atom => free_obj(p as *mut atom::AtomObj),
             Kind::Regex => free_obj(p as *mut regex::RegexObj),

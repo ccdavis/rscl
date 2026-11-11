@@ -268,9 +268,9 @@ builtins! {
     "vector?" => fn cf_vector_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Vector))) }
     "map?" => fn cf_map_p(args) [1] { Ok(Value::bool(coll::is_map_like(&args[0]))) }
     "set?" => fn cf_set_p(args) [1] { Ok(Value::bool(matches!(args[0].kind(), Some(Kind::Set | Kind::SortedSet)))) }
-    "coll?" => fn cf_coll_p(args) [1] { Ok(Value::bool(matches!(args[0].kind(), Some(Kind::List | Kind::Vector | Kind::Map | Kind::Set | Kind::Cons | Kind::LazySeq | Kind::SortedMap | Kind::SortedSet)) || crate::obj::types::is_record(&args[0]))) }
+    "coll?" => fn cf_coll_p(args) [1] { Ok(Value::bool(matches!(args[0].kind(), Some(Kind::List | Kind::Vector | Kind::Map | Kind::Set | Kind::Cons | Kind::LazySeq | Kind::VecSeq | Kind::SortedMap | Kind::SortedSet)) || crate::obj::types::is_record(&args[0]))) }
     "seq?" => fn cf_seq_p(args) [1] { Ok(Value::bool(coll::is_seq(&args[0]))) }
-    "sequential?" => fn cf_sequential_p(args) [1] { Ok(Value::bool(matches!(args[0].kind(), Some(Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq)))) }
+    "sequential?" => fn cf_sequential_p(args) [1] { Ok(Value::bool(matches!(args[0].kind(), Some(Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq | Kind::VecSeq)))) }
     "associative?" => fn cf_associative_p(args) [1] { Ok(Value::bool(matches!(args[0].kind(), Some(Kind::Map | Kind::Vector | Kind::SortedMap)) || crate::obj::types::is_record(&args[0]))) }
     "seqable?" => fn cf_seqable_p(args) [1] { Ok(Value::bool(coll::is_seqable(&args[0]))) }
     "ifn?" => fn cf_ifn_p(args) [1] { Ok(Value::bool(matches!(args[0].kind(), Some(Kind::Fn | Kind::Keyword | Kind::Map | Kind::Set | Kind::Vector | Kind::Var | Kind::SortedMap | Kind::SortedSet)))) }

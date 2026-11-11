@@ -39,8 +39,8 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
             x.hash == y.hash && x.ns == y.ns && x.name == y.name
         }
         (
-            Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq,
-            Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq,
+            Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq | Kind::VecSeq,
+            Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq | Kind::VecSeq,
         ) => seq_equiv(a, b),
         // Clones (O(1)): comparing elements can run rscl code (lazy seqs), during
         // which a collection may replace the node trees of `a` and `b` themselves.
@@ -72,6 +72,7 @@ fn nests(k: Kind) -> bool {
             | Kind::Vector
             | Kind::Cons
             | Kind::LazySeq
+            | Kind::VecSeq
             | Kind::Map
             | Kind::Set
             | Kind::SortedMap
@@ -241,7 +242,7 @@ pub fn hasheq(v: &Value) -> u64 {
         Kind::String => mix64(hash_bytes(obj::string::get(v).as_bytes())),
         Kind::Symbol => mix64(obj::symbol::get(v).hash),
         Kind::Keyword => obj::keyword::get(v).hash,
-        Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq => {
+        Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq | Kind::VecSeq => {
             let mut h = SEQ_SEED;
             for x in crate::coll::seq_iter(v) {
                 match x {

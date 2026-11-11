@@ -51,7 +51,7 @@ pub fn stored(s: &Set_, k: &Value) -> Option<Value> {
     }
     if matches!(
         k.kind(),
-        Some(Kind::BigInt | Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq)
+        Some(Kind::BigInt | Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq | Kind::VecSeq)
     ) {
         return s.iter().find(|x| crate::equiv::equiv(x, k)).cloned();
     }

@@ -762,6 +762,58 @@ fn value_lifetimes_across_calls() {
 }
 
 #[test]
+fn seqs_over_vectors_are_positions_not_copies() {
+    with_jit(|j| {
+        assert_eq!(
+            eval(
+                j,
+                "(let [v [1 2 3] s (seq v)] [s (rest s) (next (next (next s))) (rest (rest (rest s))) (count (rest s)) (nth s 2) (nth s 5 :nf)])"
+            ),
+            "[(1 2 3) (2 3) nil () 2 3 :nf]"
+        );
+        // A seq, not a list; equal to (and hashed like) a list or vector of the
+        // same elements.
+        assert_eq!(
+            eval(
+                j,
+                "(let [r (rest [1 2 3])] [(seq? r) (list? r) (= r (list 2 3)) (= r [2 3]) (= (hash r) (hash (list 2 3))) (contains? #{(list 2 3)} r) (get {r :x} [2 3])])"
+            ),
+            "[true false true true true true :x]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [r (rest [1 2 3])] [(conj r 0) (cons 0 r) (into [] r) (reduce + r) (map inc r) (last r) (empty r) (with-meta r {:a 1}) (rest (cons 0 r))])"
+            ),
+            "[(0 2 3) (0 2 3) [2 3] 5 (3 4) 3 () (2 3) (2 3)]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[(seq []) (rest []) (next [1]) (seq \"ab\") (rest \"ab\") (first {:a 1}) (rest {:a 1}) (count (seq #{1 2 3})) (empty? []) (empty? [1])]"
+            ),
+            "[nil () nil (\\a \\b) (\\b) [:a 1] () 3 true false]"
+        );
+        // The seq of a big vector costs one object, and it keeps the vector alive.
+        def(j, "(def big (vec (range 200000)))");
+        def(j, "(def tail (nthrest big 199998))");
+        def(j, "(def big nil)");
+        assert_eq!(eval(j, "(do (gc) (gc) tail)"), "(199998 199999)");
+        let before: i64 = def(j, "(gc-count)").parse().unwrap();
+        assert_eq!(
+            eval(
+                j,
+                "(let [v (vec (range 100000))] (loop [i 0 n 0] (if (< i 2000) (recur (inc i) (+ n (count (rest v)) (if (seq v) 1 0))) n)))"
+            ),
+            "200000000"
+        );
+        let after: i64 = def(j, "(gc-count)").parse().unwrap();
+        // Copying the vector each time would allocate 20 GB of cells.
+        assert!(after - before < 5, "{} collections", after - before);
+    });
+}
+
+#[test]
 fn dynamic_keywords_are_collected() {
     with_jit(|j| {
         // Keywords made at run time die with their last reference (no table growth);

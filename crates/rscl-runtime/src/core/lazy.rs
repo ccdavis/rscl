@@ -185,7 +185,7 @@ builtins! {
         }
         let copy = match v.kind() {
             Some(Kind::Symbol) => symbol::with_meta(v, args[1]),
-            Some(Kind::List | Kind::Cons | Kind::LazySeq) => { let c = list::from_iter(coll::to_vec(v)?); obj::set_meta_unshared(&c, args[1]); c }
+            Some(Kind::List | Kind::Cons | Kind::LazySeq | Kind::VecSeq) => { let c = list::from_iter(coll::to_vec(v)?); obj::set_meta_unshared(&c, args[1]); c }
             Some(Kind::Vector) => { let c = vector::new(vector::get(v).v.clone()); obj::set_meta_unshared(&c, args[1]); c }
             Some(Kind::Map) => { let o = obj::map::get(v); let c = match &o.order { Some(k) => obj::map::new_ordered(o.m.clone(), k.to_vec()), None => obj::map::new(o.m.clone()) }; obj::set_meta_unshared(&c, args[1]); c }
             Some(Kind::Set) => { let o = obj::set::get(v); let c = match &o.order { Some(k) => obj::set::new_ordered(o.s.clone(), k.to_vec()), None => obj::set::new(o.s.clone()) }; obj::set_meta_unshared(&c, args[1]); c }

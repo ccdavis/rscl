@@ -563,7 +563,9 @@ impl Analyzer {
         match form.kind() {
             Some(Kind::Symbol) => self.analyze_symbol(form),
             // Macro expansions may return cons cells or lazy seqs: any seq is a call form.
-            Some(Kind::List | Kind::Cons | Kind::LazySeq) => self.analyze_list(form, tail),
+            Some(Kind::List | Kind::Cons | Kind::LazySeq | Kind::VecSeq) => {
+                self.analyze_list(form, tail)
+            }
             Some(Kind::Vector) => {
                 let items = vector::get(form).v.iter().cloned().collect::<Vec<_>>();
                 self.analyze_coll(form, CollKind::Vector, &items)
@@ -1457,7 +1459,7 @@ fn check_embeddable(form: &Value, v: &Value) -> CResult<()> {
             | Kind::Symbol
             | Kind::Regex,
         ) => true,
-        Some(Kind::List | Kind::Cons | Kind::LazySeq | Kind::Vector | Kind::Set) => {
+        Some(Kind::List | Kind::Cons | Kind::LazySeq | Kind::VecSeq | Kind::Vector | Kind::Set) => {
             let Some(items) = seq_items(v).or_else(|| rscl_runtime::coll::to_vec(v).ok()) else {
                 return fail(form, "cannot realise a sequence in a constant");
             };

@@ -113,6 +113,7 @@ pub fn builtin_name(key: u64) -> &'static str {
             Some(Kind::Atom) => "Atom",
             Some(Kind::LazySeq) => "LazySeq",
             Some(Kind::Cons) => "Cons",
+            Some(Kind::VecSeq) => "VectorSeq",
             Some(Kind::Namespace) => "Namespace",
             Some(Kind::Regex) => "Pattern",
             Some(Kind::Native) => "Native",
@@ -156,6 +157,7 @@ const ALL_KINDS: &[Kind] = &[
     Kind::SortedSet,
     Kind::Pending,
     Kind::BigInt,
+    Kind::VecSeq,
 ];
 
 /// The dispatch key of any value.
