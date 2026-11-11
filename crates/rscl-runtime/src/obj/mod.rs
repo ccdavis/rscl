@@ -133,10 +133,12 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
     }
 }
 
-/// Memory for a heap object, from the object heap (see `arena.rs`).
+/// Memory for a heap object that owns no Rust data, from the object heap (see
+/// `arena.rs`): nothing is dropped when it dies.
+#[inline]
 pub(crate) fn raw_alloc(layout: std::alloc::Layout) -> *mut u8 {
     debug_assert!(layout.align() <= 16);
-    crate::arena::alloc(layout.size())
+    crate::arena::alloc(layout.size(), false)
 }
 
 /// Drop an object's fields; its slot is released by the sweep.
@@ -144,9 +146,13 @@ unsafe fn free_obj<T>(p: *mut T) {
     unsafe { std::ptr::drop_in_place(p) };
 }
 
-/// Allocate an object.
+/// Allocate an object. One whose type has something to drop (a string, a
+/// collection) is finalised by `free` when it dies; the others are released
+/// without being looked at.
+#[inline]
 pub(crate) fn alloc_raw<T>(obj: T) -> *mut T {
-    let p = raw_alloc(std::alloc::Layout::new::<T>()) as *mut T;
+    debug_assert!(std::mem::align_of::<T>() <= 16);
+    let p = crate::arena::alloc(std::mem::size_of::<T>(), std::mem::needs_drop::<T>()) as *mut T;
     unsafe { std::ptr::write(p, obj) };
     p
 }

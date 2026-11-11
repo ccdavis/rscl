@@ -493,7 +493,7 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
 }
 
 /// Collections created from another keep its metadata.
-fn with_meta_of(src: &Value, dst: Value) -> Value {
+pub fn with_meta_of(src: &Value, dst: Value) -> Value {
     if let Some(m) = obj::meta(src)
         && !m.is_nil()
     {

@@ -176,6 +176,7 @@ thread_local! {
 
 /// Register an object that is never freed and is a root (its header is permanent).
 pub(crate) fn register_permanent(p: *mut ObjHeader) {
+    crate::arena::note_permanent(p as usize);
     let mut h = heap();
     h.permanent.push(p as usize);
     h.new_permanent.push(p as usize);
@@ -189,11 +190,19 @@ pub(crate) fn register_proto(p: *const func::FnProto) {
 /// Make an existing object permanent: it becomes a root and is never freed.
 pub fn make_permanent(v: &Value) {
     let Some(h) = v.header() else { return };
+    crate::arena::note_permanent(v.bits() as usize);
     if h.flags.fetch_or(PERMANENT, Ordering::Relaxed) & PERMANENT == 0 {
         let mut heap = heap();
         heap.permanent.push(v.bits() as usize);
         heap.new_permanent.push(v.bits() as usize);
     }
+}
+
+/// Flag an object as never freed without making it a root: for what a permanent
+/// object contains, which is reached through it.
+pub fn flag_permanent(h: &ObjHeader) {
+    crate::arena::note_permanent(h as *const ObjHeader as usize);
+    h.flags.fetch_or(PERMANENT, Ordering::Relaxed);
 }
 
 /// The write barrier: call after storing a reference into an existing heap object
@@ -806,6 +815,7 @@ pub fn register_thread() {
 /// Leave the set of rscl threads (also done when the thread exits).
 pub fn unregister_thread() {
     let _ = LOCAL.try_with(leave_world);
+    crate::arena::thread_exit();
     crate::heap::thread_exit();
 }
 
@@ -1660,6 +1670,7 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
     let mut finalizers: Vec<Finalizer> = Vec::new();
     let freed = crate::arena::sweep(
         full,
+        m.verify,
         |p| {
             // Unreached: garbage, unless it is permanent (then it stays as it is).
             let hd = unsafe { &*p };

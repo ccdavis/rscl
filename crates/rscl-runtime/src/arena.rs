@@ -9,9 +9,18 @@
 //! `Vec` left in some frame can never turn out to be the address of a newer object,
 //! which with a shared allocator kept whole lazy sequences alive.
 //!
-//! A thread allocates from blocks it has taken for itself (no locking on the fast
-//! path); a collection hands every block back, frees the unmarked slots and
-//! releases blocks that became empty to the operating system.
+//! Allocation is the cheap part by design, since everything a Lisp program does
+//! allocates. A thread takes blocks for itself and, inside a block, claims a run
+//! of free slots that it then hands out by moving a pointer: the common case of
+//! `alloc` is a comparison, an addition and setting the slot's bit, with the size
+//! class folded to a constant at each call site. A collection hands every block
+//! back, frees the unmarked slots and releases blocks that became empty to the
+//! operating system.
+//!
+//! Reclaiming is cheap for most garbage too. Objects that own Rust data (strings,
+//! collections) live in blocks of their own; the others (cons cells, closures,
+//! lazy-seq cells, boxed numbers) need no finalising, so the sweep frees the dead
+//! ones in such a block by clearing bits a word at a time, without reading them.
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -29,6 +38,22 @@ const WORDS: usize = BLOCK / GRAIN / 64;
 /// Classes 1..=16 are multiples of 16 bytes up to 256; then powers of two to a block.
 const SMALL_CLASSES: usize = 16;
 pub const NCLASSES: usize = SMALL_CLASSES + 8 + 1;
+/// Blocks come in two sorts per size class: *plain* blocks hold only objects
+/// that own nothing outside the object heap (cons cells, closures, boxed
+/// numbers), *drop* blocks hold objects with Rust data to drop when they die
+/// (strings, collections). A plain block is swept without looking at the dead
+/// objects in it. A pool is a (class, sort) pair.
+const NPOOLS: usize = 2 * NCLASSES;
+/// A block's class byte: the size class (0: the block is free), and two flags.
+const CLASS_MASK: u8 = 0x3f;
+/// The block holds a permanent object: the sweep looks at each unreached object
+/// before releasing it.
+const HAS_PERMANENT: u8 = 0x40;
+/// A drop block.
+const DROPS: u8 = 0x80;
+/// Longest run of free slots a thread claims at a time, in bytes (what it has
+/// claimed counts as allocated).
+const MAX_RUN: usize = 8 << 10;
 
 #[inline]
 fn class_of(size: usize) -> usize {
@@ -161,8 +186,8 @@ struct Pool {
     next: usize,
     /// Blocks that were emptied and released.
     free: Vec<u32>,
-    /// Per class: blocks with free slots that no thread holds.
-    partial: [Vec<u32>; NCLASSES],
+    /// Per pool: blocks with free slots that no thread holds.
+    partial: [Vec<u32>; NPOOLS],
     /// Blocks threads have taken since the last collection: every object
     /// allocated since then is in one of them.
     young: Vec<u32>,
@@ -174,7 +199,7 @@ fn pool() -> MutexGuard<'static, Pool> {
         Mutex::new(Pool {
             next: 0,
             free: Vec::new(),
-            partial: [const { Vec::new() }; NCLASSES],
+            partial: [const { Vec::new() }; NPOOLS],
             young: Vec::new(),
         })
     })
@@ -190,6 +215,30 @@ fn block_addr(l: &Layout, block: usize) -> usize {
 #[inline]
 unsafe fn class_ptr(l: &Layout, block: usize) -> *mut u8 {
     (l.classes + block) as *mut u8
+}
+
+/// The size class of a block (0: free).
+#[inline]
+unsafe fn class_at(l: &Layout, block: usize) -> usize {
+    (unsafe { *class_ptr(l, block) } & CLASS_MASK) as usize
+}
+
+/// The pool a block with this class byte belongs to.
+#[inline]
+fn pool_of(byte: u8) -> usize {
+    (byte & CLASS_MASK) as usize + if byte & DROPS != 0 { NCLASSES } else { 0 }
+}
+
+/// Record that the object at `addr` became permanent: its block is from now on
+/// swept object by object, so that the object is kept even when a collection
+/// does not reach it.
+pub fn note_permanent(addr: usize) {
+    let l = layout();
+    debug_assert!(addr >= l.base);
+    let block = (addr - l.base) >> BLOCK_SHIFT;
+    // Other threads may be flagging objects in the same block.
+    let byte = unsafe { &*(class_ptr(l, block) as *const std::sync::atomic::AtomicU8) };
+    byte.fetch_or(HAS_PERMANENT, Ordering::Relaxed);
 }
 
 #[inline]
@@ -279,20 +328,46 @@ pub fn begin_marks(full: bool) {
     }
 }
 
-/// A thread's allocation state: per class, the block it fills (index + 1; 0: none)
-/// and the slot to try next.
+/// A thread's allocation state. Per pool it holds a block and, inside it, a run
+/// of free slots `[cur, end)` that it hands out one after the other; when the
+/// run is used up it looks for the next one in the block (from slot `cursor`),
+/// then takes another block.
 pub struct Cache {
     epoch: Cell<u64>,
-    block: [Cell<u32>; NCLASSES],
-    cursor: [Cell<u32>; NCLASSES],
+    /// Copies of the layout's addresses, for the fast path.
+    base: Cell<usize>,
+    bitmaps: Cell<usize>,
+    cur: [Cell<usize>; NPOOLS],
+    end: [Cell<usize>; NPOOLS],
+    /// The block the run is in (index + 1; 0: none).
+    block: [Cell<u32>; NPOOLS],
+    cursor: [Cell<u32>; NPOOLS],
 }
 
 impl Cache {
     pub const fn new() -> Cache {
         Cache {
             epoch: Cell::new(0),
-            block: [const { Cell::new(0) }; NCLASSES],
-            cursor: [const { Cell::new(0) }; NCLASSES],
+            base: Cell::new(0),
+            bitmaps: Cell::new(0),
+            cur: [const { Cell::new(0) }; NPOOLS],
+            end: [const { Cell::new(0) }; NPOOLS],
+            block: [const { Cell::new(0) }; NPOOLS],
+            cursor: [const { Cell::new(0) }; NPOOLS],
+        }
+    }
+
+    /// Give up every run: what was claimed and not used is no longer allocated.
+    fn release(&self) {
+        let mut unused = 0usize;
+        for pc in 0..NPOOLS {
+            unused += self.end[pc].get() - self.cur[pc].get();
+            self.cur[pc].set(0);
+            self.end[pc].set(0);
+            self.block[pc].set(0);
+        }
+        if unused != 0 {
+            crate::heap::account_object(-(unused as isize));
         }
     }
 }
@@ -307,90 +382,134 @@ thread_local! {
     static CACHE: Cache = const { Cache::new() };
 }
 
-/// Find a free slot at or after `from` in a block of `slots` slots of `step` grains;
-/// mark it used.
+/// A thread that allocated is ending: return what it claimed and did not use.
+pub fn thread_exit() {
+    let _ = CACHE.try_with(Cache::release);
+}
+
 #[inline]
-unsafe fn take_slot(bits: *mut u64, from: usize, slots: usize, step: usize) -> Option<usize> {
+fn slot_used(bits: *const u64, bit: usize) -> bool {
+    unsafe { *bits.add(bit / 64) >> (bit % 64) & 1 == 1 }
+}
+
+/// The first run of free slots at or after slot `from` in a block of `slots`
+/// slots of `step` grains: (first slot, length), at most `max` slots long.
+fn find_run(
+    bits: *const u64,
+    from: usize,
+    slots: usize,
+    step: usize,
+    max: usize,
+) -> Option<(usize, usize)> {
     let mut i = from;
-    while i < slots {
-        let bit = i * step;
-        let w = unsafe { *bits.add(bit / 64) };
-        if step == 1 {
-            // Skip a run of used slots a word at a time.
-            let rest = !w >> (bit % 64);
-            if rest == 0 {
-                i = (bit / 64 + 1) * 64;
-                continue;
-            }
-            let i2 = i + rest.trailing_zeros() as usize;
-            if i2 >= slots {
-                return None;
-            }
-            let b2 = i2;
-            unsafe { *bits.add(b2 / 64) |= 1 << (b2 % 64) };
-            return Some(i2);
-        }
-        if w >> (bit % 64) & 1 == 0 {
-            unsafe { *bits.add(bit / 64) = w | 1 << (bit % 64) };
-            return Some(i);
-        }
+    while i < slots && slot_used(bits, i * step) {
         i += 1;
     }
-    None
+    if i >= slots {
+        return None;
+    }
+    let mut n = 1;
+    while n < max && i + n < slots && !slot_used(bits, (i + n) * step) {
+        n += 1;
+    }
+    Some((i, n))
 }
 
-/// Allocate `size` bytes for an object. The memory is not initialised; the caller
-/// writes the whole object before anything can observe it (the slot's bit is
-/// already set, so the collector treats it as an object: a collection cannot start
-/// between the allocation and the write, since allocation is not a safepoint).
-pub fn alloc(size: usize) -> *mut u8 {
-    let l = layout();
+/// Allocate `size` bytes for an object; `drops` says whether the object owns Rust
+/// data that must be dropped when it dies (see `NPOOLS`). The memory is not
+/// initialised; the caller writes the whole object before anything can observe it
+/// (the slot's bit is already set, so the collector treats it as an object: a
+/// collection cannot start between the allocation and the write, since allocation
+/// is not a safepoint).
+#[inline]
+pub fn alloc(size: usize, drops: bool) -> *mut u8 {
+    // With a constant size (nearly every caller) these fold to constants.
     let class = class_of(size);
     let csize = class_size(class);
-    let step = csize / GRAIN;
-    let slots = BLOCK / csize;
+    let pc = class + if drops { NCLASSES } else { 0 };
     let fast = CACHE.try_with(|c| {
-        let epoch = EPOCH.load(Ordering::Relaxed);
-        if c.epoch.get() != epoch {
-            c.epoch.set(epoch);
-            for b in &c.block {
-                b.set(0);
-            }
-        }
-        loop {
-            let held = c.block[class].get();
-            if held != 0 {
-                let block = held as usize - 1;
-                let from = c.cursor[class].get() as usize;
-                if let Some(i) = unsafe { take_slot(bitmap(l, block), from, slots, step) } {
-                    c.cursor[class].set(i as u32 + 1);
-                    return block_addr(l, block) + i * csize;
-                }
-            }
-            let block = acquire(l, class);
-            c.block[class].set(block as u32 + 1);
-            c.cursor[class].set(0);
-        }
+        let cur = c.cur[pc].get();
+        let addr = if cur < c.end[pc].get() && c.epoch.get() == EPOCH.load(Ordering::Relaxed) {
+            c.cur[pc].set(cur + csize);
+            cur
+        } else {
+            refill(c, pc, csize)
+        };
+        // The slot is in use from here on.
+        let i = (addr - c.base.get()) >> 4;
+        unsafe { *((c.bitmaps.get() + (i >> 6) * 8) as *mut u64) |= 1u64 << (i & 63) };
+        addr
     });
-    let addr = match fast {
-        Ok(a) => a,
-        // The thread's locals are gone (it is exiting): take a slot from a block
-        // of its own.
-        Err(_) => {
-            let block = acquire(l, class);
-            let i = unsafe { take_slot(bitmap(l, block), 0, slots, step) }.expect("empty block");
-            block_addr(l, block) + i * csize
-        }
-    };
-    crate::heap::account_object(csize as isize);
-    addr as *mut u8
+    match fast {
+        Ok(addr) => addr as *mut u8,
+        Err(_) => alloc_uncached(pc, csize),
+    }
 }
 
-/// A block of `class` with free slots, taken out of the shared pool.
+/// The slow path of `alloc`: claim the next run of free slots for pool `pc` and
+/// return its first slot.
 #[cold]
-fn acquire(l: &Layout, class: usize) -> usize {
+#[inline(never)]
+fn refill(c: &Cache, pc: usize, csize: usize) -> usize {
+    let l = layout();
+    let epoch = EPOCH.load(Ordering::Relaxed);
+    if c.epoch.get() != epoch {
+        // A collection ran: the blocks went back to the pool.
+        c.release();
+        c.epoch.set(epoch);
+        c.base.set(l.base);
+        c.bitmaps.set(l.bitmaps);
+    }
+    let step = csize / GRAIN;
+    let slots = BLOCK / csize;
+    let max = (MAX_RUN / csize).max(1);
+    loop {
+        let held = c.block[pc].get();
+        if held != 0 {
+            let block = held as usize - 1;
+            let from = c.cursor[pc].get() as usize;
+            if let Some((i, n)) = find_run(unsafe { bitmap(l, block) }, from, slots, step, max) {
+                let start = block_addr(l, block) + i * csize;
+                c.cursor[pc].set((i + n) as u32);
+                c.cur[pc].set(start + csize);
+                c.end[pc].set(start + n * csize);
+                crate::heap::account_object((n * csize) as isize);
+                return start;
+            }
+        }
+        let block = acquire(l, pc);
+        c.block[pc].set(block as u32 + 1);
+        c.cursor[pc].set(0);
+        c.cur[pc].set(0);
+        c.end[pc].set(0);
+    }
+}
+
+/// Allocation on a thread whose locals are gone (it is exiting): one slot from a
+/// block taken for the purpose.
+#[cold]
+fn alloc_uncached(pc: usize, csize: usize) -> *mut u8 {
+    let l = layout();
+    let block = acquire(l, pc);
+    let (i, _) = find_run(
+        unsafe { bitmap(l, block) },
+        0,
+        BLOCK / csize,
+        csize / GRAIN,
+        1,
+    )
+    .expect("a block from the pool has a free slot");
+    let bit = i * (csize / GRAIN);
+    unsafe { *bitmap(l, block).add(bit / 64) |= 1u64 << (bit % 64) };
+    crate::heap::account_object(csize as isize);
+    (block_addr(l, block) + i * csize) as *mut u8
+}
+
+/// A block of pool `pc` with free slots, taken out of the shared pool.
+#[cold]
+fn acquire(l: &Layout, pc: usize) -> usize {
     let mut p = pool();
-    if let Some(b) = p.partial[class].pop() {
+    if let Some(b) = p.partial[pc].pop() {
         p.young.push(b);
         return b as usize;
     }
@@ -412,7 +531,12 @@ fn acquire(l: &Layout, class: usize) -> usize {
             p.next - 1
         }
     };
-    unsafe { *class_ptr(l, block) = class as u8 };
+    let byte = if pc >= NCLASSES {
+        (pc - NCLASSES) as u8 | DROPS
+    } else {
+        pc as u8
+    };
+    unsafe { *class_ptr(l, block) = byte };
     p.young.push(block as u32);
     block
 }
@@ -427,7 +551,7 @@ pub fn find(addr: usize) -> Option<usize> {
         return None;
     }
     let block = (addr - l.base) >> BLOCK_SHIFT;
-    let class = unsafe { *class_ptr(l, block) } as usize;
+    let class = unsafe { class_at(l, block) };
     if class == 0 {
         return None;
     }
@@ -455,7 +579,7 @@ pub fn object_count() -> usize {
     let p = pool();
     let mut n = 0usize;
     for block in 0..p.next {
-        if unsafe { *class_ptr(l, block) } == 0 {
+        if unsafe { class_at(l, block) } == 0 {
             continue;
         }
         let bits = unsafe { bitmap(l, block) };
@@ -471,7 +595,7 @@ pub fn for_each_object(mut f: impl FnMut(*mut ObjHeader)) {
     let l = layout();
     let p = pool();
     for block in 0..p.next {
-        let class = unsafe { *class_ptr(l, block) } as usize;
+        let class = unsafe { class_at(l, block) };
         if class == 0 {
             continue;
         }
@@ -500,12 +624,17 @@ pub fn for_each_object(mut f: impl FnMut(*mut ObjHeader)) {
 ///   and is reported to `promoted` (it may refer to young objects, which the
 ///   collector must know about, since minor collections will not look inside it).
 ///
+/// The dead objects of a plain block without permanent objects are released
+/// without calling `finalize` (with `check_plain`, a verification mode, they are
+/// offered to it all the same, and it must not keep any).
+///
 /// A `full` sweep visits every block; otherwise only the young blocks: those
 /// allocated into since the last collection and those that still hold aged
 /// objects. Blocks left empty are released, and every block visited goes back to
 /// the pool, so threads start the next cycle with blocks of their own.
 pub fn sweep(
     full: bool,
+    check_plain: bool,
     mut finalize: impl FnMut(*mut ObjHeader) -> bool,
     mut promoted: impl FnMut(*mut ObjHeader),
 ) -> usize {
@@ -535,10 +664,15 @@ pub fn sweep(
     let mut freed_bytes = 0usize;
     for block in blocks {
         let block = block as usize;
-        let class = unsafe { *class_ptr(l, block) } as usize;
+        let byte = unsafe { *class_ptr(l, block) };
+        let class = (byte & CLASS_MASK) as usize;
         if class == 0 {
             continue;
         }
+        // Nothing in a plain block needs finalising, and without a permanent
+        // object in it nothing unreached is kept: its dead objects are released
+        // without being looked at.
+        let wholesale = byte & (DROPS | HAS_PERMANENT) == 0;
         let csize = class_size(class);
         let slots = BLOCK / csize;
         let at = block * WORDS * 8;
@@ -564,6 +698,31 @@ pub fn sweep(
             old |= second;
             let mut kept = used;
             let mut dead = used & !mark;
+            if wholesale {
+                if check_plain {
+                    let mut d = dead;
+                    while d != 0 {
+                        let b = d.trailing_zeros() as usize;
+                        d &= d - 1;
+                        let addr = block_addr(l, block) + (w * 64 + b) * GRAIN;
+                        assert!(
+                            !finalize(addr as *mut ObjHeader),
+                            "arena: an unreached object at {addr:#x} in a plain block must be kept"
+                        );
+                    }
+                }
+                kept &= !dead;
+                // Counted bit by bit, not with `count_ones`: the marks derive from
+                // words the stack scan read out of dead stack slots, which memory
+                // checkers call uninitialised, and a count computed from them
+                // would carry that into the heap accounting and into `(gc)`'s
+                // result.
+                while dead != 0 {
+                    dead &= dead - 1;
+                    freed += 1;
+                    freed_bytes += csize;
+                }
+            }
             while dead != 0 {
                 let b = dead.trailing_zeros() as usize;
                 dead &= dead - 1;
@@ -602,7 +761,7 @@ pub fn sweep(
             p.free.push(block as u32);
         } else {
             if live < slots {
-                p.partial[class].push(block as u32);
+                p.partial[pool_of(byte)].push(block as u32);
             }
             if has_young {
                 // Its aged objects are examined again by the next collection.

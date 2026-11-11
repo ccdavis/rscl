@@ -287,7 +287,9 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 
 - Heap objects are managed by a tracing garbage collector (stop-the-world mark and
   sweep; objects never move). Nothing counts references. Compile-time constants are
-  permanent.
+  permanent. Allocation moves a per-thread pointer through runs of free slots, and
+  dead objects that own no Rust data (cons cells, closures, lazy-seq cells, boxed
+  numbers) are reclaimed a bitmap word at a time without being read.
 - Hash maps and sets use a deterministic hash by default (iteration order is the
   same in every run and in JIT and AOT, as in Clojure). `RSCL_HASH_SEED=random`
   (or `0`) mixes keys with a per-process secret so attacker-chosen keys cannot be

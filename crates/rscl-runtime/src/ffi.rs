@@ -345,10 +345,7 @@ fn flag(v: &Value) {
     if h.is_permanent() {
         return;
     }
-    h.flags.fetch_or(
-        crate::value::PERMANENT,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    crate::gc::flag_permanent(h);
     flag_contents(v);
 }
 
@@ -367,10 +364,7 @@ fn flag_contents(v: &Value) {
                 if h.is_permanent() {
                     break;
                 }
-                h.flags.fetch_or(
-                    crate::value::PERMANENT,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                crate::gc::flag_permanent(h);
                 cell = list::get(&cell.rest);
             }
         }

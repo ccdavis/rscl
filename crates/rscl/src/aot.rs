@@ -142,6 +142,17 @@ fn object_module(o: &BuildOptions) -> Result<ObjectModule, BuildError> {
     flags
         .set("opt_level", if o.opt { "speed" } else { "none" })
         .map_err(internal)?;
+    // The IR verifier is a debugging aid.
+    flags
+        .set(
+            "enable_verifier",
+            if cfg!(debug_assertions) {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .map_err(internal)?;
     let isa_builder = if o.native {
         cranelift_native::builder().map_err(internal)?
     } else {

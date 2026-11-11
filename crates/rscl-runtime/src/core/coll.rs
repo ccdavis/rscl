@@ -116,6 +116,20 @@ builtins! {
     }
     "into" => @gc fn cf_into(args; slots = slots) [1, 2] {
         if args.len() == 1 { return Ok(args[0]); }
+        if let Some(target) = vector::as_vec(&args[0]) {
+            // One new vector, not one per element. The elements gathered so far
+            // are rooted while the source is realised.
+            let root = crate::gc::ArgRoot::empty();
+            let _rooted = root.enter();
+            let mut items = Vec::new();
+            for x in coll::iter_at(slots.cursor(1))? {
+                items.push(x?);
+                root.set(&items);
+            }
+            let mut v = target.v.clone();
+            v.extend(items);
+            return Ok(coll::with_meta_of(&args[0], vector::new(v)));
+        }
         let mut c = args[0];
         for x in coll::iter_at(slots.cursor(1))? { c = coll::conj(&c, x?)?; }
         Ok(c)

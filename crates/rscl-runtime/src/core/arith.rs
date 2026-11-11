@@ -6,6 +6,16 @@ use crate::exc::RtResult;
 use crate::num::{self, Num, expect_num, to_value};
 use crate::value::Value;
 
+/// Two small integers, the common case of every binary operator: computed on the
+/// spot, without the general number representation.
+#[inline]
+fn fix2(args: &[Value]) -> Option<(i64, i64)> {
+    match args {
+        [a, b] => Some((a.as_fixnum()?, b.as_fixnum()?)),
+        _ => None,
+    }
+}
+
 fn fold(args: &[Value], init: Num, op: fn(Num, Num) -> RtResult<Num>) -> RtResult<Value> {
     let mut acc = init;
     for a in args {
@@ -37,9 +47,17 @@ fn parity(args: &[Value], want_even: bool) -> RtResult<Value> {
 }
 
 builtins! {
-    "+" => fn cf_add(args) [; 0] { fold(args, Num::I(0), num::add) }
-    "*" => fn cf_mul(args) [; 0] { fold(args, Num::I(1), num::mul) }
+    "+" => fn cf_add(args) [; 0] {
+        // (A fixnum sum cannot overflow an i64.)
+        if let Some((a, b)) = fix2(args) { return Ok(Value::int(a + b)); }
+        fold(args, Num::I(0), num::add)
+    }
+    "*" => fn cf_mul(args) [; 0] {
+        if let Some((a, b)) = fix2(args) && let Some(r) = a.checked_mul(b) { return Ok(Value::int(r)); }
+        fold(args, Num::I(1), num::mul)
+    }
     "-" => fn cf_sub(args) [; 1] {
+        if let Some((a, b)) = fix2(args) { return Ok(Value::int(a - b)); }
         if args.len() == 1 { return Ok(to_value(num::neg(expect_num(&args[0])?)?)); }
         fold(&args[1..], expect_num(&args[0])?, num::sub)
     }
@@ -52,10 +70,22 @@ builtins! {
     "mod" => fn cf_mod(args) [2] { Ok(to_value(num::modulo(expect_num(&args[0])?, expect_num(&args[1])?)?)) }
     "inc" => fn cf_inc(args) [1] { Ok(to_value(num::inc(expect_num(&args[0])?)?)) }
     "dec" => fn cf_dec(args) [1] { Ok(to_value(num::dec(expect_num(&args[0])?)?)) }
-    "<" => fn cf_lt(args) [; 1] { chain(args, |o| o == Some(Ordering::Less)) }
-    "<=" => fn cf_le(args) [; 1] { chain(args, |o| matches!(o, Some(Ordering::Less | Ordering::Equal))) }
-    ">" => fn cf_gt(args) [; 1] { chain(args, |o| o == Some(Ordering::Greater)) }
-    ">=" => fn cf_ge(args) [; 1] { chain(args, |o| matches!(o, Some(Ordering::Greater | Ordering::Equal))) }
+    "<" => fn cf_lt(args) [; 1] {
+        if let Some((a, b)) = fix2(args) { return Ok(Value::bool(a < b)); }
+        chain(args, |o| o == Some(Ordering::Less))
+    }
+    "<=" => fn cf_le(args) [; 1] {
+        if let Some((a, b)) = fix2(args) { return Ok(Value::bool(a <= b)); }
+        chain(args, |o| matches!(o, Some(Ordering::Less | Ordering::Equal)))
+    }
+    ">" => fn cf_gt(args) [; 1] {
+        if let Some((a, b)) = fix2(args) { return Ok(Value::bool(a > b)); }
+        chain(args, |o| o == Some(Ordering::Greater))
+    }
+    ">=" => fn cf_ge(args) [; 1] {
+        if let Some((a, b)) = fix2(args) { return Ok(Value::bool(a >= b)); }
+        chain(args, |o| matches!(o, Some(Ordering::Greater | Ordering::Equal)))
+    }
     "==" => fn cf_num_eq(args) [; 1] { chain(args, |o| o == Some(Ordering::Equal)) }
     "max" => fn cf_max(args) [; 1] {
         let mut best = expect_num(&args[0])?;

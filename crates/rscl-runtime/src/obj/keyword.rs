@@ -17,6 +17,10 @@ pub struct KwObj {
     pub hash: u64,
 }
 
+// A dead keyword must be offered to the collector's finaliser (it leaves the intern
+// table), which only happens for objects with something to drop (see `arena.rs`).
+const _: () = assert!(std::mem::needs_drop::<KwObj>());
+
 /// Live keyword objects by name (weak: the collector removes the dead ones).
 struct Table {
     names: HashMap<(Option<String>, String), usize>,

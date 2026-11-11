@@ -62,6 +62,15 @@ impl Jit {
         rscl_runtime::entry::init();
         let flags = [
             ("opt_level", "none"),
+            // The IR verifier is a debugging aid: it costs a tenth of start-up.
+            (
+                "enable_verifier",
+                if cfg!(debug_assertions) {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
             // The default register allocator, not the single-pass one, which starts
             // up 15% faster but leaves dead references where the conservative part
             // of the stack scan finds them (in registers that natives then save in

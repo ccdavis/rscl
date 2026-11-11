@@ -20,6 +20,11 @@ pub struct NativeObj {
     pub drop_fn: Option<rscl_abi::DropFn>,
 }
 
+// A dead native object must be offered to the collector's finaliser (the library's
+// destructor), which only happens for objects with something to drop (see
+// `arena.rs`).
+const _: () = assert!(std::mem::needs_drop::<NativeObj>());
+
 // SAFETY: the payload is managed by the library; the runtime only stores the pointer.
 unsafe impl Send for NativeObj {}
 unsafe impl Sync for NativeObj {}
