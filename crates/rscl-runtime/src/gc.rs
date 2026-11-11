@@ -545,21 +545,25 @@ fn with_frame<R>(f: impl FnOnce(&Frame) -> R) -> R {
 pub fn clear_dead_stack() {
     sweep_dead_stack();
     // The sweep cannot clear its own frame, which is exactly where the caller's
-    // next callee will put its frame: zero that strip from here, using registers
-    // only. (This function is inlined into a caller that has just made a call, so
-    // the caller keeps nothing below its stack pointer.)
+    // next callee will put its frame: that strip is zeroed by a function without a
+    // frame of its own.
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::asm!(
-            "lea rdi, [rsp - 1024]",
-            "mov ecx, 126",
-            "xor eax, eax",
-            "rep stosq",
-            out("rdi") _,
-            out("rcx") _,
-            out("rax") _,
-        );
-    }
+    rscl_zero_below_sp();
+}
+
+/// Zero the kilobyte below the caller's stack pointer (all but the return address
+/// of this call). No frame, registers only, so nothing it uses lies in the range.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+extern "C" fn rscl_zero_below_sp() {
+    std::arch::naked_asm!(
+        "lea rdi, [rsp - 1024]",
+        "mov ecx, 127",
+        "xor eax, eax",
+        "rep stosq",
+        "ret",
+    )
 }
 
 #[inline(never)]

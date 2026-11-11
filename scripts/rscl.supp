@@ -40,5 +40,10 @@
    The dead part of the stack (below the stack pointer) is zeroed on purpose
    Memcheck:Addr8
    ...
-   fun:*rscl_runtime*gc*clear_dead_stack*
+   fun:*sweep_dead_stack*
+}
+{
+   The dead part of the stack (below the stack pointer) is zeroed on purpose
+   Memcheck:Addr8
+   fun:rscl_zero_below_sp
 }
