@@ -6,19 +6,32 @@
 //!
 //! # Roots
 //!
-//! * **Machine stacks and registers**, scanned *conservatively*: any word that is
-//!   the address of a registered object (or points inside one) keeps that object
-//!   alive. This covers the frames of compiled code and of the Rust runtime alike,
-//!   so neither needs stack maps or handles. Objects never move, so a word that
-//!   merely looks like a pointer costs nothing but some retention.
-//! * **Constant tables** of compiled units (registered ranges, scanned the same way).
+//! * **Compiled frames**, read *precisely*. Generated code declares its references
+//!   to Cranelift, which keeps the ones live across a call in stack slots and
+//!   records those slots per call site (stack maps, registered with the code: see
+//!   `trace::FrameInfo`). The collector finds the compiled frames on a stack by
+//!   walking the frame-pointer chain and marks exactly the slots the map of each
+//!   frame's current call lists; a value that is dead at that call is not a root.
+//!   (x86-64; elsewhere compiled frames are scanned like native ones.)
+//! * **Native frames and registers**, scanned *conservatively*: any word that is
+//!   the address of an object (or, for some kinds, points inside one) keeps that
+//!   object alive. So Rust code needs no handles: a `Value` in a local is safe.
+//!   Objects never move, so a word that merely looks like a pointer costs nothing
+//!   but some retention; the runtime keeps that rare (objects have their own
+//!   address range, thread-local storage is not scanned, the dead part of the
+//!   stack is zeroed before long-lived frames and at collections, and a collection
+//!   prefers a safepoint without short-lived native frames above it).
+//! * **Argument lists** of calls in progress. A compiled caller's argument slots
+//!   are not in its stack maps, so the callee keeps its arguments reachable: a
+//!   compiled fn loads them into its own variables before its first safepoint, a
+//!   native under which a collection may run roots the list ([`ArgRoot`]), and
+//!   [`crate::ffi::invoke`] roots the slice a native passes.
 //! * **Permanent objects**: vars (and through them every root value), namespaces,
-//!   types, protocols, fn prototypes' metadata.
+//!   types, protocols, compiled constants, fn prototypes' metadata.
 //! * **Thread-local runtime state**: the pending exception, `binding` frames, the
-//!   future a worker computes, and argument slices handed to rscl functions by
-//!   natives ([`root_slice`]).
+//!   future a worker computes, slices rooted with [`root_slice`].
 //! * **Pins**: values that live only in Rust heap data for a while (the closure of a
-//!   thread being started, values held by a native library): [`Pinned`].
+//!   thread being started): [`Pinned`].
 //!
 //! From the roots, objects are traced precisely: each kind knows the values it
 //! holds (`trace`).
@@ -26,13 +39,15 @@
 //! # When a collection may run
 //!
 //! Only at a *safepoint*: fn entry and loop headers of compiled code, and explicit
-//! blocking regions of the runtime ([`blocking`]). A native function is never
-//! interrupted by a collection unless it calls back into rscl code, so values it
-//! holds in Rust heap containers (a `Vec<Value>` being built, say) are safe as long
-//! as it does not call rscl functions meanwhile; one that does keeps such values
-//! reachable through a root ([`root_slice`], [`Pinned`]). The compiler holds forms
-//! in its own data structures while it runs macros, so it defers collections for
-//! the duration with [`inhibit`].
+//! blocking regions of the runtime ([`blocking`]). Allocation never collects, so a
+//! native function is not interrupted by a collection unless it calls back into
+//! rscl code. And even then not by default: a builtin holds collections off while
+//! it runs ([`hold`]), since it may keep values in Rust heap containers (a
+//! `Vec<Value>` being built, say) that no scan would find. Only builtins declared
+//! `@gc` let a collection run under them; those keep every value they need across
+//! a callback on their stack, in their (rooted) arguments, or under
+//! [`root_slice`]. The compiler holds forms in its own data structures while it
+//! runs macros, so it defers collections for the duration with [`inhibit`].
 //!
 //! All other rscl threads must be stopped (parked at a safepoint or inside a
 //! blocking region) while a collection runs; their stacks are scanned from the
@@ -43,8 +58,8 @@
 //! The approach borrows from `gc-arena` (collections happen only at points where
 //! the mutator's state is known, and each object type has a trace method) and from
 //! `shredder` (a non-moving collector that traces through ordinary Rust data), but
-//! neither crate can see references held by JIT-compiled machine code, which is why
-//! the stack scan is conservative.
+//! neither crate can see references held by JIT-compiled machine code or in raw
+//! tagged words, so roots are found by stack maps and scanning instead of handles.
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -100,6 +115,10 @@ struct Local {
     inhibit: Cell<u32>,
     /// A collection was wanted while inhibited.
     deferred: Cell<bool>,
+    /// An explicit collection: do not wait for a cleaner safepoint.
+    force: Cell<bool>,
+    /// Safepoints passed over while a collection was wanted.
+    skips: Cell<u32>,
     /// Argument slices of calls into rscl code in progress: (address, values).
     slices: RefCell<Vec<(usize, usize)>>,
 }
@@ -120,6 +139,8 @@ thread_local! {
             collecting: Cell::new(false),
             inhibit: Cell::new(0),
             deferred: Cell::new(false),
+            force: Cell::new(false),
+            skips: Cell::new(0),
             slices: RefCell::new(Vec::new()),
         }
     };
@@ -229,6 +250,66 @@ impl Drop for SliceRoot<'_> {
     }
 }
 
+thread_local! {
+    /// The argument lists of the natives on this thread's stack that let
+    /// collections run (innermost first, linked through their frames).
+    static ARGS: Cell<*const ArgRoot> = const { Cell::new(std::ptr::null()) };
+}
+
+/// An argument list that is a root while its native runs. A caller's argument
+/// slots are not in any stack map (a compiled caller's frame is read through its
+/// maps only), so a native under which a collection may run keeps its arguments
+/// reachable itself: `let root = ArgRoot::new(argv, argc); let _g = root.enter();`.
+pub struct ArgRoot {
+    prev: Cell<*const ArgRoot>,
+    argv: *const u64,
+    argc: usize,
+}
+
+impl ArgRoot {
+    #[inline]
+    pub fn new(argv: *const Value, argc: i64) -> ArgRoot {
+        ArgRoot {
+            prev: Cell::new(std::ptr::null()),
+            argv: argv as *const u64,
+            argc: argc.max(0) as usize,
+        }
+    }
+
+    /// Make the list a root until the guard is dropped. The `ArgRoot` must stay
+    /// where it is meanwhile (the guard borrows it), and guards nest like scopes.
+    #[inline]
+    pub fn enter(&self) -> ArgGuard<'_> {
+        ARGS.with(|a| {
+            self.prev.set(a.get());
+            a.set(self as *const ArgRoot);
+        });
+        ArgGuard(self)
+    }
+}
+
+pub struct ArgGuard<'a>(&'a ArgRoot);
+
+impl Drop for ArgGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        ARGS.with(|a| a.set(self.0.prev.get()));
+    }
+}
+
+/// Call into compiled code from Rust. A compiled function saves the callee-saved
+/// registers it uses in its own frame, where the collector does not look (it reads
+/// compiled frames through their stack maps): a value a Rust caller further up
+/// keeps in such a register would be lost. So the registers are copied into this
+/// (Rust) frame first, which is scanned like any other.
+#[inline(always)]
+pub fn enter_compiled<R>(f: impl FnOnce() -> R) -> R {
+    let saved = capture();
+    let r = f();
+    std::hint::black_box(&saved);
+    r
+}
+
 /// Number of objects the collector knows about.
 pub fn object_count() -> usize {
     crate::arena::object_count()
@@ -331,6 +412,10 @@ struct Config {
     verify: bool,
     /// Report the stack slots that refer to sequence cells.
     explain: bool,
+    /// Scan compiled frames conservatively too (for comparison and debugging).
+    conservative: bool,
+    /// Report the longest chain of reachable objects and what roots it.
+    chain: bool,
 }
 
 fn config() -> &'static Config {
@@ -346,6 +431,8 @@ fn config() -> &'static Config {
             debug: std::env::var_os("RSCL_GC_DEBUG").is_some(),
             verify: std::env::var_os("RSCL_GC_VERIFY").is_some(),
             explain: std::env::var_os("RSCL_GC_EXPLAIN").is_some(),
+            conservative: std::env::var_os("RSCL_GC_CONSERVATIVE").is_some(),
+            chain: std::env::var_os("RSCL_GC_CHAIN").is_some(),
         }
     })
 }
@@ -454,8 +541,29 @@ fn with_frame<R>(f: impl FnOnce(&Frame) -> R) -> R {
 /// long-lived frames are pushed, and after every collection, keeps such leftovers
 /// rare. The sweep goes down page by page and stops at the first run of pages that
 /// are already zero (stack never used, or cleared before).
-#[inline(never)]
+#[inline(always)]
 pub fn clear_dead_stack() {
+    sweep_dead_stack();
+    // The sweep cannot clear its own frame, which is exactly where the caller's
+    // next callee will put its frame: zero that strip from here, using registers
+    // only. (This function is inlined into a caller that has just made a call, so
+    // the caller keeps nothing below its stack pointer.)
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::asm!(
+            "lea rdi, [rsp - 1024]",
+            "mov ecx, 126",
+            "xor eax, eax",
+            "rep stosq",
+            out("rdi") _,
+            out("rcx") _,
+            out("rax") _,
+        );
+    }
+}
+
+#[inline(never)]
+fn sweep_dead_stack() {
     const PAGE: usize = 4096;
     /// Stop after this many pages in a row that needed no clearing.
     const CLEAN_RUN: usize = 4;
@@ -684,6 +792,14 @@ fn thread_roots(l: &Local) -> Vec<u64> {
             }
         }
     }
+    let mut node = ARGS.with(|a| a.get());
+    while !node.is_null() {
+        let r = unsafe { &*node };
+        for i in 0..r.argc {
+            out.push(unsafe { std::ptr::read_volatile(r.argv.add(i)) });
+        }
+        node = r.prev.get();
+    }
     out
 }
 
@@ -791,6 +907,10 @@ fn safepoint_at(frame: &Frame) -> Option<usize> {
         }
         Phase::Idle => {
             let mut g = g;
+            if GC_WANTED.load(Ordering::Acquire) && wait_for_cleaner_safepoint(frame) {
+                // Still wanted: the next safepoint looks again.
+                return None;
+            }
             if !GC_WANTED.swap(false, Ordering::AcqRel) {
                 // Nothing to do (a request already served): lower the flag.
                 drop(g);
@@ -849,6 +969,42 @@ fn safepoint_at(frame: &Frame) -> Option<usize> {
     }
 }
 
+/// How many times a thread passes over a safepoint that has native frames between
+/// compiled ones before it collects there anyway.
+const MAX_SKIPS: u32 = 64;
+
+/// Should a collection that is wanted wait for a later safepoint of this thread?
+///
+/// Native frames are scanned conservatively, and the short-lived ones (a builtin
+/// called from compiled code that called back into compiled code) are where stale
+/// words show up: such a frame is pushed over what the previous builtin call left
+/// behind and does not overwrite all of it. A safepoint with no native frame
+/// between two compiled ones (the loop header of the fn that drives a loop, say)
+/// has no such frames above it, and is usually only a few calls away. So a
+/// collection wanted at a safepoint that does have them is passed over, a bounded
+/// number of times. Explicit collections and stress mode never wait.
+fn wait_for_cleaner_safepoint(frame: &Frame) -> bool {
+    LOCAL
+        .try_with(|l| {
+            if l.force.get() || config().stress > 0 {
+                l.skips.set(0);
+                return false;
+            }
+            let frames = compiled_frames(frame, l.stack_base.get());
+            // Compiled frames that call each other are adjacent (one frame record
+            // apart); a gap means native frames in between.
+            let sandwiched = frames.windows(2).any(|w| w[1].lo != w[0].hi + 16);
+            if sandwiched && l.skips.get() < MAX_SKIPS {
+                l.skips.set(l.skips.get() + 1);
+                true
+            } else {
+                l.skips.set(0);
+                false
+            }
+        })
+        .unwrap_or(false)
+}
+
 /// `(gc)`: collect now, on the calling thread. `None` if the other threads could not
 /// be stopped in time (or collections are deferred on this thread).
 pub fn collect_now() -> Option<usize> {
@@ -859,7 +1015,10 @@ pub fn collect_now() -> Option<usize> {
 #[inline(never)]
 fn collect_now_inner() -> Option<usize> {
     GC_WANTED.store(true, Ordering::Release);
-    safepoint()
+    let _ = LOCAL.try_with(|l| l.force.set(true));
+    let r = safepoint();
+    let _ = LOCAL.try_with(|l| l.force.set(false));
+    r
 }
 
 // ---- marking -----------------------------------------------------------------------------
@@ -871,6 +1030,13 @@ const INTERIOR_WORDS: usize = 16;
 pub(crate) struct Marker {
     stack: Vec<usize>,
     verify: bool,
+    /// Diagnostics: the stack slot being scanned, and for each object reached
+    /// straight from a root, the slot it was found in.
+    root_at: usize,
+    root_slots: HashMap<usize, usize>,
+    /// Compiled frames read through their stack maps, and the slots they listed.
+    frames: usize,
+    slots: usize,
     /// `RSCL_GC_EXPLAIN`: who first reached each object (0: a root).
     parents: Option<HashMap<usize, usize>>,
     current: usize,
@@ -892,6 +1058,9 @@ impl Marker {
             self.stack.push(addr);
             if let Some(p) = &mut self.parents {
                 p.insert(addr, self.current);
+                if self.current <= 16 {
+                    self.root_slots.insert(addr, self.root_at);
+                }
             }
         }
     }
@@ -958,17 +1127,133 @@ impl Marker {
 /// Scan `[from, to)` word by word. The memory may hold anything (dead stack slots
 /// included), which is why this function has a name tools can suppress on.
 #[inline(never)]
-fn scan_conservative(m: &mut Marker, from: usize, to: usize) {
+fn scan_conservative(m: &mut Marker, from: usize, to: usize, base: usize) {
     let mut p = (from + 7) & !7;
     let explain = config().explain;
     while p + 8 <= to {
         let w = unsafe { std::ptr::read_volatile(p as *const usize) };
         if explain {
-            explain_root(m, p, w, to);
+            explain_root(m, p, w, base);
         }
+        m.root_at = p;
         m.stack_word(w);
         p += 8;
     }
+}
+
+/// Whether compiled frames are read through their stack maps on this target. Where
+/// they are not, they are scanned conservatively like Rust frames (which is always
+/// safe, only less exact), and generated code clears argument slots it has taken
+/// over.
+pub const PRECISE_FRAMES: bool = cfg!(target_arch = "x86_64");
+
+/// A compiled function's frame on a stack: `[lo, hi)` is its memory below its
+/// frame record, `slots` the addresses of the references live at its current call.
+struct CompiledFrame {
+    lo: usize,
+    hi: usize,
+    slots: Vec<usize>,
+}
+
+/// Find the compiled frames on a stack by walking the frame-pointer chain from
+/// `fp`. A frame record `[saved fp, return address]` whose return address is a call
+/// site of a compiled function belongs to that function's callee, so the function's
+/// own frame starts right above the record and ends at the saved frame pointer;
+/// the distance must equal the function's frame size, or the frame is not trusted.
+/// Anything the walk cannot identify is simply left to the conservative scan. Rust
+/// code keeps frame pointers too (the workspace forces them), so the chain runs
+/// through runtime frames; it ends at the first record that does not look like one.
+#[cfg(target_arch = "x86_64")]
+fn compiled_frames(frame: &Frame, base: usize) -> Vec<CompiledFrame> {
+    let mut out = Vec::new();
+    if config().conservative {
+        return out;
+    }
+    let code = crate::trace::code_table();
+    let mut fp = frame.regs[1];
+    let mut prev = 0usize;
+    while fp.is_multiple_of(8) && fp >= frame.sp && fp > prev && fp + 16 <= base {
+        // SAFETY: `fp` is inside the stack being scanned and aligned.
+        let (next, ret) = unsafe {
+            (
+                std::ptr::read_volatile(fp as *const usize),
+                std::ptr::read_volatile((fp + 8) as *const usize),
+            )
+        };
+        if let Some((fp_to_sp, slots)) = code.site(ret) {
+            let sp = fp + 16;
+            if next.is_multiple_of(8)
+                && next + 16 <= base
+                && next > sp
+                && next - sp == fp_to_sp as usize
+            {
+                out.push(CompiledFrame {
+                    lo: sp,
+                    hi: next,
+                    slots: slots.iter().map(|&off| sp + off as usize).collect(),
+                });
+            } else if config().debug {
+                eprintln!(
+                    "[gc] frame at {fp:#x} not trusted: return {ret:#x}, next {next:#x}, size {} (expected {fp_to_sp})",
+                    next.wrapping_sub(sp)
+                );
+            }
+        } else if config().debug && crate::trace::fn_at(ret).is_some() {
+            eprintln!("[gc] return address {ret:#x} is in compiled code but not a known call site");
+        }
+        prev = fp;
+        fp = next;
+    }
+    if config().debug && fp + 16 <= base && fp != 0 {
+        eprintln!(
+            "[gc] frame chain ended at {fp:#x} (previous {prev:#x}), {} below the stack base",
+            base - fp
+        );
+    }
+    out
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn compiled_frames(_frame: &Frame, _base: usize) -> Vec<CompiledFrame> {
+    Vec::new()
+}
+
+/// Scan one thread's stack from its published stack pointer up to `base`:
+/// compiled frames through their stack maps, everything else conservatively.
+fn scan_stack(m: &mut Marker, frame: &Frame, base: usize) {
+    let explain = config().explain;
+    let mut from = frame.sp;
+    for f in compiled_frames(frame, base) {
+        scan_conservative(m, from, f.lo, base);
+        m.frames += 1;
+        m.slots += f.slots.len();
+        if explain {
+            eprintln!(
+                "[gc] compiled frame {:#x}..{:#x}, {} slots",
+                f.lo,
+                f.hi,
+                f.slots.len()
+            );
+        }
+        let outer = std::mem::replace(&mut m.current, 9);
+        for slot in f.slots {
+            let w = unsafe { std::ptr::read_volatile(slot as *const usize) };
+            if explain {
+                explain_root(m, slot, w, base);
+            }
+            if m.verify
+                && w & 3 == 0
+                && crate::arena::in_heap(w)
+                && crate::arena::find(w) != Some(w)
+            {
+                panic!("gc: stack map slot {slot:#x} holds {w:#x}, which is not a live object");
+            }
+            m.word(w);
+        }
+        m.current = outer;
+        from = f.hi;
+    }
+    scan_conservative(m, from, base, base);
 }
 
 /// Diagnostic landmarks: label an address on the stack (`RSCL_GC_EXPLAIN`).
@@ -1135,7 +1420,11 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
     let mut m = Marker {
         stack: Vec::new(),
         verify: config().verify,
-        parents: config().explain.then(HashMap::new),
+        root_at: 0,
+        root_slots: HashMap::new(),
+        frames: 0,
+        slots: 0,
+        parents: (config().explain || config().chain).then(HashMap::new),
         current: 0,
     };
     m.current = 1;
@@ -1158,7 +1447,7 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
     }
     // This thread, then the stopped ones.
     m.current = 5;
-    scan_conservative(&mut m, frame.sp, l.stack_base.get());
+    scan_stack(&mut m, frame, l.stack_base.get());
     m.current = 6;
     for &r in &frame.regs {
         if config().explain && crate::arena::find(r) == Some(r) {
@@ -1178,7 +1467,7 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
     }
     m.current = 8;
     for (base, s) in others {
-        scan_conservative(&mut m, s.frame.sp, *base);
+        scan_stack(&mut m, &s.frame, *base);
         for &r in &s.frame.regs {
             m.stack_word(r);
         }
@@ -1187,6 +1476,7 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
         }
     }
     m.drain();
+    let (precise_frames, precise_slots) = (m.frames, m.slots);
     if let Some(parents) = &m.parents {
         // The longest chain of objects, printed from its root end.
         let mut depth: HashMap<usize, u32> = HashMap::new();
@@ -1229,10 +1519,23 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
             .map(|&a| format!("{:?}@{a:#x}", header(a).kind))
             .collect();
         eprintln!(
-            "[gc] longest chain: {} objects, root kind {tag} (1 permanent, 2 proto, 3 pin, 4 table, 5 stack, 6 register, 7 thread state, 8 other thread): {}",
+            "[gc] longest chain: {} objects, root kind {tag} (1 permanent, 2 proto, 3 pin, 4 table, 5 stack, 6 register, 7 thread state, 8 other thread, 9 compiled frame slot): {}",
             best.0,
             tail.join(" -> ")
         );
+        if let Some(&slot) = chain.last().and_then(|a| m.root_slots.get(a)) {
+            let base = l.stack_base.get();
+            let spans: Vec<String> = compiled_frames(frame, base)
+                .iter()
+                .map(|f| format!("{:#x}..{:#x}", f.lo, f.hi))
+                .collect();
+            eprintln!(
+                "[gc]   found in slot {slot:#x} ({} below the stack base, {} above the collector's frame); compiled frames: {}",
+                base.wrapping_sub(slot),
+                slot.wrapping_sub(frame.sp),
+                spans.join(" ")
+            );
+        }
     }
 
     // Sweep: an unmarked object is finalised (a keyword leaves the intern table
@@ -1259,11 +1562,13 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)]) -> usize {
     crate::heap::gc_finished();
     if config().debug {
         eprintln!(
-            "[gc] {} objects, {} freed, {} live, {} threads, {:.2} ms, heap {} KB",
+            "[gc] {} objects, {} freed, {} live, {} threads, {} compiled frames ({} slots), {:.2} ms, heap {} KB",
             before,
             freed,
             after,
             others.len() + 1,
+            precise_frames,
+            precise_slots,
             started.elapsed().as_secs_f64() * 1e3,
             crate::heap::used() >> 10,
         );

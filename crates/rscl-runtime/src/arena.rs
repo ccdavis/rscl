@@ -307,6 +307,12 @@ pub fn find(addr: usize) -> Option<usize> {
     used.then(|| block_addr(l, block) + slot * csize)
 }
 
+/// Is `addr` inside the part of the object heap that has been handed out?
+pub fn in_heap(addr: usize) -> bool {
+    let l = layout();
+    addr >= l.base && addr < USED_END.load(Ordering::Relaxed)
+}
+
 /// Bytes of the slot that holds the object at `addr`.
 pub fn slot_size(addr: usize) -> usize {
     let l = layout();

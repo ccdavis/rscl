@@ -117,7 +117,14 @@ impl Jit {
         for f in &ids.fns {
             let start = self.compiler.module.get_finalized_function(f.id) as usize;
             let lines = f.lines.clone();
-            rscl_runtime::trace::register_code(start, f.size as usize, &f.name, lines);
+            rscl_runtime::trace::register_code(
+                start,
+                f.size as usize,
+                &f.name,
+                lines,
+                Some(f.frames.clone()),
+                f.hidden,
+            );
         }
         let init = self.compiler.module.get_finalized_function(ids.init);
         let body = self.compiler.module.get_finalized_function(ids.body);
@@ -133,11 +140,11 @@ impl Jit {
         // Whatever earlier work left on the dead stack must not look like
         // references to the frames this unit is about to push.
         rscl_runtime::gc::clear_dead_stack();
-        let r = unsafe { (unit.init)() };
+        let r = rscl_runtime::gc::enter_compiled(|| unsafe { (unit.init)() });
         if r == value::EXC {
             return Err(EvalError::Exception(exc::take().unwrap_or(Value::NIL)));
         }
-        let r = unsafe { (unit.body)() };
+        let r = rscl_runtime::gc::enter_compiled(|| unsafe { (unit.body)() });
         if r == value::EXC {
             return Err(EvalError::Exception(exc::take().unwrap_or(Value::NIL)));
         }

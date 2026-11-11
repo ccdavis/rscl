@@ -371,7 +371,7 @@ pub fn load_lib_opt(key: &str, force: bool) -> crate::exc::RtResult<()> {
     let result = match (static_loader, dynamic) {
         (Some(f), _) => {
             let f: StaticLoader = unsafe { std::mem::transmute::<usize, StaticLoader>(f) };
-            crate::exc::check(unsafe { f() }).map(drop)
+            crate::exc::check(crate::gc::enter_compiled(|| unsafe { f() })).map(drop)
         }
         (None, Some(dynamic)) => dynamic(key),
         (None, None) => err(

@@ -49,8 +49,6 @@ macro_rules! runtime_fns {
 }
 
 runtime_fns! {
-    Retain        = "rt_retain"         => crate::ffi::rt_retain : (I64);
-    Release       = "rt_release"        => crate::ffi::rt_release : (I64);
     Throw         = "rt_throw"          => crate::exc::rt_throw : (I64) -> I64;
     TakeException = "rt_take_exception" => crate::exc::rt_take_exception : () -> I64;
     InternVar     = "rt_intern_var"     => crate::ns::rt_intern_var : (I64, I64, I64, I64) -> I64;
@@ -72,7 +70,6 @@ runtime_fns! {
     FnNew         = "rt_fn_new"         => crate::ffi::rt_fn_new : (I64, I64) -> I64;
     FnSetCapture  = "rt_fn_set_capture" => crate::ffi::rt_fn_set_capture : (I64, I64, I64);
     ThrowArity    = "rt_throw_arity"    => crate::ffi::rt_throw_arity : (I64, I64) -> I64;
-    ReleaseArgs   = "rt_release_args"   => crate::ffi::rt_release_args : (I64, I64, I64);
     Invoke        = "rt_invoke"         => crate::ffi::rt_invoke : (I64, I64, I64, I64) -> I64;
     ListFromSlice = "rt_list_from_slice" => crate::ffi::rt_list_from_slice : (I64, I64, I64) -> I64;
     VectorFromSlice = "rt_vector_from_slice" => crate::ffi::rt_vector_from_slice : (I64, I64, I64) -> I64;
@@ -95,6 +92,7 @@ runtime_fns! {
     RegisterNsLoader = "rt_register_ns_loader" => crate::ns::rt_register_ns_loader : (I64, I64, I64);
     CurrentNs     = "rt_current_ns"     => crate::ns::rt_current_ns : () -> I64;
     RegisterCode  = "rt_register_code"  => crate::trace::rt_register_code : (I64, I64, I64, I64, I64, I64, I64);
+    RegisterFrames = "rt_register_frames" => crate::trace::rt_register_frames : (I64, I64, I64, I64, I64);
     RuntimeInit   = "rt_runtime_init"   => crate::entry::rt_runtime_init : (I32, I64);
     Main          = "rt_main"           => crate::entry::rt_main : (I32, I64, I64) -> I32;
     Shutdown      = "rt_shutdown"       => crate::entry::rt_shutdown : ();
@@ -104,8 +102,6 @@ runtime_fns! {
 pub mod consts {
     pub use crate::value::{EXC, FALSE, NIL, TRUE, UNBOUND};
     pub const KIND_FN: u32 = crate::obj::Kind::Fn as u32;
-    /// `ObjHeader.rc`, then `ObjHeader.kind`.
-    pub const OFF_RC: i32 = 0;
     pub const OFF_KIND: i32 = 8;
     pub const OFF_VAR_FAST: i32 = crate::obj::var::OFF_FAST;
     pub const OFF_PROTO: i32 = crate::obj::func::OFF_PROTO;

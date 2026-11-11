@@ -8,10 +8,15 @@ use std::alloc::Layout;
 use super::{Kind, cast};
 use crate::value::{ObjHeader, Value};
 
-/// The uniform calling convention every rscl function and every builtin uses. Bit `i`
-/// of `owned` set means the callee owns `argv[i]`: it releases that reference, or
-/// moves it out (the slot is read, never written); a clear bit means the argument is
-/// borrowed from the caller. Callers that keep their arguments pass 0.
+/// The uniform calling convention every rscl function and every builtin uses.
+/// `owned` is non-zero when the argument slots belong to the callee for the
+/// duration of the call: the caller will not read them again, so the callee may
+/// overwrite them (a native that walks a sequence uses its slot as the cursor, see
+/// `core::Taker`). Compiled code always passes non-zero; a native that calls with a
+/// slice it still uses passes 0. The collector does not treat a compiled caller's
+/// argument slots as roots: the callee keeps its arguments reachable (a compiled fn
+/// loads them into its own variables before its first safepoint; a native under
+/// which a collection may run roots its argument list, see `gc::ArgRoot`).
 pub type Entry =
     unsafe extern "C" fn(f: *const FnObj, argc: i64, argv: *const Value, owned: u64) -> Value;
 

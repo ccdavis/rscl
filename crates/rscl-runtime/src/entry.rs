@@ -87,7 +87,7 @@ pub unsafe extern "C" fn rt_main(
     let entry_addr = entry as usize;
     let code = run_on_main_thread(move || {
         let f: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(entry_addr) };
-        unsafe { f() }
+        crate::gc::enter_compiled(|| unsafe { f() })
     });
     unsafe { rt_shutdown() };
     code

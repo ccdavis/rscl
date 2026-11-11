@@ -287,12 +287,16 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   (or `0`) mixes keys with a per-process secret so attacker-chosen keys cannot be
   made to collide, and a non-zero number is a fixed secret; iteration order then
   differs from the default. Any other value is reported on stderr and ignored.
-- **Roots.** The collector scans machine stacks and registers *conservatively*:
-  any word that is the address of an object keeps it alive. That covers compiled
-  code and the Rust runtime without stack maps or handles. Vars, namespaces, types,
-  protocols and compiled constants are permanent roots; the pending exception,
-  `binding` frames and argument lists passed to rscl fns by natives are roots too.
-  From the roots, objects are traced precisely.
+- **Roots.** Compiled code is scanned *precisely*: the compiler declares every
+  reference to Cranelift, which records per call site which frame slots hold live
+  references (stack maps), and the collector reads compiled frames through those
+  maps (found by walking frame pointers; x86-64). A value that is dead at a call
+  is not a root, so locals need no clearing. The frames of the Rust runtime, and
+  registers, are scanned *conservatively*: any word that is the address of an
+  object keeps it alive, which is what lets natives hold values in plain locals.
+  Vars, namespaces, types, protocols and compiled constants are permanent roots;
+  the pending exception, `binding` frames and the argument lists of calls in
+  progress are roots too. From the roots, objects are traced precisely.
 - **When.** A collection is requested when the heap has doubled since the last one
   (at least 64 MB; `RSCL_GC_MIN_MB`), and runs at the next safepoint: a fn entry, a
   loop iteration or a blocking wait, with every other thread stopped at one too.
@@ -306,18 +310,19 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   protocol and multimethod dispatch, `deref`, `require`, ...). A collection wanted
   meanwhile runs at the first safepoint after the builtin returns. The compiler
   defers collections while it analyses a form (macros run then).
-- **Lazy sequences stream.** Arguments a caller no longer needs are handed over to
-  the callee (fns receive an ownership mask beside `argc`/`argv`): the callee clears
-  the caller's argument slot, and the consuming core fns (`reduce`, `count`, `nth`,
-  `last`, `dorun`, `into`, `frequencies`) use that slot as their cursor, so
-  `(reduce + (range n))` runs in constant memory. A sequence held by a var or by a
-  local used again later is kept, as in Clojure. **Caveat**: because the stack scan
-  is conservative, a stale word in a frame can occasionally keep a sequence's head
-  (and so every realised cell) alive longer than Clojure would. The runtime works
-  against that (objects have their own address range, the dead stack is zeroed at
-  collections and before long-lived frames, thread-local storage is not scanned),
-  and the common idioms stream, but constant memory is not guaranteed for every
-  shape of code.
+- **Lazy sequences stream.** A compiled function stops holding a sequence when it
+  has no further use for it (liveness is the compiler's, through the stack maps),
+  and the consuming core fns (`reduce`, `count`, `nth`, `last`, `dorun`, `into`,
+  `frequencies`) walk a sequence handed to them using their argument slot as the
+  cursor, so `(reduce + (range n))`, `(count (map f (range n)))` and a `loop` over
+  a lazy seq run in constant memory. A sequence held by a var or by a local used
+  again later is kept, as in Clojure. Two caveats. A lazy-seq body keeps what it
+  closes over until it returns, so `(first (drop n coll))` holds the head of
+  `coll` while it skips (Clojure clears such captures). And native frames are
+  scanned conservatively, so a stale word in one can still keep a sequence's head
+  alive in unusual shapes of code (deeply nested natives calling back into rscl
+  code); the runtime works against that (see the collector's notes on dead-stack
+  clearing) but cannot rule it out.
 - Cycles need no special treatment. Keywords are interned weakly: one that nothing
   refers to is removed from the intern table when it is collected.
 - Native bridge libraries: values a library function holds on its stack are found
@@ -325,7 +330,10 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   library must not keep rscl values in its own long-lived storage.
 - Diagnostics: `RSCL_GC_DEBUG` (one line per collection), `RSCL_GC_STRESS=n`
   (collect at every n-th safepoint), `RSCL_GC_VERIFY` (check every traced
-  reference), `RSCL_GC_EXPLAIN` (report what keeps sequence cells alive).
+  reference and stack-map slot), `RSCL_GC_CHAIN` (report the longest chain of
+  live objects and the root that holds it), `RSCL_GC_EXPLAIN` (report every root
+  that refers to a sequence cell), `RSCL_GC_CONSERVATIVE` (ignore the stack maps
+  and scan compiled frames conservatively, for comparison).
 - The heap has a soft limit: `RSCL_MAX_HEAP_MB` (`0` for none), by default half of
   the physical memory or of the cgroup limit, whichever is smaller. The allocator
   keeps count of the bytes in use; the thread whose allocation crosses the limit

@@ -3,10 +3,15 @@
 //! A bridge library is a `cdylib` that exports `rscl_module_register(api) -> i32`.
 //! The runtime calls it with a pointer to its `RtApi` table; the library keeps the
 //! pointer and talks to the runtime only through it, so the process has exactly one
-//! runtime (one interning table, one refcount implementation). Values cross the
-//! boundary as raw 64-bit words: results are owned (+1); an argument is owned by the
-//! callee when its bit in the `owned` mask is set (the callee must release it) and
-//! borrowed otherwise.
+//! runtime (one interning table, one heap). Values cross the boundary as raw 64-bit
+//! words.
+//!
+//! Lifetimes: the runtime has a tracing garbage collector. A value a library
+//! function holds on its stack (or received as an argument) stays alive for the
+//! call, and collections are deferred while the function calls back into rscl
+//! code. A library must not keep values in storage of its own beyond a call: the
+//! collector does not see them there. `retain` and `release` remain in the table
+//! and do nothing.
 #![no_std]
 
 use core::ffi::c_void;
@@ -17,9 +22,10 @@ pub const API_VERSION: u32 = 4;
 /// The symbol every bridge library exports.
 pub const REGISTER_SYMBOL: &str = "rscl_module_register";
 
-/// The uniform calling convention of every rscl fn (compiled or native). Bit `i` of
-/// `owned` set means the callee owns `argv[i]` (it releases that reference, or moves
-/// it out; the slot is never written).
+/// The uniform calling convention of every rscl fn (compiled or native). `owned` is
+/// non-zero when the argument slots belong to the callee for the duration of the
+/// call (the caller will not read them again, so the callee may overwrite them),
+/// and zero when they are memory the caller still uses.
 pub type Entry =
     unsafe extern "C" fn(f: *const c_void, argc: i64, argv: *const u64, owned: u64) -> u64;
 

@@ -135,6 +135,10 @@ pub fn build(o: &BuildOptions) -> Result<(), BuildError> {
 fn object_module(o: &BuildOptions) -> Result<ObjectModule, BuildError> {
     let mut flags = settings::builder();
     flags.set("is_pic", "true").map_err(internal)?;
+    // The collector and stack traces walk frame pointers through generated code.
+    flags
+        .set("preserve_frame_pointers", "true")
+        .map_err(internal)?;
     flags
         .set("opt_level", if o.opt { "speed" } else { "none" })
         .map_err(internal)?;

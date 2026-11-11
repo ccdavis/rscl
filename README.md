@@ -107,7 +107,8 @@ call `load-native` again to pick up changes without restarting the REPL.
 
 Values are 64-bit tagged words (63-bit fixnums, immediates for nil/booleans/chars,
 pointers to heap objects). Memory is managed by a tracing garbage collector: stop-the-world
-mark and sweep over a non-moving heap, with machine stacks scanned conservatively. Every function uses
+mark and sweep over a non-moving heap; compiled frames are scanned precisely through
+Cranelift stack maps, the runtime's own frames conservatively. Every function uses
 one calling convention, `entry(fn, argc, argv) -> value`, so Rust builtins and
 compiled fns are interchangeable and `def` can rebind a var at any time. Exceptions
 are a sentinel return value checked after every call; nothing unwinds across the

@@ -83,12 +83,12 @@ pub fn live_objects() -> i64 {
 #[repr(transparent)]
 pub struct Value(u64);
 
-/// A borrowed reference to an rscl value: same bits, no `Drop`.
+/// A value as an FFI parameter: the same word, `Copy`.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct VRef(u64);
 
-// Heap objects are either immutable or internally synchronised; refcounts are atomic.
+// Heap objects are either immutable or internally synchronised.
 unsafe impl Send for Value {}
 unsafe impl Sync for Value {}
 unsafe impl Send for VRef {}
@@ -167,7 +167,7 @@ impl Value {
     pub fn double(d: f64) -> Value {
         obj::double::new(d)
     }
-    /// Wrap a freshly allocated heap object (refcount already 1).
+    /// Wrap a freshly allocated heap object.
     #[inline]
     pub(crate) fn from_obj<T>(p: *mut T) -> Value {
         debug_assert!(!p.is_null() && (p as u64) & 0b11 == 0);
@@ -293,20 +293,6 @@ impl Value {
             None
         }
     }
-
-    /// Another reference to the same value (kept from the reference-counting days;
-    /// identical to `clone`).
-    #[inline]
-    pub fn retain(&self) -> Value {
-        Value(self.0)
-    }
-
-    /// Formerly dropped a reference; the collector owns lifetimes now.
-    ///
-    /// # Safety
-    /// None required; kept `unsafe` for source compatibility.
-    #[inline]
-    pub unsafe fn release_raw(_bits: u64) {}
 }
 
 impl Clone for Value {

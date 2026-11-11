@@ -1,14 +1,20 @@
 //! `Node` → Cranelift IR, generic over `cranelift_module::Module` so the same code
 //! serves the JIT and the AOT object writer.
 //!
-//! Invariants (see the plan): no raw address is embedded in IR; every call is followed
-//! by an `EXC` check whose cleanup path releases every live owned operand; operands
-//! carry their ownership (`Own`) and consumers decide whether to retain or release.
+//! Invariants: no raw address is embedded in IR, and every call that can throw is
+//! followed by an `EXC` check.
+//!
+//! Memory: the runtime has a tracing collector, so generated code neither counts
+//! references nor cleans up on exception paths. What it owes the collector is to
+//! say where its references are: every tagged value that may be a heap pointer is
+//! declared to Cranelift (`FnCtx::gc`, and every value variable), which keeps the
+//! ones that are live across a call in stack slots and lists those slots in the
+//! call's stack map. The maps are handed to the runtime with the code (see
+//! `FrameInfo`), and the collector reads compiled frames through them, precisely:
+//! a value that is dead at a call is not a root. Liveness is Cranelift's, so there
+//! is no locals-clearing pass here.
 use std::collections::HashMap;
 use std::rc::Rc;
-
-mod liveness;
-use liveness::Liveness;
 
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -32,7 +38,8 @@ use crate::errors::{CResult, CompileError};
 pub struct UnitIds {
     pub init: FuncId,
     pub body: FuncId,
-    /// The `fn*` functions compiled for this unit (for stack-trace registration).
+    /// Every function compiled for this unit, `init` and `body` included (to be
+    /// registered with the runtime: stack traces and the collector's frame maps).
     pub fns: Vec<CompiledFn>,
 }
 
@@ -43,9 +50,14 @@ pub struct CompiledFn {
     pub size: u32,
     /// Source positions of the calls in the code (for stack traces).
     pub lines: Vec<LineEntry>,
+    /// Where the function's frames keep their references at each call.
+    pub frames: FrameInfo,
+    /// Not an rscl fn (a unit's `init` or `body`, a loader): left out of stack
+    /// traces.
+    pub hidden: bool,
 }
 
-pub use rscl_runtime::trace::Line as LineEntry;
+pub use rscl_runtime::trace::{FrameInfo, Line as LineEntry};
 
 pub struct Compiler<M: Module> {
     pub module: M,
@@ -56,7 +68,7 @@ pub struct Compiler<M: Module> {
     next_unit: u32,
     /// The runtime's `rscl_interrupt_flag` (an imported data symbol).
     flag_id: Option<DataId>,
-    /// Every `fn*` compiled into this module (AOT registers them for stack traces).
+    /// Every function compiled into this module (AOT registers them at start-up).
     registered_fns: Vec<CompiledFn>,
     /// Remember every compiled fn for `compile_entry` (AOT builds).
     pub keep_fns: bool,
@@ -271,10 +283,10 @@ impl<M: Module> Compiler<M> {
             fc.b.seal_block(entry);
             fc.start(0, &[])?;
             let fail = fc.b.create_block();
-            run_step(fc, own_init, fail, false);
+            run_step(fc, own_init, fail);
             for unit in units {
-                run_step(fc, unit.init, fail, false);
-                run_step(fc, unit.body, fail, true);
+                run_step(fc, unit.init, fail);
+                run_step(fc, unit.body, fail);
             }
             let zero = fc.b.ins().iconst(types::I64, 0);
             fc.b.ins().return_(&[zero]);
@@ -377,31 +389,40 @@ impl<M: Module> Compiler<M> {
             fc.b.seal_block(entry);
             fc.start(0, &[])?;
             let fail = fc.b.create_block();
-            run_step(fc, own_init, fail, false);
-            // Code ranges of every compiled fn, with the source positions of their
-            // calls, so exceptions carry traces with file and line.
+            run_step(fc, own_init, fail);
+            // Every compiled function is registered with the runtime: its code
+            // range, the source positions of its calls (so exceptions carry traces
+            // with file and line), and its frame maps (for the collector).
             for f in &fns {
                 let fref = fc.func_ref(f.id);
                 let addr = fc.b.ins().func_addr(types::I64, fref);
                 let size = fc.b.ins().iconst(types::I64, f.size as i64);
-                let (np, nl) = fc.blob_ptr(&f.name);
-                // Entries: start, end, line, col, file offset, file length (u32 each).
-                let mut bytes = Vec::with_capacity(f.lines.len() * 24);
-                for l in &f.lines {
-                    let (fo, fl) = fc.unit.blob_str(&l.file);
-                    for x in [l.start, l.end, l.line, l.col, fo as u32, fl as u32] {
-                        bytes.extend_from_slice(&x.to_le_bytes());
+                if !f.hidden {
+                    let (np, nl) = fc.blob_ptr(&f.name);
+                    // Entries: start, end, line, col, file offset, file length (u32
+                    // each).
+                    let mut bytes = Vec::with_capacity(f.lines.len() * 24);
+                    for l in &f.lines {
+                        let (fo, fl) = fc.unit.blob_str(&l.file);
+                        for x in [l.start, l.end, l.line, l.col, fo as u32, fl as u32] {
+                            bytes.extend_from_slice(&x.to_le_bytes());
+                        }
                     }
+                    let off = fc.unit.blob_bytes(&bytes);
+                    let entries = fc.b.ins().iadd_imm_s(fc.blob_base, off);
+                    let n = fc.b.ins().iconst(types::I64, f.lines.len() as i64);
+                    let base = fc.blob_base;
+                    fc.call_rt(RtFn::RegisterCode, &[addr, size, np, nl, base, entries, n]);
                 }
-                let off = fc.unit.blob_bytes(&bytes);
-                let entries = fc.b.ins().iadd_imm_s(fc.blob_base, off);
-                let n = fc.b.ins().iconst(types::I64, f.lines.len() as i64);
-                let base = fc.blob_base;
-                fc.call_rt(RtFn::RegisterCode, &[addr, size, np, nl, base, entries, n]);
+                let off = fc.unit.blob_bytes(&f.frames.encode());
+                let table = fc.b.ins().iadd_imm_s(fc.blob_base, off);
+                let hidden = fc.b.ins().iconst(types::I64, i64::from(f.hidden));
+                let fp_to_sp = fc.b.ins().iconst(types::I64, f.frames.fp_to_sp as i64);
+                fc.call_rt(RtFn::RegisterFrames, &[addr, size, hidden, fp_to_sp, table]);
             }
             for unit in core_units {
-                run_step(fc, unit.init, fail, false);
-                run_step(fc, unit.body, fail, true);
+                run_step(fc, unit.init, fail);
+                run_step(fc, unit.body, fail);
             }
             for (key, f) in loaders {
                 let (np, nl) = fc.blob_ptr(key);
@@ -410,8 +431,8 @@ impl<M: Module> Compiler<M> {
                 fc.call_rt(RtFn::RegisterNsLoader, &[np, nl, addr]);
             }
             for unit in main_units {
-                run_step(fc, unit.init, fail, false);
-                run_step(fc, unit.body, fail, true);
+                run_step(fc, unit.init, fail);
+                run_step(fc, unit.body, fail);
             }
             let var = fc.const_slot(ConstEntry::Var(main_ns.clone(), "-main".to_string()));
             let code = fc.call_rt(RtFn::RunMain, &[var]).unwrap();
@@ -490,10 +511,6 @@ impl<M: Module> Compiler<M> {
             )?;
             match body(&mut fc) {
                 Ok(()) => {
-                    debug_assert!(
-                        fc.cleanup.is_empty(),
-                        "owned-temporary stack not empty at exit of {name}"
-                    );
                     let config = fc.module.target_config();
                     fc.b.finalize(config);
                     None
@@ -522,50 +539,74 @@ impl<M: Module> Compiler<M> {
                     0,
                 )
             })?;
-        if record {
-            let (size, lines) = match ctx.compiled_code() {
-                Some(c) => {
-                    let lines = c
-                        .buffer
-                        .get_srclocs_sorted()
-                        .iter()
-                        .filter_map(|l| {
-                            // `compile` has already applied the function's base
-                            // location, but tolerate a relative one.
-                            let loc = if l.loc.is_rel() {
-                                l.loc.relocate(ctx.func.params.base_srcloc())
-                            } else {
-                                l.loc.as_abs()
-                            };
-                            if loc.is_default() {
-                                return None;
-                            }
-                            let (file, line, col) = u.positions.get(loc.bits() as usize - 1)?;
-                            Some(LineEntry {
-                                start: l.start,
-                                end: l.end,
-                                file: file.clone(),
-                                line: *line,
-                                col: *col,
-                            })
+        let (size, lines, frames) = match ctx.compiled_code() {
+            Some(c) => {
+                let lines = c
+                    .buffer
+                    .get_srclocs_sorted()
+                    .iter()
+                    .filter_map(|l| {
+                        // `compile` has already applied the function's base
+                        // location, but tolerate a relative one.
+                        let loc = if l.loc.is_rel() {
+                            l.loc.relocate(ctx.func.params.base_srcloc())
+                        } else {
+                            l.loc.as_abs()
+                        };
+                        if loc.is_default() {
+                            return None;
+                        }
+                        let (file, line, col) = u.positions.get(loc.bits() as usize - 1)?;
+                        Some(LineEntry {
+                            start: l.start,
+                            end: l.end,
+                            file: file.clone(),
+                            line: *line,
+                            col: *col,
                         })
-                        .collect();
-                    (c.code_info().total_size, lines)
+                    })
+                    .collect();
+                // Every call site, with the frame slots that hold live references
+                // there (none for a call no reference is live across).
+                let mut sites: Vec<(u32, Vec<u32>)> = c
+                    .buffer
+                    .call_sites()
+                    .map(|s| (s.ret_addr, Vec::new()))
+                    .collect();
+                sites.sort_by_key(|s| s.0);
+                sites.dedup_by_key(|s| s.0);
+                for (ret, _, map) in c.buffer.user_stack_maps() {
+                    let slots: Vec<u32> = map.entries().map(|(_, off)| off).collect();
+                    match sites.binary_search_by_key(ret, |s| s.0) {
+                        Ok(i) => sites[i].1 = slots,
+                        Err(i) => sites.insert(i, (*ret, slots)),
+                    }
                 }
-                None => (0, Vec::new()),
-            };
-            let f = CompiledFn {
-                id: func_id,
-                name: name.to_string(),
-                size,
-                lines,
-            };
-            // Only an AOT build registers every fn again in the program's entry.
-            if self.keep_fns {
-                self.registered_fns.push(f.clone());
+                let fp_to_sp = c
+                    .buffer
+                    .frame_layout()
+                    .map_or(u32::MAX, |l| l.frame_to_fp_offset);
+                (
+                    c.code_info().total_size,
+                    lines,
+                    FrameInfo { fp_to_sp, sites },
+                )
             }
-            u.fns.push(f);
+            None => (0, Vec::new(), FrameInfo::default()),
+        };
+        let f = CompiledFn {
+            id: func_id,
+            name: name.to_string(),
+            size,
+            lines: if record { lines } else { Vec::new() },
+            frames,
+            hidden: !record,
+        };
+        // Only an AOT build registers every function again in the program's entry.
+        if self.keep_fns {
+            self.registered_fns.push(f.clone());
         }
+        u.fns.push(f);
         self.module.clear_context(&mut ctx);
         Ok(())
     }
@@ -588,10 +629,8 @@ impl<M: Module> Compiler<M> {
             fc.b.switch_to_block(entry);
             fc.b.seal_block(entry);
             fc.start(argv_cap, locals)?;
-            fc.liveness = liveness::last_uses(node);
-            let op = fc.compile(node)?;
-            let op = fc.make_owned(op);
-            fc.b.ins().return_(&[op.val]);
+            let v = fc.compile(node)?;
+            fc.b.ins().return_(&[v]);
             Ok(())
         })?;
         Ok(id)
@@ -619,29 +658,10 @@ impl<M: Module> Compiler<M> {
             fc.b.seal_block(entry);
             let params = fc.b.block_params(entry).to_vec();
             let (fv, argc, argv, owned) = (params[0], params[1], params[2], params[3]);
+            fc.gc(fv);
             fc.start(argv_cap, locals)?;
-            for a in &f.arities {
-                fc.liveness.extend(liveness::last_uses(&a.body));
-            }
-            // Stack-depth and interrupt guard. No locals are bound yet, but the
-            // arguments the caller handed over must still be released on failure.
-            let sp = fc.b.ins().get_stack_pointer(types::I64);
-            fc.srcloc(f.pos);
-            let guard = fc.call_rt(RtFn::StackCheck, &[sp]).unwrap();
-            fc.srcloc(0);
-            let is_exc =
-                fc.b.ins()
-                    .icmp_imm_s(IntCC::Equal, guard, api::consts::EXC as i64);
-            let fail = fc.b.create_block();
-            let ok = fc.b.create_block();
-            fc.b.ins().brif(is_exc, fail, &[], ok, &[]);
-            fc.b.switch_to_block(fail);
-            fc.b.seal_block(fail);
-            fc.b.ins().return_(&[guard]);
-            fc.b.switch_to_block(ok);
-            fc.b.seal_block(ok);
 
-            // Captures live in the fn object; the fn object is alive for the whole call.
+            // Captures live in the fn object.
             for (i, id) in f.captures.iter().enumerate() {
                 let v = fc.b.ins().load(
                     types::I64,
@@ -649,10 +669,10 @@ impl<M: Module> Compiler<M> {
                     fv,
                     api::consts::OFF_CAPTURES + 8 * i as i32,
                 );
-                fc.bind_local(*id, v, false);
+                fc.bind_local(*id, v);
             }
             if let Some(sl) = f.self_local {
-                fc.bind_local(sl, fv, false);
+                fc.bind_local(sl, fv);
             }
 
             // Arity dispatch.
@@ -800,7 +820,7 @@ impl<M: Module> Compiler<M> {
 }
 
 /// Call a `() -> i64` unit function and branch to `fail` on `EXC`.
-fn run_step<M: Module>(fc: &mut FnCtx<'_, M>, f: FuncId, fail: Block, release_result: bool) {
+fn run_step<M: Module>(fc: &mut FnCtx<'_, M>, f: FuncId, fail: Block) {
     let fref = fc.func_ref(f);
     let inst = fc.b.ins().call(fref, &[]);
     let v = fc.b.inst_results(inst)[0];
@@ -811,8 +831,6 @@ fn run_step<M: Module>(fc: &mut FnCtx<'_, M>, f: FuncId, fail: Block, release_re
     fc.b.ins().brif(is_exc, fail, &[], cont, &[]);
     fc.b.switch_to_block(cont);
     fc.b.seal_block(cont);
-    // (The collector owns lifetimes: an unused result is simply dropped.)
-    let _ = (release_result, v);
 }
 
 /// Largest argument list (call or collection literal) in a function body, not
@@ -868,86 +886,11 @@ fn inline_op(desc: &BuiltinDesc, argc: usize) -> Option<PrimOp> {
 
 // ---- per-function state --------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Own {
-    /// An immediate (nil, bool, char, fixnum): refcounting is a no-op.
-    Imm,
-    /// Belongs to someone else (a local, a capture, a constant table entry).
-    Borrowed,
-    /// A +1 reference the holder must release or hand over.
-    Owned,
-    /// A parameter passed on at its last use: owned exactly when the caller handed
-    /// it over, which the runtime flag (non-zero: owned) records. Flows into the
-    /// callee's mask unchanged, so pass-through of a borrowed argument costs nothing.
-    Cond(Value),
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Operand {
-    val: Value,
-    own: Own,
-}
-
-impl Operand {
-    fn imm(val: Value) -> Self {
-        Operand { val, own: Own::Imm }
-    }
-    fn borrowed(val: Value) -> Self {
-        Operand {
-            val,
-            own: Own::Borrowed,
-        }
-    }
-    fn owned(val: Value) -> Self {
-        Operand {
-            val,
-            own: Own::Owned,
-        }
-    }
-}
-
-// The fields record what the entries stood for when cleanup code was emitted for
-// them; with the tracing collector nothing is emitted, so some are never read.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-enum Cleanup {
-    Val(Value),
-    Var(Variable),
-    /// A parameter: owned only when its bit is set in the function's ownership mask.
-    Param(Variable, u64),
-    /// An already-read parameter value with its mask bit.
-    ValIf(Value, u64),
-    /// A temporary owned when the flag value is non-zero (`Own::Cond`).
-    ValIfFlag(Value, Value),
-}
-
-/// How a value slot owns its contents.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Owning {
-    /// Borrowed from elsewhere (a capture, the fn object itself).
-    No,
-    /// A +1 reference released at the end of the scope.
-    Yes,
-    /// A parameter: owned when its bit is set in the function's ownership mask.
-    Param(u64),
-}
-
-#[derive(Clone, Copy)]
-struct LoopVar {
-    var: Variable,
-    /// Primitive loop variables hold raw bits.
-    ty: Ty,
-    /// For fn parameters: the bit in the ownership mask (set once `recur` rebinds).
-    param_bit: Option<u64>,
-}
-
 #[derive(Clone)]
 struct LoopCtx {
     header: Block,
-    vars: Vec<LoopVar>,
-    /// `cleanup.len()` right after the loop variables were bound: everything above it
-    /// was bound or produced inside the body and must be released before `recur`.
-    depth: usize,
+    /// The loop variables in binding order. Primitive ones hold raw bits.
+    vars: Vec<(Variable, Ty)>,
 }
 
 #[derive(Clone, Copy)]
@@ -955,7 +898,6 @@ struct Slot {
     var: Variable,
     /// `Val`: a tagged value. `Long`/`Double`: raw `i64`/`f64` in the variable.
     ty: Ty,
-    owning: Owning,
 }
 
 fn raw_type(ty: Ty) -> cranelift_codegen::ir::Type {
@@ -975,7 +917,6 @@ struct FnCtx<'a, M: Module> {
     builtin_refs: HashMap<&'static str, FuncRef>,
     func_refs: HashMap<FuncId, FuncRef>,
     locals: HashMap<LocalId, Slot>,
-    cleanup: Vec<Cleanup>,
     loops: HashMap<LoopId, LoopCtx>,
     fn_recur: Option<LoopCtx>,
     argv_slot: Option<StackSlot>,
@@ -985,26 +926,13 @@ struct FnCtx<'a, M: Module> {
     /// The analyzer's locals table (names for diagnostics, types for inference).
     local_infos: Vec<LocalInfo>,
     ty_cache: TyCache,
-    /// Last uses of locals (see `liveness`): the value is transferred out and the
-    /// variable cleared.
-    liveness: Liveness,
     /// Position of the primitive operation being compiled (for its error path).
     prim_pos: u32,
-    /// The `owned` argument mask, as a variable so `recur` can set bits.
-    owned_mask: Option<Variable>,
-    /// Active `try` handlers, innermost last.
-    handlers: Vec<Handler>,
+    /// Handler blocks of the active `try`s, innermost last.
+    handlers: Vec<Block>,
     flag_id: DataId,
     flag_addr: Option<Value>,
     scratch: Option<StackSlot>,
-}
-
-#[derive(Clone, Copy)]
-struct Handler {
-    block: Block,
-    /// `cleanup.len()` when the try was entered: entries above it are released on
-    /// the way to the handler, entries below stay live.
-    depth: usize,
 }
 
 impl<'a, M: Module> FnCtx<'a, M> {
@@ -1029,7 +957,6 @@ impl<'a, M: Module> FnCtx<'a, M> {
             builtin_refs: HashMap::new(),
             func_refs: HashMap::new(),
             locals: HashMap::new(),
-            cleanup: Vec::new(),
             loops: HashMap::new(),
             fn_recur: None,
             argv_slot: None,
@@ -1038,9 +965,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
             call_sig,
             local_infos: Vec::new(),
             ty_cache: TyCache::new(),
-            liveness: Liveness::default(),
             prim_pos: 0,
-            owned_mask: None,
             handlers: Vec::new(),
             flag_id,
             flag_addr: None,
@@ -1201,129 +1126,49 @@ impl<'a, M: Module> FnCtx<'a, M> {
         }
     }
 
-    fn imm(&mut self, bits: u64) -> Operand {
-        Operand::imm(self.b.ins().iconst(types::I64, bits as i64))
+    fn imm(&mut self, bits: u64) -> Value {
+        self.b.ins().iconst(types::I64, bits as i64)
     }
 
-    // ---- ownership helpers --------------------------------------------------------
+    // ---- values and the collector ---------------------------------------------------
 
-    fn release(&mut self, op: Operand) {
-        match op.own {
-            Own::Owned => self.emit_release(op.val),
-            Own::Cond(flag) => self.emit_release_if(flag, op.val),
-            _ => {}
-        }
+    /// Declare `v` a reference the collector must find: wherever it is live across a
+    /// call, Cranelift keeps it in a stack slot that the call's stack map lists.
+    /// Every tagged value that may be a heap pointer goes through here (immediates
+    /// and compile-time constants, which are permanent, need not).
+    fn gc(&mut self, v: Value) -> Value {
+        self.b.declare_value_needs_stack_map(v);
+        v
     }
 
-    /// Turn a borrowed operand into an owned one (+1). Immediates stay immediate.
-    fn make_owned(&mut self, op: Operand) -> Operand {
-        match op.own {
-            Own::Borrowed => {
-                self.emit_retain(op.val);
-                Operand::owned(op.val)
-            }
-            Own::Cond(flag) => {
-                self.emit_retain_if_not(flag, op.val);
-                Operand::owned(op.val)
-            }
-            _ => op,
-        }
+    /// The `owned` argument of a call from compiled code: the argument slots belong
+    /// to the callee for the duration of the call (this code never reads them again).
+    fn scratch_args(&mut self) -> Value {
+        self.b.ins().iconst(types::I64, -1)
     }
 
-    /// Reference counting is gone (the runtime has a tracing collector, see
-    /// `rscl-runtime/src/gc.rs`): the ownership bookkeeping of this module is kept as
-    /// a record of which values are temporaries, but emits no code.
-    fn emit_release(&mut self, _v: Value) {}
-
-    fn emit_retain(&mut self, _v: Value) {}
-
-    /// Like `make_owned` but the result is always tagged `Owned`, for storage in a
-    /// slot whose later contents may be heap values (loop variables, var roots).
-    fn make_owned_force(&mut self, op: Operand) -> Operand {
-        let op = self.make_owned(op);
-        Operand::owned(op.val)
-    }
-
-    fn push_tmp(&mut self, op: Operand) {
-        match op.own {
-            Own::Owned => self.cleanup.push(Cleanup::Val(op.val)),
-            Own::Cond(flag) => self.cleanup.push(Cleanup::ValIfFlag(op.val, flag)),
-            _ => {}
-        }
-    }
-
-    fn pop_tmp(&mut self, op: Operand) {
-        if matches!(op.own, Own::Owned | Own::Cond(_)) {
-            let top = self.cleanup.pop();
-            debug_assert!(
-                matches!(top, Some(Cleanup::Val(v) | Cleanup::ValIfFlag(v, _)) if v == op.val),
-                "owned-temporary stack mismatch"
-            );
-        }
-    }
-
-    fn bind_local(&mut self, id: LocalId, val: Value, owned: bool) -> Variable {
+    fn bind_local(&mut self, id: LocalId, val: Value) -> Variable {
         let var = self.b.declare_var(types::I64);
+        self.b.declare_var_needs_stack_map(var);
         self.b.def_var(var, val);
-        let owning = if owned { Owning::Yes } else { Owning::No };
-        self.locals.insert(
-            id,
-            Slot {
-                var,
-                ty: Ty::Val,
-                owning,
-            },
-        );
-        if owned {
-            self.cleanup.push(Cleanup::Var(var));
-        }
+        self.locals.insert(id, Slot { var, ty: Ty::Val });
         var
     }
 
-    /// Bind parameter `j`, owned when bit `j` of the function's mask is set.
-    fn bind_param(&mut self, id: LocalId, val: Value, j: usize) -> Variable {
-        let var = self.b.declare_var(types::I64);
-        self.b.def_var(var, val);
-        let bit = 1u64 << j;
-        self.locals.insert(
-            id,
-            Slot {
-                var,
-                ty: Ty::Val,
-                owning: Owning::Param(bit),
-            },
-        );
-        self.cleanup.push(Cleanup::Param(var, bit));
-        var
-    }
-
-    /// `mask & bit != 0` for the function's ownership mask.
-    fn owned_bit(&mut self, bit: u64) -> Value {
-        let mask = self.owned_mask.expect("ownership mask");
-        let m = self.b.use_var(mask);
-        self.b.ins().band_imm_s(m, bit as i64)
-    }
-
-    /// Bind a primitive local holding raw bits (no refcounting).
+    /// Bind a primitive local holding raw bits (not a reference).
     fn bind_typed(&mut self, id: LocalId, raw: Value, ty: Ty) -> Variable {
         let var = self.b.declare_var(raw_type(ty));
         self.b.def_var(var, raw);
-        self.locals.insert(
-            id,
-            Slot {
-                var,
-                ty,
-                owning: Owning::No,
-            },
-        );
+        self.locals.insert(id, Slot { var, ty });
         var
     }
 
-    fn release_cleanups(&mut self, _items: &[Cleanup]) {}
-
-    fn emit_release_if(&mut self, _flag: Value, _v: Value) {}
-
-    fn emit_retain_if_not(&mut self, _flag: Value, _v: Value) {}
+    /// End of a binding scope.
+    fn unbind(&mut self, vars: &[(LocalId, Variable)]) {
+        for (id, _) in vars {
+            self.locals.remove(id);
+        }
+    }
 
     fn slot(&self, id: LocalId) -> CResult<Slot> {
         self.locals.get(&id).copied().ok_or_else(|| {
@@ -1346,49 +1191,22 @@ impl<'a, M: Module> FnCtx<'a, M> {
         ty_of_memo(node, &self.local_infos, &mut self.ty_cache)
     }
 
-    /// A local as a tagged value, boxing a primitive one. At the local's last use
-    /// (`at`: the using node) an owned value is transferred out and the variable
-    /// cleared, so the function stops holding it.
-    fn read_local(&mut self, at: usize, id: LocalId) -> CResult<Operand> {
+    /// A local as a tagged value, boxing a primitive one.
+    fn read_local(&mut self, id: LocalId) -> CResult<Value> {
         let slot = self.slot(id)?;
         let raw = self.b.use_var(slot.var);
-        if slot.ty != Ty::Val {
-            return Ok(self.box_raw(raw, slot.ty));
-        }
-        if self.liveness.retain.contains(&(at, id)) {
-            // Pending as an argument while a later argument transfers this local.
-            return Ok(self.make_owned(Operand::borrowed(raw)));
-        }
-        if !self.liveness.last.contains(&(at, id)) {
-            return Ok(Operand::borrowed(raw));
-        }
-        match slot.owning {
-            Owning::No => Ok(Operand::borrowed(raw)),
-            Owning::Yes => {
-                let nil = self.b.ins().iconst(types::I64, 0);
-                self.b.def_var(slot.var, nil);
-                Ok(Operand::owned(raw))
-            }
-            Owning::Param(bit) => {
-                // Owned exactly when the caller handed it over; the flag travels with
-                // the value, so a borrowed argument is passed on without refcounting.
-                let f = self.owned_bit(bit);
-                let nil = self.b.ins().iconst(types::I64, 0);
-                self.b.def_var(slot.var, nil);
-                Ok(Operand {
-                    val: raw,
-                    own: Own::Cond(f),
-                })
-            }
-        }
+        Ok(self.box_raw(raw, slot.ty))
     }
 
     // ---- primitives -----------------------------------------------------------------
 
     /// Box raw bits: a fixnum when it fits (no allocation), else a heap number.
-    fn box_raw(&mut self, raw: Value, ty: Ty) -> Operand {
+    fn box_raw(&mut self, raw: Value, ty: Ty) -> Value {
         match ty {
-            Ty::Double => Operand::owned(self.call_rt(RtFn::BoxDouble, &[raw]).unwrap()),
+            Ty::Double => {
+                let v = self.call_rt(RtFn::BoxDouble, &[raw]).unwrap();
+                self.gc(v)
+            }
             Ty::Long => {
                 let shifted = self.b.ins().ishl_imm_s(raw, 1);
                 let back = self.b.ins().sshr_imm_s(shifted, 1);
@@ -1408,17 +1226,17 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 self.b.ins().jump(merge, &[BlockArg::Value(boxed)]);
                 self.b.switch_to_block(merge);
                 self.b.seal_block(merge);
-                Operand::owned(self.b.block_params(merge)[0])
+                let v = self.b.block_params(merge)[0];
+                self.gc(v)
             }
-            Ty::Val => Operand::borrowed(raw),
+            Ty::Val => raw,
         }
     }
 
     /// Unbox a tagged value into raw bits of `want`, throwing `ClassCastException`
     /// for non-numbers. Fixnums are converted inline; everything else goes through
-    /// the runtime. Consumes `op`.
-    fn unbox(&mut self, op: Operand, want: Ty, strict: bool) -> CResult<Value> {
-        let v = op.val;
+    /// the runtime.
+    fn unbox(&mut self, v: Value, want: Ty, strict: bool) -> CResult<Value> {
         let is_fix = self.b.ins().band_imm_s(v, 1);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
@@ -1440,7 +1258,6 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.b.seal_block(slow);
         let slot = self.scratch_slot();
         let out = self.b.ins().stack_addr(types::I64, slot, 0);
-        self.push_tmp(op);
         let r = if want == Ty::Double {
             self.call_rt(RtFn::UnboxDouble, &[v, out]).unwrap()
         } else {
@@ -1448,15 +1265,12 @@ impl<'a, M: Module> FnCtx<'a, M> {
             self.call_rt(RtFn::UnboxLong, &[v, out, s]).unwrap()
         };
         self.check_exc(r);
-        self.pop_tmp(op);
         let loaded = self.b.ins().stack_load(types::I64, raw_type(want), slot, 0);
         self.b.ins().jump(merge, &[BlockArg::Value(loaded)]);
 
         self.b.switch_to_block(merge);
         self.b.seal_block(merge);
-        let r = self.b.block_params(merge)[0];
-        self.release(op);
-        Ok(r)
+        Ok(self.b.block_params(merge)[0])
     }
 
     /// Convert raw bits between primitive types (`Long` widens to `Double`; a double
@@ -1554,15 +1368,14 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 return Ok(self.b.block_params(merge)[0]);
             }
             Node::Let { bindings, body } => {
-                let vars = self.bind_all(bindings, false)?;
+                let vars = self.bind_all(bindings)?;
                 let r = self.compile_typed(body, want)?;
-                self.release_locals(&vars);
+                self.unbind(&vars);
                 return Ok(r);
             }
             Node::Do(nodes) if !nodes.is_empty() => {
                 for n in &nodes[..nodes.len() - 1] {
-                    let op = self.compile(n)?;
-                    self.release(op);
+                    self.compile(n)?;
                 }
                 return self.compile_typed(&nodes[nodes.len() - 1], want);
             }
@@ -1591,31 +1404,25 @@ impl<'a, M: Module> FnCtx<'a, M> {
     /// Evaluate operands left to right to raw bits of `want`: statically primitive ones
     /// directly, the rest as values that are unboxed only after every operand has been
     /// evaluated, so a `ClassCastException` surfaces at the same point as in the
-    /// builtin. Unboxing runs newest first, keeping the earlier operands protected on
-    /// the temporary stack while a later one may throw.
+    /// builtin.
     fn prim_args(&mut self, args: &[Node], want: Ty) -> CResult<Vec<Value>> {
         enum Pre {
             Raw(Value),
-            Boxed(Operand),
+            Boxed(Value),
         }
         let mut pre = Vec::with_capacity(args.len());
         for a in args {
-            if self.ty_of(a) != Ty::Val {
-                pre.push(Pre::Raw(self.compile_typed(a, want)?));
+            pre.push(if self.ty_of(a) != Ty::Val {
+                Pre::Raw(self.compile_typed(a, want)?)
             } else {
-                let op = self.compile(a)?;
-                self.push_tmp(op);
-                pre.push(Pre::Boxed(op));
-            }
+                Pre::Boxed(self.compile(a)?)
+            });
         }
         let mut out: Vec<Option<Value>> = vec![None; pre.len()];
         for (i, p) in pre.into_iter().enumerate().rev() {
             out[i] = Some(match p {
                 Pre::Raw(v) => v,
-                Pre::Boxed(op) => {
-                    self.pop_tmp(op);
-                    self.unbox(op, want, want == Ty::Long)?
-                }
+                Pre::Boxed(v) => self.unbox(v, want, want == Ty::Long)?,
             });
         }
         Ok(out.into_iter().map(|v| v.expect("operand")).collect())
@@ -1816,8 +1623,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
             if tys[0] != tys[1] {
                 // Evaluate for effects; a long and a double are never `=`.
                 for a in args {
-                    let o = self.compile(a)?;
-                    self.release(o);
+                    self.compile(a)?;
                 }
                 let r = i64::from(op == PrimOp::Ne);
                 return Ok(Some(self.b.ins().iconst(types::I8, r)));
@@ -1844,27 +1650,8 @@ impl<'a, M: Module> FnCtx<'a, M> {
         }
     }
 
-    /// Release and forget owned locals in reverse order of binding.
-    fn release_locals(&mut self, vars: &[(LocalId, Variable, bool)]) {
-        let mut items = Vec::new();
-        for (id, var, owned) in vars.iter().rev() {
-            if *owned {
-                let top = self.cleanup.pop();
-                debug_assert!(
-                    matches!(top, Some(Cleanup::Var(v) | Cleanup::Param(v, _)) if v == *var),
-                    "cleanup stack mismatch"
-                );
-                if let Some(c) = top {
-                    items.push(c);
-                }
-            }
-            self.locals.remove(id);
-        }
-        self.release_cleanups(&items);
-    }
-
-    /// After a call: branch to a cleanup block that releases every live owned operand
-    /// and propagates `EXC`.
+    /// After a call: on `EXC`, continue at the innermost `try` handler, or return
+    /// `EXC` from the function. Nothing needs cleaning up on the way.
     fn check_exc(&mut self, r: Value) {
         let is_exc = self
             .b
@@ -1880,17 +1667,10 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.b.seal_block(cont);
     }
 
-    /// An exception is pending (`r == EXC`): release what the current path owns and
-    /// continue at the innermost `try` handler, or return `EXC` from the function.
-    /// Ends the current block.
+    /// An exception is pending (`r == EXC`): go to the innermost `try` handler, or
+    /// return `EXC`. Ends the current block.
     fn emit_exc_path(&mut self, r: Value) {
-        let (floor, target) = match self.handlers.last().copied() {
-            Some(h) => (h.depth, Some(h.block)),
-            None => (0, None),
-        };
-        let items: Vec<Cleanup> = self.cleanup[floor..].iter().rev().copied().collect();
-        self.release_cleanups(&items);
-        match target {
+        match self.handlers.last().copied() {
             Some(block) => {
                 self.b.ins().jump(block, &[]);
             }
@@ -1907,7 +1687,8 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.b.seal_block(dead);
     }
 
-    /// Loop-header check of the interrupt flag (one byte load and branch).
+    /// Loop-header check of the interrupt flag (one byte load and branch). The slow
+    /// path is a safepoint: a collection may run there.
     fn emit_interrupt_check(&mut self) {
         let addr = self.interrupt_flag_addr();
         let flag = self
@@ -1934,16 +1715,27 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
     // ---- nodes --------------------------------------------------------------------
 
-    fn compile(&mut self, node: &Node) -> CResult<Operand> {
+    /// Evaluate `node` to a tagged value.
+    fn compile(&mut self, node: &Node) -> CResult<Value> {
+        let v = self.compile_node(node)?;
+        // Constants are permanent objects and vars too; everything else may be a
+        // reference to an object only this frame keeps alive.
+        if !matches!(node, Node::Const(_) | Node::TheVar(_)) {
+            self.gc(v);
+        }
+        Ok(v)
+    }
+
+    fn compile_node(&mut self, node: &Node) -> CResult<Value> {
         match node {
             Node::Const(v) => self.compile_const(v),
-            Node::Local(id) => self.read_local(node as *const Node as usize, *id),
+            Node::Local(id) => self.read_local(*id),
             Node::VarRef(v) => {
                 let var = v.get();
                 let p = self.const_slot(ConstEntry::Var(var.ns.to_string(), var.name.to_string()));
-                // Fast path: the var's lock-free word holds the root when it is an
-                // immediate or immortal (never freed) value; otherwise take the root
-                // under the lock with a +1.
+                // Fast path: the var's lock-free word holds the root of a bound,
+                // non-dynamic var; otherwise ask the runtime (thread bindings, or the
+                // unbound error).
                 let fast = self.b.ins().load(
                     types::I64,
                     MemFlagsData::trusted(),
@@ -1967,28 +1759,21 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 self.b.ins().jump(merge, &[BlockArg::Value(r)]);
                 self.b.switch_to_block(merge);
                 self.b.seal_block(merge);
-                let v = self.b.block_params(merge)[0];
-                // Releasing an immortal value is a no-op, so both paths may be owned.
-                Ok(Operand::owned(v))
+                Ok(self.b.block_params(merge)[0])
             }
             Node::TheVar(v) => {
                 let var = v.get();
-                let p = self.const_slot(ConstEntry::Var(var.ns.to_string(), var.name.to_string()));
-                Ok(Operand::borrowed(p))
+                Ok(self.const_slot(ConstEntry::Var(var.ns.to_string(), var.name.to_string())))
             }
-            Node::CurrentNs => {
-                let ns = self.call_rt(RtFn::CurrentNs, &[]).unwrap();
-                Ok(Operand::borrowed(ns))
-            }
+            Node::CurrentNs => Ok(self.call_rt(RtFn::CurrentNs, &[]).unwrap()),
             Node::Def { var, init, meta } => {
                 let vo = var.get();
                 let p = self.const_slot(ConstEntry::Var(vo.ns.to_string(), vo.name.to_string()));
                 let result = match init {
                     None => p,
                     Some(init) => {
-                        let op = self.compile(init)?;
-                        let op = self.make_owned_force(op);
-                        self.call_rt(RtFn::VarBindRoot, &[p, op.val]).unwrap()
+                        let v = self.compile(init)?;
+                        self.call_rt(RtFn::VarBindRoot, &[p, v]).unwrap()
                     }
                 };
                 // Metadata after the init, so a throwing init leaves the var untouched.
@@ -1996,30 +1781,23 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 // is republished when the flag changes.)
                 if let Some(m) = meta {
                     let mv = self.compile(m)?;
-                    let mv = self.make_owned_force(mv);
-                    self.call_rt(RtFn::VarSetMeta, &[p, mv.val]);
+                    self.call_rt(RtFn::VarSetMeta, &[p, mv]);
                 }
-                Ok(Operand::borrowed(result))
+                Ok(result)
             }
             Node::VarSet { var, value } => {
                 let vo = var.get();
                 let p = self.const_slot(ConstEntry::Var(vo.ns.to_string(), vo.name.to_string()));
-                let op = self.compile(value)?;
-                let op = self.make_owned_force(op);
-                let r = self.call_rt(RtFn::VarSet, &[p, op.val]).unwrap();
+                let v = self.compile(value)?;
+                let r = self.call_rt(RtFn::VarSet, &[p, v]).unwrap();
                 self.check_exc(r);
-                Ok(Operand::owned(r))
+                Ok(r)
             }
             Node::If { test, then, else_ } => self.compile_if(test, then, else_),
             Node::Do(nodes) => {
                 let mut last = self.imm(api::consts::NIL);
-                for (i, n) in nodes.iter().enumerate() {
-                    let op = self.compile(n)?;
-                    if i + 1 < nodes.len() {
-                        self.release(op);
-                    } else {
-                        last = op;
-                    }
+                for n in nodes {
+                    last = self.compile(n)?;
                 }
                 Ok(last)
             }
@@ -2031,7 +1809,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 pos,
             } => self.compile_loop(*id, bindings, body, *pos),
             Node::Recur { target, args } => self.compile_recur(*target, args),
-            Node::Fn(f) => self.compile_fn_value(node as *const Node as usize, f),
+            Node::Fn(f) => self.compile_fn_value(f),
             Node::Call { f, args, pos } => self.compile_call(f, args, *pos),
             Node::BuiltinCall { desc, args, pos } => {
                 let ty = self.ty_of(node);
@@ -2057,45 +1835,43 @@ impl<'a, M: Module> FnCtx<'a, M> {
         }
     }
 
-    fn compile_throw(&mut self, e: &Node, pos: u32) -> CResult<Operand> {
-        let op = self.compile(e)?;
-        let op = self.make_owned_force(op);
+    fn compile_throw(&mut self, e: &Node, pos: u32) -> CResult<Value> {
+        let v = self.compile(e)?;
         self.srcloc(pos);
-        let r = self.call_rt(RtFn::Throw, &[op.val]).unwrap();
+        let r = self.call_rt(RtFn::Throw, &[v]).unwrap();
         self.srcloc(0);
         self.emit_exc_path(r);
         self.dead_block();
         Ok(self.imm(api::consts::NIL))
     }
 
-    /// Run `region` with a handler: on an exception the cleanup entries pushed inside
-    /// the region are released and control reaches `handler` with the taken exception
-    /// (owned). `handler` must end its block (jump to `merge` or propagate).
+    /// Run `region` with a handler: on an exception control reaches `handler` with
+    /// the taken exception. `handler` must end its block (jump to `merge` with a
+    /// value, or propagate).
     fn protect(
         &mut self,
-        region: &mut dyn FnMut(&mut Self) -> CResult<Operand>,
+        region: &mut dyn FnMut(&mut Self) -> CResult<Value>,
         handler: &mut dyn FnMut(&mut Self, Value, Block) -> CResult<()>,
-    ) -> CResult<Operand> {
+    ) -> CResult<Value> {
         let handler_block = self.b.create_block();
         let merge = self.b.create_block();
         self.b.append_block_param(merge, types::I64);
-        self.handlers.push(Handler {
-            block: handler_block,
-            depth: self.cleanup.len(),
-        });
-        let op = region(self);
+        self.handlers.push(handler_block);
+        let v = region(self);
         self.handlers.pop();
-        let op = self.make_owned(op?);
-        self.b.ins().jump(merge, &[BlockArg::Value(op.val)]);
+        let v = v?;
+        self.b.ins().jump(merge, &[BlockArg::Value(v)]);
 
         self.b.switch_to_block(handler_block);
         self.b.seal_block(handler_block);
         let e = self.call_rt(RtFn::TakeException, &[]).unwrap();
+        let e = self.gc(e);
         handler(self, e, merge)?;
 
         self.b.switch_to_block(merge);
         self.b.seal_block(merge);
-        Ok(Operand::owned(self.b.block_params(merge)[0]))
+        let r = self.b.block_params(merge)[0];
+        Ok(self.gc(r))
     }
 
     fn compile_try(
@@ -2103,13 +1879,11 @@ impl<'a, M: Module> FnCtx<'a, M> {
         body: &Node,
         catches: &[CatchClause],
         finally: Option<&Node>,
-    ) -> CResult<Operand> {
+    ) -> CResult<Value> {
         if catches.is_empty() && finally.is_none() {
-            // Owned, so a `(try x)` argument never passes a local through borrowed.
-            let op = self.compile(body)?;
-            return Ok(self.make_owned(op));
+            return self.compile(body);
         }
-        let mut inner = |fc: &mut Self| -> CResult<Operand> {
+        let mut inner = |fc: &mut Self| -> CResult<Value> {
             if catches.is_empty() {
                 return fc.compile(body);
             }
@@ -2120,23 +1894,17 @@ impl<'a, M: Module> FnCtx<'a, M> {
         match finally {
             None => inner(self),
             Some(fin) => {
-                let op = self.protect(&mut inner, &mut |fc, e, _merge| {
-                    // Exceptional path: run finally with the exception parked (and
-                    // owned), then rethrow it. If finally throws, its exception wins.
-                    fc.cleanup.push(Cleanup::Val(e));
-                    let f = fc.compile(fin)?;
-                    fc.release(f);
-                    fc.cleanup.pop();
+                let v = self.protect(&mut inner, &mut |fc, e, _merge| {
+                    // Exceptional path: run finally, then rethrow. If finally
+                    // throws, its exception wins.
+                    fc.compile(fin)?;
                     let r = fc.call_rt(RtFn::Throw, &[e]).unwrap();
                     fc.emit_exc_path(r);
                     Ok(())
                 })?;
-                // Normal path: the result is live while finally runs.
-                self.push_tmp(op);
-                let f = self.compile(fin)?;
-                self.release(f);
-                self.pop_tmp(op);
-                Ok(op)
+                // Normal path: finally runs for effect; the result is the body's.
+                self.compile(fin)?;
+                Ok(v)
             }
         }
     }
@@ -2144,7 +1912,6 @@ impl<'a, M: Module> FnCtx<'a, M> {
     /// Handler body for `catch` clauses: match classes in order, bind, run, merge;
     /// rethrow when nothing matches.
     fn catch_dispatch(&mut self, e: Value, merge: Block, catches: &[CatchClause]) -> CResult<()> {
-        self.cleanup.push(Cleanup::Val(e));
         for clause in catches {
             let (cp, cl) = self.blob_ptr(&clause.class);
             let m = self.call_rt(RtFn::ExceptionInstance, &[e, cp, cl]).unwrap();
@@ -2154,19 +1921,14 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
             self.b.switch_to_block(clause_b);
             self.b.seal_block(clause_b);
-            // Ownership of `e` moves from the dispatch temporary to the catch local.
-            self.cleanup.pop();
-            let var = self.bind_local(clause.local, e, true);
+            self.bind_local(clause.local, e);
             let r = self.compile(&clause.body)?;
-            let r = self.make_owned(r);
-            self.release_locals(&[(clause.local, var, true)]);
-            self.b.ins().jump(merge, &[BlockArg::Value(r.val)]);
+            self.locals.remove(&clause.local);
+            self.b.ins().jump(merge, &[BlockArg::Value(r)]);
 
             self.b.switch_to_block(next);
             self.b.seal_block(next);
-            self.cleanup.push(Cleanup::Val(e));
         }
-        self.cleanup.pop();
         let r = self.call_rt(RtFn::Throw, &[e]).unwrap();
         self.emit_exc_path(r);
         Ok(())
@@ -2189,13 +1951,8 @@ impl<'a, M: Module> FnCtx<'a, M> {
         ret: NativeTy,
         params: &[NativeTy],
         args: &[Node],
-    ) -> CResult<Operand> {
-        let mut ops = Vec::with_capacity(args.len());
-        for a in args {
-            let op = self.compile(a)?;
-            self.push_tmp(op);
-            ops.push(op);
-        }
+    ) -> CResult<Value> {
+        let ops = self.eval_args(args)?;
         let fptr = self.const_slot(ConstEntry::Native(symbol.to_string()));
         let scratch = self.scratch_slot();
         let scratch_addr = self.b.ins().stack_addr(types::I64, scratch, 0);
@@ -2204,7 +1961,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
         for (op, ty) in ops.iter().zip(params) {
             let v = match ty {
                 NativeTy::Long | NativeTy::Ptr | NativeTy::Int | NativeTy::UInt => {
-                    let r = self.call_rt(RtFn::ToLong, &[op.val, scratch_addr]).unwrap();
+                    let r = self.call_rt(RtFn::ToLong, &[*op, scratch_addr]).unwrap();
                     self.check_exc(r);
                     let n = self.b.ins().stack_load(types::I64, types::I64, scratch, 0);
                     if matches!(ty, NativeTy::Int | NativeTy::UInt) {
@@ -2214,9 +1971,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
                     }
                 }
                 NativeTy::Double | NativeTy::Float => {
-                    let r = self
-                        .call_rt(RtFn::ToDouble, &[op.val, scratch_addr])
-                        .unwrap();
+                    let r = self.call_rt(RtFn::ToDouble, &[*op, scratch_addr]).unwrap();
                     self.check_exc(r);
                     let d = self.b.ins().stack_load(types::I64, types::F64, scratch, 0);
                     if *ty == NativeTy::Float {
@@ -2225,9 +1980,9 @@ impl<'a, M: Module> FnCtx<'a, M> {
                         d
                     }
                 }
-                NativeTy::Bool => self.truthy(op.val),
+                NativeTy::Bool => self.truthy(*op),
                 NativeTy::Str => {
-                    let r = self.call_rt(RtFn::ToCstr, &[op.val, scratch_addr]).unwrap();
+                    let r = self.call_rt(RtFn::ToCstr, &[*op, scratch_addr]).unwrap();
                     self.check_exc(r);
                     self.b.ins().stack_load(types::I64, types::I64, scratch, 0)
                 }
@@ -2249,44 +2004,43 @@ impl<'a, M: Module> FnCtx<'a, M> {
             NativeTy::Void => self.imm(api::consts::NIL),
             NativeTy::Long | NativeTy::Ptr => {
                 let r = self.b.inst_results(inst)[0];
-                Operand::owned(self.call_rt(RtFn::BoxLong, &[r]).unwrap())
+                self.call_rt(RtFn::BoxLong, &[r]).unwrap()
             }
             NativeTy::Int => {
                 let r = self.b.inst_results(inst)[0];
                 let r = self.b.ins().sextend(types::I64, r);
-                Operand::owned(self.call_rt(RtFn::BoxLong, &[r]).unwrap())
+                self.call_rt(RtFn::BoxLong, &[r]).unwrap()
             }
             NativeTy::UInt => {
                 let r = self.b.inst_results(inst)[0];
                 let r = self.b.ins().uextend(types::I64, r);
-                Operand::owned(self.call_rt(RtFn::BoxLong, &[r]).unwrap())
+                self.call_rt(RtFn::BoxLong, &[r]).unwrap()
             }
             NativeTy::Double => {
                 let r = self.b.inst_results(inst)[0];
-                Operand::owned(self.call_rt(RtFn::BoxDouble, &[r]).unwrap())
+                self.call_rt(RtFn::BoxDouble, &[r]).unwrap()
             }
             NativeTy::Float => {
                 let r = self.b.inst_results(inst)[0];
                 let r = self.b.ins().fpromote(types::F64, r);
-                Operand::owned(self.call_rt(RtFn::BoxDouble, &[r]).unwrap())
+                self.call_rt(RtFn::BoxDouble, &[r]).unwrap()
             }
             NativeTy::Bool => {
                 let r = self.b.inst_results(inst)[0];
                 let c = self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
                 let t = self.b.ins().iconst(types::I64, api::consts::TRUE as i64);
                 let f = self.b.ins().iconst(types::I64, api::consts::FALSE as i64);
-                Operand::imm(self.b.ins().select(c, t, f))
+                self.b.ins().select(c, t, f)
             }
             NativeTy::Str => {
                 let r = self.b.inst_results(inst)[0];
-                Operand::owned(self.call_rt(RtFn::StringFromCstr, &[r]).unwrap())
+                self.call_rt(RtFn::StringFromCstr, &[r]).unwrap()
             }
         };
-        self.release_tmps(&ops);
         Ok(result)
     }
 
-    fn compile_const(&mut self, v: &rscl_runtime::Value) -> CResult<Operand> {
+    fn compile_const(&mut self, v: &rscl_runtime::Value) -> CResult<Value> {
         if !v.is_ptr() {
             return Ok(self.imm(v.bits()));
         }
@@ -2323,7 +2077,7 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 )));
             }
         };
-        Ok(Operand::borrowed(self.const_slot(entry)))
+        Ok(self.const_slot(entry))
     }
 
     /// An i8 condition for `test`: inline comparisons skip the boolean value.
@@ -2331,15 +2085,13 @@ impl<'a, M: Module> FnCtx<'a, M> {
         if let Node::BuiltinCall { desc, args, pos } = test
             && (inline_op(desc, args.len()).is_some() || self.ty_of(test) == Ty::Val)
         {
-            return Ok(self.compile_builtin_call(desc, args, true, *pos)?.val);
+            return self.compile_builtin_call(desc, args, true, *pos);
         }
         let t = self.compile(test)?;
-        let c = self.truthy(t.val);
-        self.release(t);
-        Ok(c)
+        Ok(self.truthy(t))
     }
 
-    fn compile_if(&mut self, test: &Node, then: &Node, else_: &Node) -> CResult<Operand> {
+    fn compile_if(&mut self, test: &Node, then: &Node, else_: &Node) -> CResult<Value> {
         let c = self.compile_cond(test)?;
         let then_b = self.b.create_block();
         let else_b = self.b.create_block();
@@ -2350,58 +2102,38 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.b.switch_to_block(then_b);
         self.b.seal_block(then_b);
         let a = self.compile(then)?;
-        let a = self.make_owned(a);
-        self.b.ins().jump(merge, &[BlockArg::Value(a.val)]);
+        self.b.ins().jump(merge, &[BlockArg::Value(a)]);
 
         self.b.switch_to_block(else_b);
         self.b.seal_block(else_b);
         let e = self.compile(else_)?;
-        let e = self.make_owned(e);
-        self.b.ins().jump(merge, &[BlockArg::Value(e.val)]);
+        self.b.ins().jump(merge, &[BlockArg::Value(e)]);
 
         self.b.switch_to_block(merge);
         self.b.seal_block(merge);
-        let r = self.b.block_params(merge)[0];
-        let own = if a.own == Own::Imm && e.own == Own::Imm {
-            Own::Imm
-        } else {
-            Own::Owned
-        };
-        Ok(Operand { val: r, own })
+        Ok(self.b.block_params(merge)[0])
     }
 
-    fn bind_all(
-        &mut self,
-        bindings: &[(LocalId, Node)],
-        force_owned: bool,
-    ) -> CResult<Vec<(LocalId, Variable, bool)>> {
+    fn bind_all(&mut self, bindings: &[(LocalId, Node)]) -> CResult<Vec<(LocalId, Variable)>> {
         let mut out = Vec::with_capacity(bindings.len());
         for (id, init) in bindings {
             let ty = self.local_ty(*id);
-            if ty != Ty::Val {
+            let var = if ty != Ty::Val {
                 let raw = self.compile_typed(init, ty)?;
-                let var = self.bind_typed(*id, raw, ty);
-                out.push((*id, var, false));
-                continue;
-            }
-            let op = self.compile(init)?;
-            let op = if force_owned {
-                self.make_owned_force(op)
+                self.bind_typed(*id, raw, ty)
             } else {
-                self.make_owned(op)
+                let v = self.compile(init)?;
+                self.bind_local(*id, v)
             };
-            let owned = op.own == Own::Owned;
-            let var = self.bind_local(*id, op.val, owned);
-            out.push((*id, var, owned));
+            out.push((*id, var));
         }
         Ok(out)
     }
 
-    fn compile_let(&mut self, bindings: &[(LocalId, Node)], body: &Node) -> CResult<Operand> {
-        let vars = self.bind_all(bindings, false)?;
+    fn compile_let(&mut self, bindings: &[(LocalId, Node)], body: &Node) -> CResult<Value> {
+        let vars = self.bind_all(bindings)?;
         let res = self.compile(body)?;
-        let res = self.make_owned(res);
-        self.release_locals(&vars);
+        self.unbind(&vars);
         Ok(res)
     }
 
@@ -2411,8 +2143,8 @@ impl<'a, M: Module> FnCtx<'a, M> {
         bindings: &[(LocalId, Node)],
         body: &Node,
         pos: u32,
-    ) -> CResult<Operand> {
-        let vars = self.bind_all(bindings, true)?;
+    ) -> CResult<Value> {
+        let vars = self.bind_all(bindings)?;
         let header = self.b.create_block();
         self.b.ins().jump(header, &[]);
         self.b.switch_to_block(header);
@@ -2427,113 +2159,50 @@ impl<'a, M: Module> FnCtx<'a, M> {
                 header,
                 vars: vars
                     .iter()
-                    .map(|(id, v, _)| LoopVar {
-                        var: *v,
-                        ty: self.local_ty(*id),
-                        param_bit: None,
-                    })
+                    .map(|(id, v)| (*v, self.local_ty(*id)))
                     .collect(),
-                depth: self.cleanup.len(),
             },
         );
         let res = self.compile(body);
         self.loops.remove(&id);
         self.b.seal_block(header);
-        let res = self.make_owned(res?);
-        self.release_locals(&vars);
+        let res = res?;
+        self.unbind(&vars);
         Ok(res)
     }
 
-    fn compile_recur(&mut self, target: RecurTarget, args: &[Node]) -> CResult<Operand> {
+    fn compile_recur(&mut self, target: RecurTarget, args: &[Node]) -> CResult<Value> {
         let ctx = match target {
             RecurTarget::Loop(id) => self.loops.get(&id).cloned(),
             RecurTarget::Fn => self.fn_recur.clone(),
         }
         .ok_or_else(|| internal("recur target missing"))?;
-        // Primitive loop variables take raw bits; the rest are evaluated as owned
-        // values, kept on the temporary stack while later arguments run.
-        let mut ops: Vec<Option<Operand>> = Vec::with_capacity(args.len());
-        let mut raws: Vec<Value> = Vec::with_capacity(args.len());
-        for (a, lv) in args.iter().zip(&ctx.vars) {
-            if lv.ty == Ty::Val {
-                let op = self.compile(a)?;
-                self.push_tmp(op);
-                ops.push(Some(op));
-                raws.push(op.val);
+        // Every argument is evaluated before any variable is rebound.
+        let mut vals = Vec::with_capacity(args.len());
+        for (a, (_, ty)) in args.iter().zip(&ctx.vars) {
+            vals.push(if *ty == Ty::Val {
+                self.compile(a)?
             } else {
-                let raw = self.compile_typed(a, lv.ty)?;
-                ops.push(None);
-                raws.push(raw);
-            }
+                self.compile_typed(a, *ty)?
+            });
         }
-        for op in ops.iter().rev().flatten() {
-            self.pop_tmp(*op);
-        }
-        let new_vals: Vec<Value> = ops
-            .iter()
-            .zip(&raws)
-            .map(|(op, raw)| match op {
-                Some(op) => self.make_owned_force(*op).val,
-                None => *raw,
-            })
-            .collect();
-        // Locals bound inside the loop body (`let` etc.) are live on this path and
-        // would otherwise leak once per iteration: release them, newest first. They
-        // stay on the compile-time stack for the fall-through path.
-        let inner: Vec<Cleanup> = self.cleanup[ctx.depth..].iter().rev().copied().collect();
-        self.release_cleanups(&inner);
-        // Old values before rebinding; parameters are released only if owned.
-        let olds: Vec<Cleanup> = ctx
-            .vars
-            .iter()
-            .filter(|lv| lv.ty == Ty::Val)
-            .map(|lv| match lv.param_bit {
-                Some(bit) => Cleanup::Param(lv.var, bit),
-                None => Cleanup::Var(lv.var),
-            })
-            .collect();
-        // The old values must be read before the variables are redefined.
-        let old_vals: Vec<Cleanup> = olds
-            .iter()
-            .map(|c| match c {
-                Cleanup::Var(var) => Cleanup::Val(self.b.use_var(*var)),
-                Cleanup::Param(var, bit) => {
-                    let v = self.b.use_var(*var);
-                    Cleanup::ValIf(v, *bit)
-                }
-                c => *c,
-            })
-            .collect();
-        let mut rebound_bits = 0u64;
-        for (lv, val) in ctx.vars.iter().zip(new_vals) {
-            self.b.def_var(lv.var, val);
-            if let Some(bit) = lv.param_bit {
-                rebound_bits |= bit;
-            }
-        }
-        self.release_cleanups(&old_vals);
-        if rebound_bits != 0 {
-            // Rebound by recur: owned from now on.
-            let mask = self.owned_mask.expect("ownership mask");
-            let m = self.b.use_var(mask);
-            let m = self.b.ins().bor_imm_s(m, rebound_bits as i64);
-            self.b.def_var(mask, m);
+        for ((var, _), val) in ctx.vars.iter().zip(vals) {
+            self.b.def_var(*var, val);
         }
         self.b.ins().jump(ctx.header, &[]);
         self.dead_block();
         Ok(self.imm(api::consts::NIL))
     }
 
-    fn compile_fn_value(&mut self, at: usize, f: &Rc<FnNode>) -> CResult<Operand> {
+    fn compile_fn_value(&mut self, f: &Rc<FnNode>) -> CResult<Value> {
         let func = self.unit.fn_id(self.module, f)?;
         if f.captures.is_empty() {
-            let fv = self.const_slot(ConstEntry::FnObj {
+            return Ok(self.const_slot(ConstEntry::FnObj {
                 func,
                 name: f.name.clone(),
                 mask: f.arity_mask(),
                 vmin: f.variadic_min(),
-            });
-            return Ok(Operand::borrowed(fv));
+            }));
         }
         let proto = self.const_slot(ConstEntry::Proto {
             func,
@@ -2543,40 +2212,32 @@ impl<'a, M: Module> FnCtx<'a, M> {
         });
         let n = self.b.ins().iconst(types::I64, f.captures.len() as i64);
         let fv = self.call_rt(RtFn::FnNew, &[proto, n]).unwrap();
+        let fv = self.gc(fv);
         for (i, id) in f.captures.iter().enumerate() {
-            let op = self.read_local(at, *id)?;
-            let op = self.make_owned_force(op);
+            let v = self.read_local(*id)?;
             let i = self.b.ins().iconst(types::I64, i as i64);
-            self.call_rt(RtFn::FnSetCapture, &[fv, i, op.val]);
+            self.call_rt(RtFn::FnSetCapture, &[fv, i, v]);
         }
-        Ok(Operand::owned(fv))
+        Ok(fv)
     }
 
-    /// Evaluate `items` and store them in the argv slot; returns (addr, count).
-    fn store_args(&mut self, items: &[Node]) -> CResult<(Value, Value, Vec<Operand>)> {
-        let ops = self.eval_args(items)?;
-        let (addr, n) = self.store_ops(&ops);
-        Ok((addr, n, ops))
+    /// Evaluate arguments left to right. Each is a declared reference, so the ones
+    /// already evaluated are in the stack maps of the calls that evaluate the rest.
+    fn eval_args(&mut self, items: &[Node]) -> CResult<Vec<Value>> {
+        items.iter().map(|a| self.compile(a)).collect()
     }
 
-    /// Evaluate arguments left to right, keeping each on the owned-temporary stack.
-    fn eval_args(&mut self, items: &[Node]) -> CResult<Vec<Operand>> {
-        let mut ops = Vec::with_capacity(items.len());
-        for a in items {
-            let op = self.compile(a)?;
-            self.push_tmp(op);
-            ops.push(op);
-        }
-        Ok(ops)
-    }
-
-    /// Write evaluated arguments into the argv slot; returns (addr, count).
-    fn store_ops(&mut self, ops: &[Operand]) -> (Value, Value) {
+    /// Write evaluated arguments into the argv slot; returns (addr, count). From
+    /// here to the call nothing else may be emitted that calls: the slot is not in
+    /// any stack map, and the callee takes the arguments over (a compiled fn loads
+    /// them into its own variables before its first safepoint; a native that lets
+    /// collections run roots its argument list).
+    fn store_ops(&mut self, ops: &[Value]) -> (Value, Value) {
         let addr = self.argv_addr();
         for (i, op) in ops.iter().enumerate() {
             self.b
                 .ins()
-                .store(MemFlagsData::trusted(), op.val, addr, 8 * i as i32);
+                .store(MemFlagsData::trusted(), *op, addr, 8 * i as i32);
         }
         let n = self.b.ins().iconst(types::I64, ops.len() as i64);
         (addr, n)
@@ -2591,56 +2252,35 @@ impl<'a, M: Module> FnCtx<'a, M> {
         args: &[Node],
         as_cond: bool,
         pos: u32,
-    ) -> CResult<Operand> {
+    ) -> CResult<Value> {
         if let Some(c) = self.prim_cond(desc, args)? {
             return Ok(if as_cond {
-                Operand::imm(c)
+                c
             } else {
                 let t = self.b.ins().iconst(types::I64, api::consts::TRUE as i64);
                 let f = self.b.ins().iconst(types::I64, api::consts::FALSE as i64);
-                Operand::imm(self.b.ins().select(c, t, f))
+                self.b.ins().select(c, t, f)
             });
         }
         let ops = self.eval_args(args)?;
-        let op = inline_op(desc, args.len());
-        let result = match op {
-            Some(op) => {
-                let r = self.compile_inline(op, desc, &ops, as_cond, pos)?;
-                self.release_tmps(&ops);
-                r
-            }
+        match inline_op(desc, args.len()) {
+            Some(op) => self.compile_inline(op, desc, &ops, as_cond, pos),
             None => {
-                let r = self.direct_call(desc, &ops, true, pos)?;
-                self.release_untransferred(&ops);
-                if as_cond {
-                    // Only the truth of the result is needed; the value itself goes.
-                    let c = self.truthy(r);
-                    self.emit_release(r);
-                    Operand::imm(c)
-                } else {
-                    Operand::owned(r)
-                }
+                let r = self.direct_call(desc, &ops, pos)?;
+                Ok(if as_cond { self.truthy(r) } else { r })
             }
-        };
-        Ok(result)
+        }
     }
 
-    /// `builtin(null, argc, argv, owned)` with the exception check; returns the raw
-    /// result. With `transfer`, owned operands are handed over (popped from the
-    /// temporary stack); otherwise the builtin borrows and the caller releases.
+    /// `builtin(null, argc, argv, owned)` with the exception check.
     fn direct_call(
         &mut self,
         desc: &'static BuiltinDesc,
-        ops: &[Operand],
-        transfer: bool,
+        ops: &[Value],
         pos: u32,
     ) -> CResult<Value> {
         let (argv, argc) = self.store_ops(ops);
-        let owned = if transfer {
-            self.transfer_tmps(ops)
-        } else {
-            self.b.ins().iconst(types::I64, 0)
-        };
+        let owned = self.scratch_args();
         let fref = self.builtin_ref(desc)?;
         let this = self.b.ins().iconst(types::I64, 0);
         self.srcloc(pos);
@@ -2648,22 +2288,21 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.srcloc(0);
         let r = self.b.inst_results(inst)[0];
         self.check_exc(r);
-        Ok(r)
+        Ok(self.gc(r))
     }
 
     /// Fixnum fast path for `op`, falling back to the builtin for anything else
-    /// (boxed longs, doubles, non-numbers, overflow). Operands are already on the
-    /// temporary stack; the caller releases them.
+    /// (boxed longs, doubles, non-numbers, overflow).
     fn compile_inline(
         &mut self,
         op: PrimOp,
         desc: &'static BuiltinDesc,
-        ops: &[Operand],
+        ops: &[Value],
         as_cond: bool,
         pos: u32,
-    ) -> CResult<Operand> {
-        let a = ops[0].val;
-        let b = ops.get(1).map(|o| o.val);
+    ) -> CResult<Value> {
+        let a = ops[0];
+        let b = ops.get(1).copied();
         let tagged = match b {
             Some(b) => self.b.ins().band(a, b),
             None => a,
@@ -2678,7 +2317,6 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
         self.b.switch_to_block(fast);
         self.b.seal_block(fast);
-        let is_pred = op.is_predicate();
         match op {
             PrimOp::Add | PrimOp::Sub | PrimOp::Mul | PrimOp::Inc | PrimOp::Dec => {
                 // a = 2x+1, b = 2y+1: the tagged forms combine with one adjustment;
@@ -2744,75 +2382,22 @@ impl<'a, M: Module> FnCtx<'a, M> {
 
         self.b.switch_to_block(slow);
         self.b.seal_block(slow);
-        let r = self.direct_call(desc, ops, false, pos)?;
-        let r = if as_cond {
-            let c = self.truthy(r);
-            self.emit_release(r);
-            c
-        } else {
-            r
-        };
+        let r = self.direct_call(desc, ops, pos)?;
+        let r = if as_cond { self.truthy(r) } else { r };
         self.b.ins().jump(merge, &[BlockArg::Value(r)]);
 
         self.b.switch_to_block(merge);
         self.b.seal_block(merge);
         let r = self.b.block_params(merge)[0];
-        // Predicates yield booleans on both paths; arithmetic may yield a boxed long
-        // from the builtin, so it is owned (releasing a fixnum is a no-op).
-        Ok(if as_cond || is_pred {
-            Operand::imm(r)
-        } else {
-            Operand::owned(r)
-        })
+        // Arithmetic may yield a boxed long from the builtin.
+        Ok(if as_cond { r } else { self.gc(r) })
     }
 
-    fn release_tmps(&mut self, ops: &[Operand]) {
-        for op in ops.iter().rev() {
-            self.pop_tmp(*op);
-            self.release(*op);
-        }
-    }
-
-    /// Hand owned argument operands over to the callee: pop them from the temporary
-    /// stack (the callee releases or keeps them) and return the ownership mask. With
-    /// more than 64 arguments nothing is transferred.
-    fn transfer_tmps(&mut self, ops: &[Operand]) -> Value {
-        if ops.len() > 64 {
-            return self.b.ins().iconst(types::I64, 0);
-        }
-        let mut mask: u64 = 0;
-        let mut dynamic: Vec<(usize, Value)> = Vec::new();
-        for (i, op) in ops.iter().enumerate().rev() {
-            self.pop_tmp(*op);
-            match op.own {
-                Own::Owned => mask |= 1 << i,
-                Own::Cond(flag) => dynamic.push((i, flag)),
-                _ => {}
-            }
-        }
-        let mut m = self.b.ins().iconst(types::I64, mask as i64);
-        for (i, flag) in dynamic {
-            let bit = self.b.ins().iconst(types::I64, (1u64 << i) as i64);
-            let zero = self.b.ins().iconst(types::I64, 0);
-            let b = self.b.ins().select(flag, bit, zero);
-            m = self.b.ins().bor(m, b);
-        }
-        m
-    }
-
-    /// Release the arguments the callee did not take (more than 64 of them).
-    fn release_untransferred(&mut self, ops: &[Operand]) {
-        if ops.len() > 64 {
-            self.release_tmps(ops);
-        }
-    }
-
-    fn compile_call(&mut self, f: &Node, args: &[Node], pos: u32) -> CResult<Operand> {
-        let fop = self.compile(f)?;
-        self.push_tmp(fop);
-        let (argv, argc, ops) = self.store_args(args)?;
-        let owned = self.transfer_tmps(&ops);
-        let fv = fop.val;
+    fn compile_call(&mut self, f: &Node, args: &[Node], pos: u32) -> CResult<Value> {
+        let fv = self.compile(f)?;
+        let ops = self.eval_args(args)?;
+        let (argv, argc) = self.store_ops(&ops);
+        let owned = self.scratch_args();
 
         // Fast path: a heap pointer whose kind is Fn → call its entry directly.
         let low = self.b.ins().band_imm_s(fv, 3);
@@ -2876,27 +2461,24 @@ impl<'a, M: Module> FnCtx<'a, M> {
         self.b.seal_block(merge);
         let r = self.b.block_params(merge)[0];
         self.check_exc(r);
-        self.release_untransferred(&ops);
-        self.pop_tmp(fop);
-        self.release(fop);
-        Ok(Operand::owned(r))
+        Ok(self.gc(r))
     }
 
-    fn compile_coll(&mut self, kind: CollKind, items: &[Node]) -> CResult<Operand> {
-        let (addr, n, ops) = self.store_args(items)?;
-        let owned = self.transfer_tmps(&ops);
+    fn compile_coll(&mut self, kind: CollKind, items: &[Node]) -> CResult<Value> {
+        let ops = self.eval_args(items)?;
+        let (addr, n) = self.store_ops(&ops);
+        let owned = self.scratch_args();
         let f = match kind {
             CollKind::Vector => RtFn::VectorFromSlice,
             CollKind::Map => RtFn::MapFromSlice,
             CollKind::Set => RtFn::SetFromSlice,
         };
         let r = self.call_rt(f, &[addr, n, owned]).unwrap();
-        self.release_untransferred(&ops);
-        Ok(Operand::owned(r))
+        Ok(self.gc(r))
     }
 
-    /// Body of one fn arity: bind params (and rest), compile the body as the recur
-    /// target, release owned locals, return.
+    /// Body of one fn arity: bind params (and rest), check the stack, compile the
+    /// body as the recur target, return.
     fn compile_arity(
         &mut self,
         a: &Arity,
@@ -2905,48 +2487,32 @@ impl<'a, M: Module> FnCtx<'a, M> {
         owned: Value,
         pos: u32,
     ) -> CResult<()> {
-        let mut vars: Vec<(LocalId, Variable, bool)> = Vec::new();
-        let mut bits: Vec<Option<u64>> = Vec::new();
-        let mask = self.b.declare_var(types::I64);
-        self.b.def_var(mask, owned);
-        self.owned_mask = Some(mask);
-        // Load every argument and protect the owned ones (and the rest list) before
-        // anything can throw: unboxing a `^long`/`^double` parameter may fail, and the
-        // exception path must then release the arguments that were handed over.
+        // The arguments move from the caller's argument slots into this function's
+        // own variables before anything here can reach a safepoint: the collector
+        // does not look at the caller's slots.
         let vals: Vec<Value> = (0..a.params.len())
             .map(|j| {
-                self.b
+                let v = self
+                    .b
                     .ins()
-                    .load(types::I64, MemFlagsData::trusted(), argv, 8 * j as i32)
+                    .load(types::I64, MemFlagsData::trusted(), argv, 8 * j as i32);
+                self.gc(v)
             })
             .collect();
-        // The analyzer caps fixed parameters at 63, so every bit fits the mask.
-        debug_assert!(
-            vals.len() < 64,
-            "too many parameters for the ownership mask"
-        );
-        for (j, v) in vals.iter().enumerate() {
-            self.cleanup.push(Cleanup::ValIf(*v, 1 << j));
-        }
-        // An argument the caller gave up (its `owned` bit) is cleared in the
-        // caller's argument area now that it is in a variable here: the slot must
-        // not keep, say, the head of a lazy sequence alive while this function
-        // walks it.
-        if !vals.is_empty() {
+        if !rscl_runtime::gc::PRECISE_FRAMES && !vals.is_empty() {
+            // Where compiled frames are scanned conservatively, the caller's slots
+            // are cleared (when they are the callee's to clear) so they do not keep,
+            // say, the head of a lazy sequence alive while this function walks it.
             let clear = self.b.create_block();
             let cont = self.b.create_block();
             self.b.ins().brif(owned, clear, &[], cont, &[]);
             self.b.switch_to_block(clear);
             self.b.seal_block(clear);
-            for (j, v) in vals.iter().enumerate() {
-                // keep = all ones when the bit is clear, zero when it is set
-                let bit = self.b.ins().ushr_imm_s(owned, j as i64);
-                let bit = self.b.ins().band_imm_s(bit, 1);
-                let keep = self.b.ins().iadd_imm_s(bit, -1);
-                let stored = self.b.ins().band(*v, keep);
+            let nil = self.b.ins().iconst(types::I64, 0);
+            for j in 0..vals.len() {
                 self.b
                     .ins()
-                    .store(MemFlagsData::trusted(), stored, argv, 8 * j as i32);
+                    .store(MemFlagsData::trusted(), nil, argv, 8 * j as i32);
             }
             self.b.ins().jump(cont, &[]);
             self.b.switch_to_block(cont);
@@ -2956,54 +2522,35 @@ impl<'a, M: Module> FnCtx<'a, M> {
             let nfixed = a.params.len() as i64;
             let extra = self.b.ins().iadd_imm_s(argc, -nfixed);
             let addr = self.b.ins().iadd_imm_s(argv, 8 * nfixed);
-            let rest_owned = self.b.ins().ushr_imm_s(owned, nfixed);
             let r = self
-                .call_rt(RtFn::ListFromSlice, &[addr, extra, rest_owned])
+                .call_rt(RtFn::ListFromSlice, &[addr, extra, owned])
                 .unwrap();
-            self.cleanup.push(Cleanup::Val(r));
-            r
+            self.gc(r)
         });
-        let mut raws: Vec<Option<Value>> = Vec::with_capacity(vals.len());
+        let mut vars: Vec<(LocalId, Variable)> = Vec::new();
         for (id, v) in a.params.iter().zip(&vals) {
             let ty = self.local_ty(*id);
-            raws.push(if ty != Ty::Val {
+            let var = if ty != Ty::Val {
                 // ClassCastException for anything else, like a primitive-hinted
                 // Clojure fn.
-                Some(self.unbox(Operand::borrowed(*v), ty, true)?)
+                let raw = self.unbox(*v, ty, true)?;
+                self.bind_typed(*id, raw, ty)
             } else {
-                None
-            });
-        }
-        // Now bind: the protection entries are replaced by the parameters' own.
-        if rest.is_some() {
-            self.cleanup.pop();
-        }
-        for _ in &vals {
-            self.cleanup.pop();
-        }
-        for (j, (id, v)) in a.params.iter().zip(&vals).enumerate() {
-            match raws[j] {
-                Some(raw) => {
-                    // The boxed argument goes right away if it was handed over.
-                    let flag = self.owned_bit(1 << j);
-                    self.emit_release_if(flag, *v);
-                    let ty = self.local_ty(*id);
-                    let var = self.bind_typed(*id, raw, ty);
-                    vars.push((*id, var, false));
-                    bits.push(None);
-                }
-                None => {
-                    let var = self.bind_param(*id, *v, j);
-                    vars.push((*id, var, true));
-                    bits.push(Some(1 << j));
-                }
-            }
+                self.bind_local(*id, *v)
+            };
+            vars.push((*id, var));
         }
         if let (Some(id), Some(r)) = (a.rest, rest) {
-            let var = self.bind_local(id, r, true);
-            vars.push((id, var, true));
-            bits.push(None);
+            let var = self.bind_local(id, r);
+            vars.push((id, var));
         }
+        // Stack-depth and interrupt guard: a safepoint.
+        let sp = self.b.ins().get_stack_pointer(types::I64);
+        self.srcloc(pos);
+        let guard = self.call_rt(RtFn::StackCheck, &[sp]).unwrap();
+        self.srcloc(0);
+        self.check_exc(guard);
+
         let header = self.b.create_block();
         self.b.ins().jump(header, &[]);
         self.b.switch_to_block(header);
@@ -3017,21 +2564,15 @@ impl<'a, M: Module> FnCtx<'a, M> {
             header,
             vars: vars
                 .iter()
-                .zip(&bits)
-                .map(|((id, v, _), bit)| LoopVar {
-                    var: *v,
-                    ty: self.local_ty(*id),
-                    param_bit: *bit,
-                })
+                .map(|(id, v)| (*v, self.local_ty(*id)))
                 .collect(),
-            depth: self.cleanup.len(),
         });
         let res = self.compile(&a.body);
         self.fn_recur = None;
         self.b.seal_block(header);
-        let res = self.make_owned(res?);
-        self.release_locals(&vars);
-        self.b.ins().return_(&[res.val]);
+        let res = res?;
+        self.unbind(&vars);
+        self.b.ins().return_(&[res]);
         Ok(())
     }
 }

@@ -572,8 +572,7 @@ pub unsafe fn register(api: *const RtApi, ns: &str, exports: &[Export]) -> i32 {
     0
 }
 
-/// Body of every generated wrapper: arity check, conversion, panic safety, and the
-/// release of arguments the caller handed over (wrappers only borrow them).
+/// Body of every generated wrapper: arity check, conversion, panic safety.
 ///
 /// # Safety
 /// `argv` must point at `argc` values that stay valid for the call.
@@ -585,13 +584,8 @@ pub unsafe fn wrap(
     arity: i64,
     f: impl FnOnce(&[Val]) -> Result<Val>,
 ) -> u64 {
-    let r = wrap_borrowed(name, argc, argv, arity, f);
-    for i in 0..argc.min(64) {
-        if owned >> i & 1 == 1 {
-            unsafe { (api().release)(*argv.add(i as usize)) };
-        }
-    }
-    r
+    let _ = owned;
+    wrap_borrowed(name, argc, argv, arity, f)
 }
 
 fn wrap_borrowed(

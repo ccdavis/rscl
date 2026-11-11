@@ -25,14 +25,6 @@ unsafe fn args_slice<'a>(argv: *const Value, argc: i64) -> &'a [VRef] {
     }
 }
 
-// ---- former refcounting entry points (no-ops; kept until the ABI drops them) --------
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_retain(_v: VRef) {}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_release(_v: Value) {}
-
 // ---- primitives --------------------------------------------------------------------
 
 /// Unbox a number as `f64` for primitive arithmetic (`nil` on success, `EXC` with a
@@ -181,10 +173,6 @@ pub unsafe extern "C" fn rt_fn_set_capture(f: VRef, i: i64, v: Value) {
     unsafe { func::set_capture(&f, i as usize, v) }
 }
 
-/// No longer needed (nothing is released); kept until the ABI drops it.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_release_args(_argv: *const Value, _argc: i64, _owned: u64) {}
-
 /// Arity failure for a compiled function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_throw_arity(f: VRef, argc: i64) -> Value {
@@ -209,6 +197,11 @@ pub unsafe extern "C" fn rt_invoke(f: VRef, argc: i64, argv: *const Value, owned
 
 /// Invoke any callable from Rust.
 pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
+    // The arguments may live nowhere but in this slice (a `Vec` built by a native,
+    // or a compiled caller's argument slots, which the collector does not read):
+    // they are roots until the call returns.
+    let root = crate::gc::ArgRoot::new(args.as_ptr() as *const Value, args.len() as i64);
+    let _rooted = root.enter();
     match f.kind() {
         Some(Kind::Fn) => {
             let fo = func::get(f);
@@ -224,10 +217,9 @@ pub fn invoke(f: &Value, args: &[VRef]) -> RtResult<Value> {
             } else {
                 args.as_ptr() as *const Value
             };
-            // The callee reaches a safepoint before it has loaded its arguments, and
-            // they may live nowhere but in this slice (a `Vec` built by a native).
-            let _root = unsafe { crate::gc::root_words(args.as_ptr() as *const u64, args.len()) };
-            let r = unsafe { (proto.entry)(f.ptr() as *const FnObj, args.len() as i64, argv, 0) };
+            let r = crate::gc::enter_compiled(|| unsafe {
+                (proto.entry)(f.ptr() as *const FnObj, args.len() as i64, argv, 0)
+            });
             exc::check(r)
         }
         Some(Kind::Keyword | Kind::Map | Kind::Set | Kind::SortedMap | Kind::SortedSet) => {
@@ -319,6 +311,9 @@ pub unsafe extern "C" fn rt_vector_from_slice(items: *const Value, n: i64, owned
 /// Alternating keys and values.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_map_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
+    // Hashing a key can run rscl code (a lazy seq realising); the items are in a
+    // `Vec` here.
+    let _hold = crate::gc::hold();
     let mut m = map::empty_map();
     let mut it = unsafe { take_slice(items, n, owned) }.into_iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
@@ -329,6 +324,7 @@ pub unsafe extern "C" fn rt_map_from_slice(items: *const Value, n: i64, owned: u
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_set_from_slice(items: *const Value, n: i64, owned: u64) -> Value {
+    let _hold = crate::gc::hold();
     let mut s = set::empty_set();
     for x in unsafe { take_slice(items, n, owned) } {
         // An equal element already there stays (as `hash-set` does).
