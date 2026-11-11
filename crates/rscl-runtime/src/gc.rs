@@ -146,6 +146,8 @@ struct Local {
     force_minor: Cell<bool>,
     /// Safepoints passed over while a collection was wanted.
     skips: Cell<u32>,
+    /// Destructors of the native objects this thread's last collection freed.
+    finalizers: RefCell<Vec<Finalizer>>,
     /// Argument slices of calls into rscl code in progress: (address, values).
     slices: RefCell<Vec<(usize, usize)>>,
 }
@@ -169,6 +171,7 @@ thread_local! {
             force: Cell::new(false),
             force_minor: Cell::new(false),
             skips: Cell::new(0),
+            finalizers: RefCell::new(Vec::new()),
             slices: RefCell::new(Vec::new()),
         }
     };
@@ -318,8 +321,8 @@ thread_local! {
 /// reachable itself: `let root = ArgRoot::new(argv, argc); let _g = root.enter();`.
 pub struct ArgRoot {
     prev: Cell<*const ArgRoot>,
-    argv: *const u64,
-    argc: usize,
+    argv: Cell<*const u64>,
+    argc: Cell<usize>,
 }
 
 impl ArgRoot {
@@ -327,9 +330,24 @@ impl ArgRoot {
     pub fn new(argv: *const Value, argc: i64) -> ArgRoot {
         ArgRoot {
             prev: Cell::new(std::ptr::null()),
-            argv: argv as *const u64,
-            argc: argc.max(0) as usize,
+            argv: Cell::new(argv as *const u64),
+            argc: Cell::new(argc.max(0) as usize),
         }
+    }
+
+    /// A root with nothing in it yet (see `set`).
+    #[inline]
+    pub fn empty() -> ArgRoot {
+        ArgRoot::new(std::ptr::null(), 0)
+    }
+
+    /// Point the root at `s`: for a `Vec` a native fills while it calls rscl code.
+    /// Call it again after every change to the vector (it may have moved), and do
+    /// not let the vector go while the root is entered.
+    #[inline]
+    pub fn set(&self, s: &[Value]) {
+        self.argv.set(s.as_ptr() as *const u64);
+        self.argc.set(s.len());
     }
 
     /// Make the list a root until the guard is dropped. The `ArgRoot` must stay
@@ -692,6 +710,10 @@ struct World {
     phase: Phase,
     /// Registered threads that are not stopped.
     running: usize,
+    /// Running threads that are blocked where they cannot be scanned (under a
+    /// native that holds collections off, or under the compiler): a collector
+    /// does not wait for them.
+    held_blocked: usize,
     threads: Vec<ThreadRec>,
 }
 
@@ -706,6 +728,7 @@ fn world() -> &'static Sync {
         world: Mutex::new(World {
             phase: Phase::Idle,
             running: 0,
+            held_blocked: 0,
             threads: Vec::new(),
         }),
         cv: Condvar::new(),
@@ -858,8 +881,8 @@ fn thread_roots(l: &Local) -> Vec<u64> {
     let mut node = ARGS.with(|a| a.get());
     while !node.is_null() {
         let r = unsafe { &*node };
-        for i in 0..r.argc {
-            out.push(unsafe { std::ptr::read_volatile(r.argv.add(i)) });
+        for i in 0..r.argc.get() {
+            out.push(unsafe { std::ptr::read_volatile(r.argv.get().add(i)) });
         }
         node = r.prev.get();
     }
@@ -897,10 +920,31 @@ fn resume(g: MutexGuard<'static, World>) {
 /// or allocate objects; whatever it returns is used only after a collection in
 /// progress has finished.
 pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
-    let direct = LOCAL
-        .try_with(|l| l.stopped.get() || l.collecting.get() || l.inhibit.get() > 0)
-        .unwrap_or(true);
-    if direct || HOLD.with(|h| h.get()) > 0 {
+    let (plain, held) = LOCAL
+        .try_with(|l| {
+            (
+                l.stopped.get() || l.collecting.get(),
+                l.inhibit.get() > 0 || HOLD.with(|h| h.get()) > 0,
+            )
+        })
+        .unwrap_or((true, false));
+    if plain {
+        return f();
+    }
+    if held {
+        // A native below holds values the scan would miss (or the compiler does),
+        // so this thread cannot count as stopped while it waits. A collector must
+        // not sit out its timeout on it again and again: it is told that the wait
+        // is hopeless for now.
+        struct Unblocked;
+        impl Drop for Unblocked {
+            fn drop(&mut self) {
+                lock_world().held_blocked -= 1;
+            }
+        }
+        lock_world().held_blocked += 1;
+        world().cv.notify_all();
+        let _unblocked = Unblocked;
         return f();
     }
     register_thread();
@@ -925,14 +969,37 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
 /// giving up (a thread inside a long native operation is not at one).
 const STOP_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// What a thread did at a safepoint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Outcome {
+    /// No collection was wanted.
+    Nothing,
+    /// This thread collected and freed this many objects.
+    Collected(usize),
+    /// Another thread collected while this one was parked.
+    Parked,
+    /// Collections are deferred here (a hold, the compiler, a blocking region), or
+    /// the safepoint was passed over for a cleaner one.
+    Deferred,
+    /// The other threads could not be stopped.
+    Busy,
+}
+
 /// A thread at a safepoint while a collection is wanted: either park until the
 /// collection is over, or, if nobody is collecting yet, become the collector.
 /// Returns the number of objects freed when this thread collected.
 pub fn safepoint() -> Option<usize> {
+    match safepoint_outcome() {
+        Outcome::Collected(n) => Some(n),
+        _ => None,
+    }
+}
+
+fn safepoint_outcome() -> Outcome {
     if HOLD.with(|h| h.get()) > 0 {
         // A native frame below holds values the scan would miss. The request stays
         // up, so the first safepoint after that frame is gone collects.
-        return None;
+        return Outcome::Deferred;
     }
     let skip = LOCAL
         .try_with(|l| {
@@ -951,13 +1018,17 @@ pub fn safepoint() -> Option<usize> {
         })
         .unwrap_or(true);
     if skip {
-        return None;
+        return Outcome::Deferred;
     }
     register_thread();
-    with_frame(safepoint_at)
+    let outcome = with_frame(safepoint_at);
+    // Destructors of native objects the collection freed run here, after the
+    // world has been restarted and with no collector lock held.
+    run_finalizers();
+    outcome
 }
 
-fn safepoint_at(frame: &Frame) -> Option<usize> {
+fn safepoint_at(frame: &Frame) -> Outcome {
     let w = world();
     let g = lock_world();
     match g.phase {
@@ -966,19 +1037,19 @@ fn safepoint_at(frame: &Frame) -> Option<usize> {
             let g = LOCAL.with(|l| stop_here(l, frame));
             resume(g);
             clear_dead_stack();
-            None
+            Outcome::Parked
         }
         Phase::Idle => {
             let mut g = g;
             if GC_WANTED.load(Ordering::Acquire) && wait_for_cleaner_safepoint(frame) {
                 // Still wanted: the next safepoint looks again.
-                return None;
+                return Outcome::Deferred;
             }
             if !GC_WANTED.swap(false, Ordering::AcqRel) {
                 // Nothing to do (a request already served): lower the flag.
                 drop(g);
                 crate::native::safepoint_done();
-                return None;
+                return Outcome::Nothing;
             }
             // The flag stays raised until the collection is over, so every running
             // thread reaches `take_interrupt` and parks.
@@ -989,16 +1060,17 @@ fn safepoint_at(frame: &Frame) -> Option<usize> {
             let deadline = Instant::now() + STOP_TIMEOUT;
             while g.running > 1 {
                 let now = Instant::now();
-                if now >= deadline {
-                    // Someone is busy in native code or compiling: try again after
-                    // some more allocation.
+                if now >= deadline || g.held_blocked > 0 {
+                    // Someone is busy in native code or compiling, or is blocked
+                    // where it cannot be scanned: try again after some more
+                    // allocation.
                     g.phase = Phase::Idle;
                     STOPPING.store(false, Ordering::Release);
                     w.cv.notify_all();
                     drop(g);
                     crate::native::safepoint_done();
                     crate::heap::gc_postponed();
-                    return None;
+                    return Outcome::Busy;
                 }
                 let (guard, _) =
                     w.cv.wait_timeout(g, deadline - now)
@@ -1032,8 +1104,22 @@ fn safepoint_at(frame: &Frame) -> Option<usize> {
             drop(g);
             crate::native::safepoint_done();
             clear_dead_stack();
-            Some(freed)
+            Outcome::Collected(freed)
         }
+    }
+}
+
+/// A native object's destructor and its payload, to be run after the collection
+/// that freed the object.
+struct Finalizer(rscl_abi::DropFn, *mut std::ffi::c_void);
+
+fn run_finalizers() {
+    let pending = LOCAL
+        .try_with(|l| std::mem::take(&mut *l.finalizers.borrow_mut()))
+        .unwrap_or_default();
+    for Finalizer(drop_fn, data) in pending {
+        // A destructor that panics must not take the thread down with it.
+        let _ = std::panic::catch_unwind(|| unsafe { drop_fn(data) });
     }
 }
 
@@ -1103,28 +1189,56 @@ pub fn safepoint_ready() -> bool {
         .unwrap_or(false)
 }
 
+/// The result of asking for a collection now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Collect {
+    /// This thread ran the collection; the number of objects it freed.
+    Done(usize),
+    /// Collections are deferred at this point of this thread (a builtin that holds
+    /// them off is running further up, or the compiler is): the collection stays
+    /// requested and runs at the next safepoint that allows one.
+    Deferred,
+    /// The other threads could not be stopped in time.
+    Busy,
+}
+
 /// `(gc)`: collect now, on the calling thread: a full collection, or with
-/// `minor` one that only looks at what was allocated since the last. `None` if the
-/// other threads could not be stopped in time (or collections are deferred on
-/// this thread).
-pub fn collect_now(minor: bool) -> Option<usize> {
+/// `minor` one that only looks at the young objects. If another thread is
+/// collecting, this waits for it and then runs its own.
+pub fn collect_now(minor: bool) -> Collect {
     clear_dead_stack();
     collect_now_inner(minor)
 }
 
 #[inline(never)]
-fn collect_now_inner(minor: bool) -> Option<usize> {
-    GC_WANTED.store(true, Ordering::Release);
+fn collect_now_inner(minor: bool) -> Collect {
     let _ = LOCAL.try_with(|l| {
         l.force.set(true);
         l.force_minor.set(minor);
     });
-    let r = safepoint();
+    let mut result = Collect::Busy;
+    // Parking for someone else's collection is not the collection that was asked
+    // for (it may have been a minor one, and it did not report here): go again.
+    for _ in 0..64 {
+        GC_WANTED.store(true, Ordering::Release);
+        match safepoint_outcome() {
+            Outcome::Collected(n) => {
+                result = Collect::Done(n);
+                break;
+            }
+            Outcome::Parked | Outcome::Nothing => continue,
+            Outcome::Deferred => {
+                result = Collect::Deferred;
+                break;
+            }
+            Outcome::Busy => break,
+        }
+    }
     let _ = LOCAL.try_with(|l| {
         l.force.set(false);
         l.force_minor.set(false);
     });
-    r
+    result
 }
 
 // ---- marking -----------------------------------------------------------------------------
@@ -1167,7 +1281,7 @@ impl Marker {
     /// Mark the object at `addr` (known to be one) and queue it for tracing.
     #[inline]
     fn object(&mut self, addr: usize) {
-        if crate::arena::mark(addr) {
+        if crate::arena::mark(addr, !self.full) {
             self.stack.push(addr);
             if let Some(p) = &mut self.parents {
                 p.insert(addr, self.current);
@@ -1187,7 +1301,7 @@ impl Marker {
                 // After marking, everything a surviving object refers to must have
                 // survived too. An old object that refers to an unmarked one was
                 // written without the barrier.
-                if !crate::arena::is_marked(addr)
+                if !crate::arena::reached(addr, !self.full)
                     && header(addr).flags.load(Ordering::Relaxed) & PERMANENT == 0
                 {
                     panic!(
@@ -1696,7 +1810,7 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
         // Nothing that survived may refer to something that did not.
         m.checking = true;
         crate::arena::for_each_object(|p| {
-            if crate::arena::is_marked(p as usize)
+            if crate::arena::reached(p as usize, !full)
                 || unsafe { &*p }.flags.load(Ordering::Relaxed) & PERMANENT != 0
             {
                 m.current = p as usize;
@@ -1769,6 +1883,7 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
     // Sweep: an unmarked object is finalised (a keyword leaves the intern table
     // first) and its slot released.
     let mut promoted: Vec<usize> = Vec::new();
+    let mut finalizers: Vec<Finalizer> = Vec::new();
     let freed = crate::arena::sweep(
         full,
         |p| {
@@ -1779,6 +1894,15 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
             }
             if hd.kind == Kind::Keyword {
                 obj::keyword::forget(&[p as usize]);
+            }
+            if hd.kind == Kind::Native {
+                // The library's destructor may do anything (block, call back into
+                // the runtime): it runs after the collection, not inside it.
+                if let Some((drop_fn, data)) =
+                    unsafe { obj::native::take_destructor(p as *mut obj::native::NativeObj) }
+                {
+                    finalizers.push(Finalizer(drop_fn, data));
+                }
             }
             unsafe { obj::free(p) };
             false
@@ -1793,6 +1917,7 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
         header(p).flags.fetch_or(REMEMBERED, Ordering::Relaxed);
     }
     h.remembered = remembered;
+    l.finalizers.borrow_mut().append(&mut finalizers);
     // A permanent object is a root for minor collections until it is old.
     h.new_permanent.retain(|&p| !crate::arena::is_old(p));
     let after = if debug {

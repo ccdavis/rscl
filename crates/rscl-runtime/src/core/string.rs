@@ -62,9 +62,13 @@ builtins! {
     "split-lines" => fn cs_split_lines(args) [1] {
         Ok(crate::obj::vector::from_iter(args::string(&args[0], "s")?.lines().map(string::new).collect::<Vec<_>>()))
     }
-    "join" => fn cs_join(args) [1, 2] {
+    "join" => @gc fn cs_join(args) [1, 2] {
         let (sep, coll) = if args.len() == 2 { (crate::printer::str_of(&args[0]), &args[1]) } else { (String::new(), &args[0]) };
-        let parts: Vec<String> = crate::coll::to_vec(coll)?.iter().map(crate::printer::str_of).collect();
+        // Rooted: printing an element may run rscl code, and the elements of a map
+        // (its entries) exist nowhere but in this `Vec`.
+        let items = crate::coll::to_vec(coll)?;
+        let _root = crate::gc::root_slice(&items);
+        let parts: Vec<String> = items.iter().map(crate::printer::str_of).collect();
         Ok(string::from_string(parts.join(&sep)))
     }
     "replace" => fn cs_replace(args) [3] {

@@ -63,11 +63,18 @@ native_fns! {
         Ok(Value::bool(!cap(this, 0).call(&all_args(args))?.truthy()))
     }
     "constantly" => fn nf_constantly(args, this) [; 0] { let _ = args; Ok(cap(this, 0)) }
-    "juxt" => fn nf_juxt(args, this) [; 0] {
+    "juxt" => @gc fn nf_juxt(args, this) [; 0] {
         let fs = coll::to_vec(&cap(this, 0))?;
         let a = all_args(args);
+        // The results so far are rooted while the remaining fns run.
+        let root = crate::gc::ArgRoot::empty();
+        let _rooted = root.enter();
         let mut out = Vec::with_capacity(fs.len());
-        for f in &fs { out.push(f.call(&a)?); }
+        for f in &fs {
+            let r = f.call(&a)?;
+            out.push(r);
+            root.set(&out);
+        }
         Ok(vector::from_iter(out))
     }
     "fnil" => @gc fn nf_fnil(args, this) [; 1] {

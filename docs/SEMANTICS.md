@@ -154,9 +154,11 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   checked by `TypeId`. A map argument converted to `HashMap<String, V>` keeps a
   keyword's namespace in the key (`user/id`) and rejects two keys with the same
   name. `clear_exception` drops an error the library handles itself. An export
-  takes at most 63 parameters. The ABI is at version 4.
+  takes at most 63 parameters. The ABI is at version 5 (version 4 libraries, built
+  for reference counting, are rejected at load).
 - Native objects (`Native<T>`) print as `#object[type 0x...]`, compare by identity,
-  and are dropped (running `T`'s destructor in the library) when unreferenced. They
+  and are dropped (running `T`'s destructor in the library) some time after they
+  become unreachable, by the collector. They
   belong to the library instance that created them: after a reload, a handle made by
   the old copy is a `ClassCastException` to the new one, never a reinterpretation.
 - A plain C library (no `rscl_module_register`) is opened globally so its symbols are
@@ -315,15 +317,25 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   last one (`RSCL_GC_MIN_MB`), and runs at the next safepoint: a fn entry, a
   loop iteration or a blocking wait, with every other thread stopped at one too.
   Allocation itself never collects. `(gc)` runs a full collection now (`(gc :minor)` a minor
-  one) and returns the number of objects freed; `(gc-count)` counts collections. A thread stuck in
-  a long native call delays a collection; `(gc)` throws if the others cannot be
-  stopped within 200 ms.
+  one) and returns the number of objects freed; if another thread is collecting,
+  it waits for that and then runs its own. Where collections are deferred (under a
+  builtin that holds them off, during macro expansion) it returns `nil`, and the
+  collection runs at the next safepoint that allows one. `(gc-count)` counts
+  collections. A thread stuck in a long native call delays a collection; `(gc)`
+  throws if the others cannot be stopped within 200 ms.
 - **Natives.** A builtin defers collections while it runs (it may hold values in
-  Rust data the collector cannot see) unless it is declared safe; the ones that
-  drive long computations are (`reduce`, `apply`, `swap!`, the seq functions,
-  protocol and multimethod dispatch, `deref`, `require`, ...). A collection wanted
-  meanwhile runs at the first safepoint after the builtin returns. The compiler
-  defers collections while it analyses a form (macros run then).
+  Rust data the collector cannot see) unless it is declared safe, which means it
+  keeps what it needs rooted. The safe ones are those under which long
+  computations run: the seq functions, `reduce`, `into`, `apply`, `swap!`,
+  `deref`, protocol and multimethod dispatch, `partial`/`comp`/`juxt` and
+  friends, `sort`, `sort-by`, `group-by`, `frequencies`, `set`, `zipmap`,
+  `concat`, `=`, printing and `str`, `clojure.string/join`, `require`. Under any
+  other builtin that calls back into rscl code, a collection that becomes due
+  waits for the first safepoint after the builtin returns, and a thread that
+  blocks there (a `deref` inside such a callback) cannot be stopped for another
+  thread's collection, which is then put off. The compiler defers collections
+  while it analyses a form (macros run then). A call into a native bridge library
+  holds collections off as well.
 - **Lazy sequences stream.** A compiled function stops holding a sequence when it
   has no further use for it (liveness is the compiler's, through the stack maps),
   and the consuming core fns (`reduce`, `count`, `nth`, `last`, `dorun`, `into`,
@@ -339,9 +351,12 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   clearing) but cannot rule it out.
 - Cycles need no special treatment. Keywords are interned weakly: one that nothing
   refers to is removed from the intern table when it is collected.
-- Native bridge libraries: values a library function holds on its stack are found
-  by the scan, and collections are deferred while it calls back into rscl code. A
-  library must not keep rscl values in its own long-lived storage.
+- Native bridge libraries: no collection runs during a call into a library, so
+  whatever a library function holds during the call is safe. A library must not
+  keep rscl values in storage of its own beyond a call. A native object's
+  destructor runs after the collection that finds the object unreachable (a full
+  one, if the object has grown old), not when the last reference goes; a library
+  whose objects hold scarce resources should offer an explicit close.
 - Diagnostics: `RSCL_GC_DEBUG` (one line per collection), `RSCL_GC_STRESS=n`
   (collect at every n-th safepoint), `RSCL_GC_VERIFY` (check every traced
   reference and stack-map slot, and after each collection that no survivor refers
@@ -355,7 +370,11 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   the physical memory or of the cgroup limit, whichever is smaller. The allocator
   keeps count of the bytes in use; the thread whose allocation crosses the limit
   gets an `OutOfMemoryError` at its next fn entry, loop iteration or blocking wait,
-  after one collection has had the chance to free enough. If that thread does
+  once a full collection has run and the heap is still over the limit. Where no
+  collection can run at that point (collections are deferred there, or another
+  thread cannot be stopped), the error is put off until the heap is a quarter over
+  the limit. The limit is never more than half of the address space reserved for
+  objects (256 GB where the system allows it). If that thread does
   not get there within 50 ms (it waits in native code), another thread running rscl
   code takes the error instead; one raised by a program's last form is reported
   while the program waits for its futures, with exit status 1. The error is

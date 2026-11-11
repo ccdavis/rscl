@@ -294,8 +294,10 @@ builtins! {
         lock(&args[0])?;
         Ok(Value::NIL)
     }
-    // (gc): a full collection. (gc :minor): only what was allocated since the last
-    // collection is examined. Returns the number of objects freed.
+    // (gc): a full collection. (gc :minor): only the young objects are examined.
+    // Returns the number of objects freed, or nil where collections are deferred
+    // (under a builtin that holds them off, or during macro expansion): the
+    // collection then runs at the next safepoint that allows one.
     "gc" => @gc fn cc_gc(args) [0, 1] {
         let minor = match args.first() {
             None => false,
@@ -303,8 +305,9 @@ builtins! {
             Some(k) => return err(ILLEGAL_ARGUMENT, format!("gc: unknown option {}", crate::printer::pr_str(k))),
         };
         match crate::gc::collect_now(minor) {
-            Some(n) => Ok(Value::int(n as i64)),
-            None => err(ILLEGAL_STATE, "gc: cannot collect now (another thread did not reach a safepoint in time, or collections are deferred here)"),
+            crate::gc::Collect::Done(n) => Ok(Value::int(n as i64)),
+            crate::gc::Collect::Deferred => Ok(Value::NIL),
+            crate::gc::Collect::Busy => err(ILLEGAL_STATE, "gc: another thread did not reach a safepoint in time"),
         }
     }
     "gc-count" => fn cc_gc_count(args) [0] { let _ = args; Ok(Value::int(crate::gc::collections() as i64)) }

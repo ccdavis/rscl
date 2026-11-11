@@ -24,13 +24,13 @@ pub fn emit(s: &str) {
 }
 
 builtins! {
-    "=" => fn cf_eq(args) [; 1] {
+    "=" => @gc fn cf_eq(args) [; 1] {
         let first = &args[0];
         let eq = args[1..].iter().all(|a| crate::equiv::equiv(first, a));
         if !eq && crate::exc::is_pending() { return Err(crate::exc::Exc); }
         Ok(Value::bool(eq))
     }
-    "not=" => fn cf_not_eq(args) [; 1] {
+    "not=" => @gc fn cf_not_eq(args) [; 1] {
         let first = &args[0];
         let eq = args[1..].iter().all(|a| crate::equiv::equiv(first, a));
         if !eq && crate::exc::is_pending() { return Err(crate::exc::Exc); }
@@ -56,19 +56,19 @@ builtins! {
     "symbol?" => fn cf_symbol_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Symbol))) }
     "fn?" => fn cf_fn_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Fn))) }
     "var?" => fn cf_var_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Var))) }
-    "str" => fn cf_str(args) [; 0] {
+    "str" => @gc fn cf_str(args) [; 0] {
         let mut out = String::new();
         for a in args {
             crate::printer::write_str(&mut out, a);
         }
         Ok(string::from_string(out))
     }
-    "pr-str" => fn cf_pr_str(args) [; 0] { Ok(string::from_string(join_args(args, true, " "))) }
-    "print-str" => fn cf_print_str(args) [; 0] { Ok(string::from_string(join_args(args, false, " "))) }
-    "pr" => fn cf_pr(args) [; 0] { emit(&join_args(args, true, " ")); Ok(Value::NIL) }
-    "prn" => fn cf_prn(args) [; 0] { let mut s = join_args(args, true, " "); s.push('\n'); emit(&s); Ok(Value::NIL) }
-    "print" => fn cf_print(args) [; 0] { emit(&join_args(args, false, " ")); Ok(Value::NIL) }
-    "println" => fn cf_println(args) [; 0] { let mut s = join_args(args, false, " "); s.push('\n'); emit(&s); Ok(Value::NIL) }
+    "pr-str" => @gc fn cf_pr_str(args) [; 0] { Ok(string::from_string(join_args(args, true, " "))) }
+    "print-str" => @gc fn cf_print_str(args) [; 0] { Ok(string::from_string(join_args(args, false, " "))) }
+    "pr" => @gc fn cf_pr(args) [; 0] { emit(&join_args(args, true, " ")); Ok(Value::NIL) }
+    "prn" => @gc fn cf_prn(args) [; 0] { let mut s = join_args(args, true, " "); s.push('\n'); emit(&s); Ok(Value::NIL) }
+    "print" => @gc fn cf_print(args) [; 0] { emit(&join_args(args, false, " ")); Ok(Value::NIL) }
+    "println" => @gc fn cf_println(args) [; 0] { let mut s = join_args(args, false, " "); s.push('\n'); emit(&s); Ok(Value::NIL) }
     "newline" => fn cf_newline(args) [0] { let _ = args; emit("\n"); Ok(Value::NIL) }
     "flush" => fn cf_flush(args) [0] { let _ = args; let _ = std::io::stdout().flush(); Ok(Value::NIL) }
     "name" => fn cf_name(args) [1] {

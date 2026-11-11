@@ -7,3 +7,4 @@
 Wrong number of args (1) passed to: add String cannot be cast to i64 (argument a)
 true true demo
 (11 22 33) 5050
+10 :freed

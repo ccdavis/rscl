@@ -1,5 +1,10 @@
 //! Opaque objects owned by a native bridge library. The runtime knows only the type
-//! name (for matching and printing) and a destructor to call when the value dies.
+//! name (for matching and printing) and a destructor to call when the value dies:
+//! some time after the last reference is gone, when a collection finds the object
+//! unreachable (a full collection, if the object has grown old). The destructor
+//! runs after that collection, on the thread that collected, with no collector
+//! lock held. A library whose objects hold scarce resources (files, sockets)
+//! should offer an explicit close as well.
 use std::ffi::c_void;
 
 use super::{Kind, alloc, cast};
@@ -27,6 +32,20 @@ impl Drop for NativeObj {
             unsafe { f(self.data) }
         }
     }
+}
+
+/// Take the destructor out of a native object that is about to be freed, so the
+/// collector can run it after the collection instead of inside it.
+///
+/// # Safety
+/// `p` must point at a native object nothing refers to any more.
+pub(crate) unsafe fn take_destructor(p: *mut NativeObj) -> Option<(rscl_abi::DropFn, *mut c_void)> {
+    let o = unsafe { &mut *p };
+    let f = o.drop_fn.take()?;
+    if o.data.is_null() {
+        return None;
+    }
+    Some((f, std::mem::replace(&mut o.data, std::ptr::null_mut())))
 }
 
 pub fn new(

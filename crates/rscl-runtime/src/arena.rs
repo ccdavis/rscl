@@ -56,6 +56,7 @@ fn class_size(class: usize) -> usize {
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
@@ -106,26 +107,43 @@ fn layout() -> &'static Layout {
         // reservations are tried when the system refuses a large one.
         for gb in [256usize, 64, 16, 4, 1] {
             let blocks = (gb << 30) >> BLOCK_SHIFT;
-            let Some(base) = reserve(blocks << BLOCK_SHIFT) else {
-                continue;
-            };
-            let (Some(classes), Some(bitmaps), Some(marks), Some(olds), Some(ageds)) = (
-                reserve(blocks),
-                reserve(blocks * WORDS * 8),
-                reserve(blocks * WORDS * 8),
-                reserve(blocks * WORDS * 8),
-                reserve(blocks * WORDS * 8),
-            ) else {
-                continue;
-            };
-            return Layout {
-                base,
+            // The heap itself, the class bytes, and the four bitmaps.
+            let sizes = [
+                blocks << BLOCK_SHIFT,
                 blocks,
-                classes,
-                bitmaps,
-                marks,
-                olds,
-                ageds,
+                blocks * WORDS * 8,
+                blocks * WORDS * 8,
+                blocks * WORDS * 8,
+                blocks * WORDS * 8,
+            ];
+            let mut got = [0usize; 6];
+            let mut ok = true;
+            for (i, &size) in sizes.iter().enumerate() {
+                match reserve(size) {
+                    Some(p) => got[i] = p,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                // Give back what this attempt did get before trying a smaller one.
+                for (i, &p) in got.iter().enumerate() {
+                    if p != 0 {
+                        unsafe { munmap(p as *mut u8, sizes[i]) };
+                    }
+                }
+                continue;
+            }
+            return Layout {
+                base: got[0],
+                blocks,
+                classes: got[1],
+                bitmaps: got[2],
+                marks: got[3],
+                olds: got[4],
+                ageds: got[5],
             };
         }
         panic!("cannot reserve address space for the object heap");
@@ -179,18 +197,23 @@ unsafe fn bitmap(l: &Layout, block: usize) -> *mut u64 {
     (l.bitmaps + block * WORDS * 8) as *mut u64
 }
 
-/// Mark the object at `addr`; true if it was not marked before. The marks are kept
-/// apart from the objects: a collection that meets many references to objects it
-/// has already marked (or, in a minor collection, to old ones) decides each from
-/// this dense bitmap without touching the object. Only the collector calls this,
-/// with the world stopped.
+/// Mark the object at `addr`; true if it was not reached before. In a `minor`
+/// collection an old object counts as reached already and is left alone. The
+/// marks are kept apart from the objects: a collection that meets many references
+/// to objects it has already marked, or to old ones, decides each from these dense
+/// bitmaps without touching the object. Only the collector calls this, with the
+/// world stopped.
 #[inline]
-pub fn mark(addr: usize) -> bool {
+pub fn mark(addr: usize, minor: bool) -> bool {
     let l = layout();
     let i = (addr - l.base) >> 4;
-    let w = (l.marks + (i >> 6) * 8) as *mut u64;
+    let at = (i >> 6) * 8;
     let bit = 1u64 << (i & 63);
     unsafe {
+        if minor && *((l.olds + at) as *const u64) & bit != 0 {
+            return false;
+        }
+        let w = (l.marks + at) as *mut u64;
         if *w & bit != 0 {
             false
         } else {
@@ -200,14 +223,18 @@ pub fn mark(addr: usize) -> bool {
     }
 }
 
-/// Was the object at `addr` reached in the collection that is running (or, in a
-/// minor one, is it old)?
+/// Was the object at `addr` reached in the collection that is running? (In a
+/// `minor` one, old objects count as reached.)
 #[inline]
-pub fn is_marked(addr: usize) -> bool {
+pub fn reached(addr: usize, minor: bool) -> bool {
     let l = layout();
     let i = (addr - l.base) >> 4;
-    let w = (l.marks + (i >> 6) * 8) as *const u64;
-    unsafe { std::ptr::read_volatile(w) & (1u64 << (i & 63)) != 0 }
+    let at = (i >> 6) * 8;
+    let bit = 1u64 << (i & 63);
+    unsafe {
+        (minor && *((l.olds + at) as *const u64) & bit != 0)
+            || *((l.marks + at) as *const u64) & bit != 0
+    }
 }
 
 /// Is the object at `addr` old (see `Layout`)?
@@ -233,17 +260,21 @@ pub fn stays_young(addr: usize) -> bool {
     }
 }
 
-/// Prepare the marks for a collection: none for a full one; for a minor one every
-/// old object starts out marked, so the trace neither enters nor frees it.
+/// Clear the marks a collection is going to use: all of them for a full one; for
+/// a minor one only those of the young blocks, since only young objects get
+/// marked (an old object counts as reached without a mark, see `mark`). So a
+/// minor collection costs nothing in proportion to the heap.
 pub fn begin_marks(full: bool) {
     let l = layout();
     let p = pool();
-    let bytes = p.next * WORDS * 8;
     unsafe {
         if full {
-            std::ptr::write_bytes(l.marks as *mut u8, 0, bytes);
+            std::ptr::write_bytes(l.marks as *mut u8, 0, p.next * WORDS * 8);
         } else {
-            std::ptr::copy_nonoverlapping(l.olds as *const u8, l.marks as *mut u8, bytes);
+            for &block in &p.young {
+                let at = block as usize * WORDS * 8;
+                std::ptr::write_bytes((l.marks + at) as *mut u8, 0, WORDS * 8);
+            }
         }
     }
 }
@@ -366,10 +397,16 @@ fn acquire(l: &Layout, class: usize) -> usize {
     let block = match p.free.pop() {
         Some(b) => b as usize,
         None => {
-            assert!(
-                p.next < l.blocks,
-                "the object heap's address space is exhausted"
-            );
+            if p.next >= l.blocks {
+                // The heap limit is capped well below the reservation (see
+                // `heap::configure`), so this takes pathological fragmentation.
+                // There is no way to report it to the program from here.
+                eprintln!(
+                    "rscl: the object heap's address space ({} GB) is exhausted",
+                    reserved_bytes() >> 30
+                );
+                std::process::abort();
+            }
             p.next += 1;
             USED_END.fetch_max(block_addr(l, p.next), Ordering::Relaxed);
             p.next - 1
@@ -399,6 +436,11 @@ pub fn find(addr: usize) -> Option<usize> {
     let bit = slot * (csize / GRAIN);
     let used = unsafe { *bitmap(l, block).add(bit / 64) } >> (bit % 64) & 1 == 1;
     used.then(|| block_addr(l, block) + slot * csize)
+}
+
+/// Bytes of address space reserved for objects.
+pub fn reserved_bytes() -> usize {
+    layout().blocks << BLOCK_SHIFT
 }
 
 /// Is `addr` inside the part of the object heap that has been handed out?
@@ -518,7 +560,11 @@ pub fn sweep(
             if used == 0 {
                 continue;
             }
-            let (mark, mut old, aged) = unsafe { (*marks.add(w), *olds.add(w), *ageds.add(w)) };
+            let (mut mark, mut old, aged) = unsafe { (*marks.add(w), *olds.add(w), *ageds.add(w)) };
+            if !full {
+                // Old objects were not marked: they count as reached.
+                mark |= old;
+            }
             let young_live = used & mark & !old;
             let first = young_live & !aged;
             let mut second = young_live & aged;

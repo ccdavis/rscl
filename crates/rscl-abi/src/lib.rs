@@ -6,18 +6,20 @@
 //! runtime (one interning table, one heap). Values cross the boundary as raw 64-bit
 //! words.
 //!
-//! Lifetimes: the runtime has a tracing garbage collector. A value a library
-//! function holds on its stack (or received as an argument) stays alive for the
-//! call, and collections are deferred while the function calls back into rscl
-//! code. A library must not keep values in storage of its own beyond a call: the
-//! collector does not see them there. `retain` and `release` remain in the table
-//! and do nothing.
+//! Lifetimes (API version 5): the runtime has a tracing garbage collector. No
+//! collection runs while a library function is being called, so every value it
+//! receives, creates or extracts stays alive for the call, wherever the library
+//! keeps it. A library must not keep values in storage of its own *beyond* a
+//! call: the collector does not see them there, and `retain` and `release` (which
+//! remain in the table) do nothing. Version 4 libraries relied on them and are
+//! rejected at load. The destructor of a native object runs some time after the
+//! object becomes unreachable (see the runtime's `obj/native.rs`), not at once.
 #![no_std]
 
 use core::ffi::c_void;
 
 /// Bump when `RtApi` changes incompatibly.
-pub const API_VERSION: u32 = 4;
+pub const API_VERSION: u32 = 5;
 
 /// The symbol every bridge library exports.
 pub const REGISTER_SYMBOL: &str = "rscl_module_register";

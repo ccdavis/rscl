@@ -305,7 +305,11 @@ pub fn over_limit() -> Option<(usize, usize)> {
 
 /// Set the limit in bytes (`None`: unlimited).
 pub fn set_limit(bytes: Option<usize>) {
-    let l = bytes.unwrap_or(usize::MAX);
+    // Never beyond half of the address space reserved for objects: the error must
+    // arrive while the object heap still has room, whatever was asked for.
+    let l = bytes
+        .unwrap_or(usize::MAX)
+        .min(crate::arena::reserved_bytes() / 2);
     LIMIT.store(l, Ordering::Relaxed);
     NEXT.store(l, Ordering::Relaxed);
 }

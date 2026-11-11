@@ -11,3 +11,6 @@
 (println (try (d/add 1) (catch Exception e (ex-message e))) (try (d/add "a" 1) (catch Exception e (ex-message e))))
 (println (fn? d/add) (= 'demo (load-native "librscl_demo.so")) (ns-name (find-ns 'demo)))
 (println (map d/add [1 2 3] [10 20 30]) (reduce d/add 0 (range 101)))
+;; A lazy seq realised inside a library call (collections are held off there), and a
+;; native object freed by the collector (its destructor runs after the collection).
+(println (d/sum (map (fn [x] (gc) x) (range 5))) (do (d/make-counter 1) (gc) (gc) (gc) :freed))

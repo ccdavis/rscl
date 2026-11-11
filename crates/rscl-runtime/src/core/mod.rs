@@ -96,7 +96,7 @@ macro_rules! native_fns {
                     const MASK: u64 = 0 $(| (1u64 << $fixed))*;
                     const VMIN: i64 = -1 $(+ 1 + $vmin)?;
                     let __taker = $crate::core::Taker::new(argv, argc, owned);
-                    $crate::__native_hold!($($safe)?; argv, argc);
+                    $crate::__native_hold!($($safe)?; argv, argc, _this; $($this)?);
                     let r: std::thread::Result<$crate::exc::RtResult<$crate::value::Value>> =
                         if !$crate::core::accepts(MASK, VMIN, argc) {
                             Ok(Err($crate::exc::Exc_from($crate::core::arity_error($name, argc))))
@@ -148,14 +148,24 @@ pub unsafe fn clear_stack_for_stream(argv: *const Value, argc: i64, owned: u64) 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __native_hold {
-    (; $argv:ident, $argc:ident) => {
+    (; $argv:ident, $argc:ident, $fnobj:ident; $($this:ident)?) => {
         let _hold = $crate::gc::hold();
     };
     // A native under which a collection may run keeps its arguments reachable (its
     // caller's argument slots are not roots by themselves).
-    (gc; $argv:ident, $argc:ident) => {
+    (gc; $argv:ident, $argc:ident, $fnobj:ident;) => {
         let __args = $crate::gc::ArgRoot::new($argv, $argc);
         let _rooted = __args.enter();
+    };
+    // One that is a closure keeps itself reachable too, and through itself what it
+    // captured: the caller may have dropped the fn object the moment it called it.
+    (gc; $argv:ident, $argc:ident, $fnobj:ident; $this:ident) => {
+        let __args = $crate::gc::ArgRoot::new($argv, $argc);
+        let _rooted = __args.enter();
+        let __self_word = [$fnobj as u64];
+        let __self =
+            $crate::gc::ArgRoot::new(__self_word.as_ptr() as *const $crate::value::Value, 1);
+        let _self_rooted = __self.enter();
     };
 }
 

@@ -26,9 +26,8 @@ unsafe fn write_str(src: &str, out: *mut *const u8, len: *mut i64) {
     }
 }
 
-// Reference counting is gone: a library's values are found on its stack by the
-// collector, and collections are deferred while a library function calls back into
-// rscl code (`api_invoke`), since it may hold values in its own heap data.
+// Reference counting is gone: no collection runs under a library call (see
+// `bridge_call`), so whatever a library function holds during the call is safe.
 unsafe extern "C" fn api_retain(_v: u64) {}
 unsafe extern "C" fn api_release(_v: u64) {}
 unsafe extern "C" fn api_type_name(v: u64, out: *mut *const u8, len: *mut i64) {
@@ -170,7 +169,6 @@ unsafe extern "C" fn api_map_entries(m: u64) -> u64 {
     }
 }
 unsafe extern "C" fn api_invoke(f: u64, argc: i64, argv: *const u64) -> u64 {
-    let _hold = crate::gc::hold();
     unsafe { crate::ffi::rt_invoke(borrowed(f), argc, argv as *const Value, 0) }.into_raw()
 }
 unsafe extern "C" fn api_throw(
@@ -226,12 +224,33 @@ unsafe extern "C" fn api_register_fn(
         .unwrap_or_else(|| crate::ns::current().name.to_string());
     let ns = crate::ns::find_or_create(&ns_name);
     let qualified = format!("{ns_name}/{name}");
-    // The bridge's `Entry` takes `*const c_void`; ours takes `*const FnObj`: same ABI.
-    let entry: func::Entry = unsafe { std::mem::transmute::<Entry, func::Entry>(entry) };
-    let proto = func::new_proto(entry, &qualified, arity_mask, variadic_min);
-    let f = func::new(proto, 0);
+    // The library's function is called through `bridge_call`, which holds
+    // collections off for the call; its address travels as the fn's one capture.
+    let proto = func::new_proto(bridge_call, &qualified, arity_mask, variadic_min);
+    let f = func::new(proto, 1);
+    unsafe { func::set_capture(&f, 0, Value::int(entry as usize as i64)) };
     crate::ffi::make_immortal(&f);
     ns.intern(name).bind_root(f);
+}
+
+/// Entry of every fn a bridge library registers. A library function reads its
+/// arguments from the caller's slots and keeps values in its own data (the `Vec`
+/// a conversion built, say) while runtime services it calls may run rscl code (a
+/// lazy seq realising in `to_vector`, a callback through `invoke`). None of that
+/// is visible to the collector, so no collection runs under a library call.
+unsafe extern "C" fn bridge_call(
+    this: *const func::FnObj,
+    argc: i64,
+    argv: *const Value,
+    owned: u64,
+) -> Value {
+    let _hold = crate::gc::hold();
+    let addr = unsafe { &*func::capture_ptr_raw(this, 0) }
+        .as_fixnum()
+        .unwrap_or(0) as usize;
+    // The bridge's `Entry` takes `*const c_void`; ours takes `*const FnObj`: same ABI.
+    let entry: func::Entry = unsafe { std::mem::transmute::<usize, func::Entry>(addr) };
+    unsafe { entry(this, argc, argv, owned) }
 }
 unsafe extern "C" fn api_pr_str(v: u64) -> u64 {
     string::from_string(crate::printer::pr_str(&borrowed(v))).into_raw()

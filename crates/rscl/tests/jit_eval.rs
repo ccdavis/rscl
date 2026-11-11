@@ -1242,3 +1242,87 @@ fn old_objects_written_after_a_collection_keep_what_they_refer_to() {
         assert!(full >= 1000, "a full collection left old garbage: {full}");
     });
 }
+
+#[test]
+fn natives_that_let_collections_run_keep_what_they_hold() {
+    with_jit(|j| {
+        // A closure made for one call is dead in its caller once it is called;
+        // the native behind it must keep it (and the fns it captured) alive while
+        // those run and collect.
+        assert_eq!(
+            eval(
+                j,
+                "((comp (partial + (count (str \"ab\"))) (fn [x] (gc) (inc x)) (fn [x] (gc) (* x 2))) 5)"
+            ),
+            "13"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "((juxt (fn [x] (gc) (str x)) (fn [x] (gc) (str x x)) (fn [x] (gc) (str x x x))) 7)"
+            ),
+            "[\"7\" \"77\" \"777\"]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[((every-pred (fn [x] (gc) (pos? x)) (fn [x] (gc) (odd? x))) 3 5) ((some-fn (fn [x] (gc) nil) (fn [x] (gc) (str x))) 4)]"
+            ),
+            "[true \"4\"]"
+        );
+        // Natives that gather values in Rust vectors and maps while a key fn, a
+        // comparator or a lazy seq runs (and collects).
+        assert_eq!(
+            eval(j, "(sort-by (fn [x] (gc) (str x)) [3 1 2])"),
+            "(1 2 3)"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(sort (fn [a b] (gc :minor) (compare (str a) (str b))) (map str [3 1 2]))"
+            ),
+            "(\"1\" \"2\" \"3\")"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [g (group-by (fn [x] (gc) (str (odd? x))) (range 6))] [(get g \"false\") (get g \"true\")])"
+            ),
+            "[[0 2 4] [1 3 5]]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(sort (vec (frequencies (map (fn [x] (gc :minor) (str (rem x 3))) (range 9)))))"
+            ),
+            "([\"0\" 3] [\"1\" 3] [\"2\" 3])"
+        );
+        assert_eq!(
+            eval(j, "(count (set (map (fn [x] (gc) (str x)) (range 5))))"),
+            "5"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(get (zipmap (map (fn [x] (gc) (str x)) (range 4)) (map (fn [x] (gc) (str x x)) (range 4))) \"3\")"
+            ),
+            "\"33\""
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[(pr-str (map (fn [x] (gc) (str x)) (range 3))) (str (map (fn [x] (gc) x) (range 3))) (count (concat {:a (str 1)} (map (fn [x] (gc) x) (range 3))))]"
+            ),
+            "[\"(\\\"0\\\" \\\"1\\\" \\\"2\\\")\" \"(0 1 2)\" 4]"
+        );
+        // (gc) from several threads at once: each waits for the others' collections
+        // and then runs its own.
+        assert_eq!(
+            eval(
+                j,
+                "(let [fs (doall (map (fn [_] (future (dotimes [_ 20] (gc)) :ok)) (range 4)))] (mapv deref fs))"
+            ),
+            "[:ok :ok :ok :ok]"
+        );
+    });
+}

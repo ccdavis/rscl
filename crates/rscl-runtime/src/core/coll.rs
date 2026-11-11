@@ -22,9 +22,13 @@ builtins! {
     "list" => fn cf_list(args) [; 0] { Ok(list::from_iter(owned_vec(args))) }
     "vector" => fn cf_vector(args) [; 0] { Ok(vector::from_iter(owned_vec(args))) }
     "vec" => @gc fn cf_vec(args) [1] { Ok(vector::from_iter(coll::to_vec(&args[0])?)) }
-    "set" => fn cf_set(args) [1] {
+    "set" => @gc fn cf_set(args) [1] {
+        // Rooted: hashing an element may run rscl code (a lazy seq in it), and the
+        // set under construction is Rust data the collector does not see.
+        let items = coll::to_vec(&args[0])?;
+        let _root = crate::gc::root_slice(&items);
         let mut s = set::empty_set();
-        for x in coll::to_vec(&args[0])? { if !s.contains(&x) { s.insert(x); } }
+        for x in &items { if !s.contains(x) { s.insert(x.clone()); } }
         Ok(set::new(s))
     }
     "hash-map" => fn cf_hash_map(args) [; 0] {
@@ -45,7 +49,7 @@ builtins! {
     "rest" => @gc fn cf_rest(args) [1] { coll::rest(&args[0]) }
     "next" => @gc fn cf_next(args) [1] { coll::next(&args[0]) }
     "last" => @gc fn cf_last(args; owned = taker) [1] { coll::last_owned(taker.cursor(0)) }
-    "butlast" => fn cf_butlast(args) [1] {
+    "butlast" => @gc fn cf_butlast(args) [1] {
         let mut v = coll::to_vec(&args[0])?;
         v.pop();
         Ok(if v.is_empty() { Value::NIL } else { list::from_iter(v) })
@@ -78,14 +82,14 @@ builtins! {
         Ok(c)
     }
     "assoc-in" => fn cf_assoc_in(args) [3] { assoc_in(&args[0], &coll::to_vec(&args[1])?, args[2].owned()) }
-    "update" => fn cf_update(args) [; 3] {
+    "update" => @gc fn cf_update(args) [; 3] {
         let old = coll::get(&args[0], &args[1], None)?;
         let mut fargs = vec![old];
         fargs.extend(args[3..].iter().map(|a| a.owned()));
         let new = call(&args[2], &fargs)?;
         coll::assoc(&args[0], args[1].owned(), new)
     }
-    "update-in" => fn cf_update_in(args) [; 3] {
+    "update-in" => @gc fn cf_update_in(args) [; 3] {
         let path = coll::to_vec(&args[1])?;
         let old = { let mut cur = args[0].owned(); for k in &path { cur = coll::get(&cur, k, None)?; } cur };
         let mut fargs = vec![old];
@@ -114,7 +118,7 @@ builtins! {
     "empty" => fn cf_empty(args) [1] { Ok(coll::empty(&args[0])) }
     "empty?" => @gc fn cf_empty_p(args) [1] { Ok(Value::bool(coll::seq(&args[0])?.is_nil())) }
     "not-empty" => @gc fn cf_not_empty(args) [1] { Ok(if coll::seq(&args[0])?.is_nil() { Value::NIL } else { args[0].owned() }) }
-    "reverse" => fn cf_reverse(args) [1] {
+    "reverse" => @gc fn cf_reverse(args) [1] {
         let mut v = coll::to_vec(&args[0])?;
         v.reverse();
         Ok(list::from_iter(v))
@@ -125,9 +129,17 @@ builtins! {
         for x in coll::iter_owned(taker.cursor(1))? { c = coll::conj(&c, x?)?; }
         Ok(c)
     }
-    "concat" => fn cf_concat(args) [; 0] {
+    "concat" => @gc fn cf_concat(args) [; 0] {
+        // What has been gathered is rooted while a later argument is realised (the
+        // entries of a map argument exist nowhere else).
+        let root = crate::gc::ArgRoot::empty();
+        let _rooted = root.enter();
         let mut out = Vec::new();
-        for a in args { out.extend(coll::to_vec(a)?); }
+        for a in args {
+            let items = coll::to_vec(a)?;
+            out.extend(items);
+            root.set(&out);
+        }
         Ok(if out.is_empty() { Value::NIL } else { list::from_iter(out) })
     }
     "reduce" => @gc fn cf_reduce(args; owned = taker) [2, 3] {
@@ -149,29 +161,57 @@ builtins! {
             None => call(&args[0], &[]),
         }
     }
-    "reduce-kv" => fn cf_reduce_kv(args) [3] {
+    // (The entries are the map's own keys and values: reachable through the map.)
+    "reduce-kv" => @gc fn cf_reduce_kv(args) [3] {
         let mut acc = args[1].owned();
         let Some(m) = map::as_map(&args[2]) else { return err(CLASS_CAST, "reduce-kv requires a map") };
         let entries: Vec<(Value, Value)> = m.m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         for (k, v) in entries { acc = call(&args[0], &[acc, k, v])?; }
         Ok(acc)
     }
-    "frequencies" => fn cf_frequencies(args; owned = taker) [1] {
+    "frequencies" => @gc fn cf_frequencies(args; owned = taker) [1] {
+        // The sequence is walked through its argument slot, so the elements behind
+        // the cursor live only in the map being built, which is Rust data: the
+        // distinct ones are kept in a rooted `Vec` beside it.
+        let root = crate::gc::ArgRoot::empty();
+        let _rooted = root.enter();
+        let mut keys: Vec<Value> = Vec::new();
         let mut m = map::empty_map();
         for x in coll::iter_owned(taker.cursor(0))? {
             let x = x?;
-            let n = m.get(&x).and_then(|v| v.as_int()).unwrap_or(0);
+            let n = match m.get(&x).and_then(|v| v.as_int()) {
+                Some(n) => n,
+                None => {
+                    keys.push(x.clone());
+                    root.set(&keys);
+                    0
+                }
+            };
             map::put(&mut m, x, Value::int(n + 1));
         }
         Ok(map::new(m))
     }
-    "group-by" => fn cf_group_by(args) [2] {
+    "group-by" => @gc fn cf_group_by(args) [2] {
+        // First the keys, with the items and the keys so far rooted while `f` runs;
+        // then the map, with collections held off (its groups are fresh vectors that
+        // only the map under construction refers to, and hashing a key may run rscl
+        // code).
+        let items = coll::to_vec(&args[1])?;
+        let _items = crate::gc::root_slice(&items);
+        let root = crate::gc::ArgRoot::empty();
+        let _rooted = root.enter();
+        let mut keys: Vec<Value> = Vec::with_capacity(items.len());
+        for x in &items {
+            let k = call(&args[0], std::slice::from_ref(x))?;
+            keys.push(k);
+            root.set(&keys);
+        }
+        let _hold = crate::gc::hold();
         let mut m = map::empty_map();
-        for x in coll::to_vec(&args[1])? {
-            let k = call(&args[0], std::slice::from_ref(&x))?;
-            let cur = m.get(&k).cloned().unwrap_or_else(|| vector::new(vector::Vec_::new()));
-            let v = coll::conj(&cur, x)?;
-            map::put(&mut m, k, v);
+        for (k, x) in keys.iter().zip(&items) {
+            let cur = m.get(k).cloned().unwrap_or_else(|| vector::new(vector::Vec_::new()));
+            let v = coll::conj(&cur, x.clone())?;
+            map::put(&mut m, k.clone(), v);
         }
         Ok(map::new(m))
     }
@@ -184,18 +224,24 @@ builtins! {
         }
         Ok(acc)
     }
-    "zipmap" => fn cf_zipmap(args) [2] {
+    "zipmap" => @gc fn cf_zipmap(args) [2] {
         let ks = coll::to_vec(&args[0])?;
+        let _ks = crate::gc::root_slice(&ks);
         let vs = coll::to_vec(&args[1])?;
+        let _vs = crate::gc::root_slice(&vs);
         let mut m = map::empty_map();
-        for (k, v) in ks.into_iter().zip(vs) { map::put(&mut m, k, v); }
+        for (k, v) in ks.iter().zip(&vs) { map::put(&mut m, k.clone(), v.clone()); }
         Ok(map::new(m))
     }
     "compare" => fn cf_compare(args) [2] {
         Ok(Value::int(match coll::compare(&args[0], &args[1])? { Ordering::Less => -1, Ordering::Equal => 0, Ordering::Greater => 1 }))
     }
-    "sort" => fn cf_sort(args) [1, 2] {
+    "sort" => @gc fn cf_sort(args) [1, 2] {
         let items = coll::to_vec(&args[args.len() - 1])?;
+        // The sort moves the items through vectors of its own while the comparator
+        // runs: a copy that stays put keeps them rooted.
+        let keep = items.clone();
+        let _root = crate::gc::root_slice(&keep);
         let items = if args.len() == 2 {
             merge_sort(items, &mut |a, b| compare_with(&args[0], a, b))?
         } else {
@@ -203,10 +249,20 @@ builtins! {
         };
         Ok(if items.is_empty() { list::empty() } else { list::from_iter(items) })
     }
-    "sort-by" => fn cf_sort_by(args) [2, 3] {
+    "sort-by" => @gc fn cf_sort_by(args) [2, 3] {
+        // The items and the keys computed so far are rooted while the key fn and the
+        // comparator run (the sort itself works on vectors of its own).
         let items = coll::to_vec(&args[args.len() - 1])?;
-        let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
-        for x in items { keyed.push((call(&args[0], std::slice::from_ref(&x))?, x)); }
+        let _items = crate::gc::root_slice(&items);
+        let root = crate::gc::ArgRoot::empty();
+        let _rooted = root.enter();
+        let mut keys: Vec<Value> = Vec::with_capacity(items.len());
+        for x in &items {
+            let k = call(&args[0], std::slice::from_ref(x))?;
+            keys.push(k);
+            root.set(&keys);
+        }
+        let keyed: Vec<(Value, Value)> = keys.iter().cloned().zip(items.iter().cloned()).collect();
         let keyed = merge_sort(keyed, &mut |(ka, _), (kb, _)| {
             if args.len() == 3 { compare_with(&args[1], ka, kb) } else { coll::compare(ka, kb) }
         })?;

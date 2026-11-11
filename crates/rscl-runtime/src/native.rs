@@ -305,18 +305,23 @@ fn take_interrupt() -> Option<(&'static str, String)> {
         // Stress mode keeps every thread on the slow path.
         rscl_interrupt_flag.store(1, Ordering::Release);
     }
-    // While collections are deferred here the heap may hold garbage that cannot be
-    // freed yet: the error waits for a safepoint that can collect, unless the heap
-    // is far over its limit.
-    let wait_for_gc = crate::gc::deferred_here()
-        && crate::heap::over_limit().is_none_or(|(used, limit)| used < limit + limit / 4);
-    if !wait_for_gc && crate::heap::take_oom(!is_blocked()) {
+    // The heap limit. An `OutOfMemoryError` is only justified once a full
+    // collection has run and the heap is still over the limit. Where no collection
+    // can run now (collections are deferred here, or the other threads cannot be
+    // stopped), the error is dropped: the limit re-arms a little higher, so the
+    // question comes up again after some more allocation. The exception is a heap
+    // far over the limit, which gets its error regardless.
+    let far_over =
+        || crate::heap::over_limit().is_some_and(|(used, limit)| used >= limit + limit / 4);
+    let deferred = crate::gc::deferred_here();
+    if (!deferred || far_over()) && crate::heap::take_oom(!is_blocked()) {
         refresh_flag();
-        // Garbage may hold the memory: collect once before giving up.
-        if !is_blocked() {
-            crate::gc::collect_now(false);
-        }
-        if let Some((used, limit)) = crate::heap::over_limit() {
+        let collected = !is_blocked()
+            && !deferred
+            && matches!(crate::gc::collect_now(false), crate::gc::Collect::Done(_));
+        if let Some((used, limit)) = crate::heap::over_limit()
+            && (collected || far_over())
+        {
             return Some((
                 OUT_OF_MEMORY,
                 format!(

@@ -70,10 +70,11 @@ pub fn write_str(out: &mut String, v: &Value) {
     }
 }
 
+/// Printing may run rscl code (a lazy seq realising, a `print-method`), and a
+/// collection may run then. The walk keeps nothing but references into `v` (and
+/// values on its own stack), so `v` being reachable is all it needs: the caller
+/// sees to that (a builtin's arguments are rooted, a local is on the stack).
 pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
-    // Printing may run rscl code (a lazy seq realising, a `print-method`) while the
-    // walk holds entries it made: no collection under it.
-    let _hold = crate::gc::hold();
     if depth > MAX_DEPTH {
         out.push_str("...");
         return;
@@ -148,9 +149,7 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
         }
         Kind::Vector => {
             out.push('[');
-            // An O(1) clone: printing an element can run rscl code (a lazy seq, a
-            // print method), and a collection that happens meanwhile may replace
-            // the node tree of the vector itself.
+            // An O(1) clone, sharing the vector's nodes.
             let items = obj::vector::get(v).v.clone();
             write_items(out, items.iter(), readably, depth);
             out.push(']');
