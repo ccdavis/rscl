@@ -305,3 +305,36 @@ $ RSCL_GC_DEBUG=1 rscl -e '(count (map inc (range 2000000)))'
 
 `RSCL_GC_STRESS=n` collects at every n-th safepoint and `RSCL_GC_VERIFY` checks each
 collection's work; the corpus passes under both.
+
+## After the plan — collector-native collections and chunked seqs (done)
+
+Vectors, hash maps and sets are persistent tries whose nodes live in the
+collector's heap (no reference counts, nothing to finalise, and a new version of
+a large collection costs a collection only its new nodes); allocation is a pointer
+bump; lazy sequences come in chunks of 32 where their source does, as in Clojure.
+
+```
+user=> (time (count (reduce conj [] (range 1000000))))
+Elapsed time: 52.650752 msecs
+1000000
+user=> (time (count (reduce (fn [m i] (assoc m i i)) {} (range 400000))))
+Elapsed time: 120.930286 msecs
+400000
+user=> (time (reduce + (map inc (filter odd? (range 3000000)))))
+Elapsed time: 121.963399 msecs
+2250001500000
+user=> (let [s (seq (map inc (range 100)))] [(chunked-seq? s) (count (chunk-first s))])
+[true 32]
+```
+
+`scripts/bench.sh` (milliseconds, median of 3; the first row of each pair is from
+before this work):
+
+```
+benchmark      rscl-jit   rscl-aot   rscl-opt
+colls               455        345          -
+colls               182         81         85
+fib                 161         43          -
+fib                 137         41         32
+```
+
