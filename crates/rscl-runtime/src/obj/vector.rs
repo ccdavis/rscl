@@ -211,6 +211,12 @@ impl VecObj {
         }
     }
 
+    /// The elements from `i`, which must be in range, to the end of its chunk.
+    #[inline]
+    pub fn chunk_from(&self, i: usize) -> &[Value] {
+        &self.chunk(i)[i & MASK..]
+    }
+
     #[inline]
     pub fn get(&self, i: usize) -> Option<&Value> {
         if i < self.len {

@@ -31,7 +31,15 @@ pub fn to_vec(v: &Value) -> RtResult<Vec<Value>> {
         Some(Kind::Set) => set::get(v).s.iter().cloned().collect(),
         Some(Kind::String) => string::get(v).chars().map(Value::char).collect(),
         Some(Kind::Cons | Kind::LazySeq) => seq_iter(v).collect::<RtResult<Vec<Value>>>()?,
-        Some(Kind::VecSeq) => vecseq::get(v).to_vec(),
+        Some(Kind::VecSeq) => {
+            let s = vecseq::get(v);
+            let mut items: Vec<Value> = s.items().iter().skip(s.i).copied().collect();
+            if !s.more.is_nil() {
+                // (The elements so far are reachable through `v`.)
+                items.extend(to_vec(&s.more)?);
+            }
+            items
+        }
         Some(Kind::SortedMap) => sorted::map_get(v)
             .m
             .iter()
@@ -121,6 +129,11 @@ impl Cursor {
 pub struct SeqIter {
     cur: Cursor,
     done: bool,
+    /// The chunk being handed out (a vector) and the next index in it, or `nil`:
+    /// a chunked seq is walked a vector at a time, with the cursor already at
+    /// what follows the vector.
+    chunk: Value,
+    at: usize,
 }
 
 pub fn seq_iter(v: &Value) -> SeqIter {
@@ -130,13 +143,22 @@ pub fn seq_iter(v: &Value) -> SeqIter {
 /// Walk a sequence from a cursor: as the iterator advances, nothing else
 /// refers to the cells behind it, so a lazy sequence is collected as it is consumed.
 pub fn seq_iter_at(cur: Cursor) -> SeqIter {
-    SeqIter { cur, done: false }
+    SeqIter {
+        cur,
+        done: false,
+        chunk: Value::NIL,
+        at: 0,
+    }
 }
 
-/// A cons or lazy seq: walked cell by cell; everything else is a materialised
-/// collection with its own fast paths.
+/// A cons, a lazy seq or a chunk with more after it: walked cell by cell;
+/// everything else is a materialised collection with its own fast paths.
 pub fn is_lazy_kind(v: &Value) -> bool {
-    matches!(v.kind(), Some(Kind::Cons | Kind::LazySeq))
+    match v.kind() {
+        Some(Kind::Cons | Kind::LazySeq) => true,
+        Some(Kind::VecSeq) => !vecseq::get(v).more.is_nil(),
+        _ => false,
+    }
 }
 
 /// Elements of the value at a cursor: a lazy sequence streams (its cells are
@@ -190,7 +212,7 @@ pub fn last_at(v: Cursor) -> RtResult<Value> {
             return Ok(vector::get(&v.get()).back().cloned().unwrap_or(Value::NIL));
         }
         // Never empty.
-        Some(Kind::VecSeq) => {
+        Some(Kind::VecSeq) if !v.is_lazy() => {
             return Ok(vecseq::get(&v.get())
                 .items()
                 .back()
@@ -234,11 +256,25 @@ impl Iterator for SeqIter {
         if self.done {
             return None;
         }
+        if !self.chunk.is_nil() {
+            if let Some(x) = vector::get(&self.chunk).get(self.at) {
+                self.at += 1;
+                return Some(Ok(*x));
+            }
+            self.chunk = Value::NIL;
+        }
         let step = (|| {
             let s = seq(&self.cur.get())?;
             if s.is_nil() {
                 self.cur.set(Value::NIL);
                 return Ok(None);
+            }
+            if s.is_kind(Kind::VecSeq) {
+                let o = vecseq::get(&s);
+                self.chunk = o.vec;
+                self.at = o.i + 1;
+                self.cur.set(o.more);
+                return Ok(Some(o.first()));
             }
             let f = first(&s)?;
             self.cur.set(rest(&s)?);
@@ -269,8 +305,8 @@ pub fn count(v: &Value) -> RtResult<i64> {
         Some(Kind::SortedMap) => sorted::map_get(v).m.len() as i64,
         Some(Kind::SortedSet) => sorted::set_get(v).s.len() as i64,
         Some(Kind::Instance) if types::is_record(v) => types::inst(v).count() as i64,
-        Some(Kind::Cons | Kind::LazySeq) => count_at(Cursor::Own(*v))?,
-        Some(Kind::VecSeq) => vecseq::get(v).count() as i64,
+        Some(Kind::VecSeq) if !is_lazy_kind(v) => vecseq::get(v).here() as i64,
+        Some(Kind::Cons | Kind::LazySeq | Kind::VecSeq) => count_at(Cursor::Own(*v))?,
         _ => {
             return err(
                 UNSUPPORTED,
@@ -283,7 +319,7 @@ pub fn count(v: &Value) -> RtResult<i64> {
 /// The seq of a vector object from index `i`: `nil` past the end.
 fn vec_seq(vec: &Value, i: usize) -> Value {
     if i < vector::get(vec).len() {
-        vecseq::new(*vec, i)
+        vecseq::new(*vec, i, Value::NIL)
     } else {
         Value::NIL
     }
@@ -308,7 +344,7 @@ pub fn seq(v: &Value) -> RtResult<Value> {
             Ok(if items.is_empty() {
                 Value::NIL
             } else {
-                vecseq::new(vector::from_iter(items), 0)
+                vecseq::new(vector::from_iter(items), 0, Value::NIL)
             })
         }
     }
@@ -341,28 +377,31 @@ fn or_empty(s: Value) -> Value {
     if s.is_nil() { list::empty() } else { s }
 }
 
+/// What follows an element, as `rest` returns it: a seq, an unrealised lazy seq
+/// as it is, or the empty list.
+pub fn tail(more: &Value) -> RtResult<Value> {
+    Ok(match more.kind() {
+        None if more.is_nil() => list::empty(),
+        Some(Kind::List) => {
+            if list::get(more).is_empty() {
+                list::empty()
+            } else {
+                *more
+            }
+        }
+        Some(Kind::Cons | Kind::LazySeq | Kind::VecSeq) => *more,
+        _ => or_empty(seq(more)?),
+    })
+}
+
 /// `rest`: a seq (possibly an unrealised lazy seq), or the empty list.
 pub fn rest(v: &Value) -> RtResult<Value> {
     Ok(match v.kind() {
         None if v.is_nil() => list::empty(),
         Some(Kind::List) => list::get(v).rest(),
-        Some(Kind::Cons) => {
-            let more = &cons::get(v).more;
-            match more.kind() {
-                None if more.is_nil() => list::empty(),
-                Some(Kind::List) => {
-                    if list::get(more).is_empty() {
-                        list::empty()
-                    } else {
-                        *more
-                    }
-                }
-                Some(Kind::Cons | Kind::LazySeq | Kind::VecSeq) => *more,
-                _ => or_empty(seq(more)?),
-            }
-        }
+        Some(Kind::Cons) => tail(&cons::get(v).more)?,
         Some(Kind::LazySeq) => rest(&lazyseq::realize(v)?)?,
-        Some(Kind::VecSeq) => or_empty(vecseq::get(v).next().unwrap_or(Value::NIL)),
+        Some(Kind::VecSeq) => tail(&vecseq::get(v).rest())?,
         Some(Kind::Vector) => or_empty(vec_seq(v, 1)),
         _ => {
             let s = seq(v)?;
@@ -567,14 +606,14 @@ pub fn nth(coll: &Value, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
                 None => oob(l.count as usize),
             }
         }
-        Some(Kind::Cons | Kind::LazySeq) => nth_at(Cursor::Own(*coll), i, not_found),
-        Some(Kind::VecSeq) => {
+        Some(Kind::VecSeq) if !is_lazy_kind(coll) => {
             let s = vecseq::get(coll);
-            match s.nth(i as usize) {
-                Some(x) => Ok(x),
-                None => oob(s.count()),
+            match s.items().get(s.i + i as usize) {
+                Some(x) => Ok(*x),
+                None => oob(s.here()),
             }
         }
+        Some(Kind::Cons | Kind::LazySeq | Kind::VecSeq) => nth_at(Cursor::Own(*coll), i, not_found),
         _ => err(
             UNSUPPORTED,
             format!("nth not supported on this type: {}", type_name(coll)),

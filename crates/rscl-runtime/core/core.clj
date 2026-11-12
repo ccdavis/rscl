@@ -122,7 +122,10 @@
   ([f coll]
    (lazy-seq
      (let [s (seq coll)]
-       (when s (cons (f (first s)) (map f (rest s)))))))
+       (when s
+         (if (chunked-seq? s)
+           (chunk-cons (chunk-map f (chunk-first s)) (map f (chunk-rest s)))
+           (cons (f (first s)) (map f (rest s))))))))
   ([f c1 c2]
    (lazy-seq
      (let [s1 (seq c1) s2 (seq c2)]
@@ -145,10 +148,15 @@
   (lazy-seq
     (loop [s (seq coll)]
       (when s
-        (let [f (first s)]
-          (if (pred f)
-            (cons f (filter pred (rest s)))
-            (recur (next s))))))))
+        (if (chunked-seq? s)
+          (let [c (chunk-filter pred (chunk-first s))]
+            (if (zero? (count c))
+              (recur (seq (chunk-rest s)))
+              (chunk-cons c (filter pred (chunk-rest s)))))
+          (let [f (first s)]
+            (if (pred f)
+              (cons f (filter pred (rest s)))
+              (recur (next s)))))))))
 
 (defn remove [pred coll]
   (filter (complement pred) coll))
@@ -186,7 +194,11 @@
   ([x y]
    (lazy-seq
      (let [s (seq x)]
-       (if s (cons (first s) (concat (rest s) y)) y))))
+       (if s
+         (if (chunked-seq? s)
+           (chunk-cons (chunk-first s) (concat (chunk-rest s) y))
+           (cons (first s) (concat (rest s) y)))
+         y))))
   ([x y & zs]
    (let [cat (fn cat [xys zs]
                (lazy-seq
@@ -262,9 +274,9 @@
   ([start end] (range start end 1))
   ([start end step]
    (lazy-seq
-     (when (or (and (pos? step) (< start end))
-               (and (neg? step) (> start end)))
-       (cons start (range (+ start step) end step))))))
+     (let [c (range-chunk start end step)]
+       (when (pos? (count c))
+         (chunk-cons c (range (+ (peek c) step) end step)))))))
 
 (defn cycle [coll]
   (lazy-seq

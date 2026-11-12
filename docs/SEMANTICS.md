@@ -96,13 +96,20 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   forms win over macros; a local shadows a macro of the same name.
 - Syntax-quote qualifies unqualified symbols with the namespace of the var they resolve
   to (else the current namespace); `x#` makes one gensym per syntax-quote.
-- Lazy seqs are unchunked: `(map f coll)` realises one element at a time. `rest` of a
+- Lazy seqs are chunked as in Clojure: the seq of a vector, a `range`, and the
+  result of `map`, `filter`, `remove` or `concat` over such a seq, come in chunks
+  of up to 32 elements, and `(first (map f (range 100)))` calls `f` on the first
+  32. Lists, `iterate`, `repeat` and seqs built with `cons`/`lazy-seq` are
+  realised one element at a time, as is `map` over several collections.
+  `chunked-seq?`, `chunk-first`, `chunk-rest` and `chunk-cons` exist (a chunk is a
+  vector; there are no chunk buffers). `rest` of a
   cons cell returns its tail unrealised. Printing, equality, `count` and `hash` realise
   the whole seq. A lazy seq whose body throws stays unrealised and can be retried.
 - `(range 0)` and other empty lazy seqs are `()`, not `nil`; `(seq ())` is `nil`.
 - The seq of a vector is a position in it: `seq`, `rest` and `next` of a vector
   cost one small object whatever its size, and `count` and `nth` of the result are
-  constant-time. It is a seq, not a list (`list?` is false, as in Clojure). The
+  constant-time (linear once something lazy follows the vector, as in a chunked
+  seq). It is a seq, not a list (`list?` is false, as in Clojure). The
   seq of a map, set or string copies the elements into a vector once.
 - Sequential collections of every kind (list, vector, cons, lazy seq) are `=` when
   their elements are, and hash alike.

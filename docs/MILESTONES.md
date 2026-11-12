@@ -227,8 +227,9 @@ mandelbrot          122        492        312         10         10
 `fib` is `(fib 32)`, `loop_sum` ten million iterations of integer arithmetic,
 `mandelbrot` a 320×200 grid with `^double` parameters, `colls` persistent
 vectors/maps, lazy seqs, sorting and string building. Before this phase the AOT
-times were 414, 1183, 696 and 489 ms. The remaining gap on `colls` is allocation in
-the persistent collections and per-element lazy-seq cells (chunked seqs are backlog).
+times were 414, 1183, 696 and 489 ms. The remaining gap on `colls` was allocation in
+the persistent collections and per-element lazy-seq cells; both were addressed
+later (see the last section).
 
 ```
 user=> (defn sum-to [^long n] (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc (rem (* i i) 7))) acc)))

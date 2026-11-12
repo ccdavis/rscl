@@ -81,6 +81,18 @@ pub fn macroexpand_1(form: &Value) -> RtResult<Value> {
     f.call(&margs)
 }
 
+/// The chunked seq an argument must be.
+fn chunked(v: &Value) -> RtResult<&crate::obj::vecseq::VecSeqObj> {
+    if v.is_kind(Kind::VecSeq) {
+        Ok(crate::obj::vecseq::get(v))
+    } else {
+        err(
+            ILLEGAL_ARGUMENT,
+            format!("{} is not a chunked seq", crate::core::type_name(v)),
+        )
+    }
+}
+
 builtins! {
     "lazy-seq*" => fn cf_lazy_seq_star(args) [1] { Ok(lazyseq::new(args[0])) }
     "realized?" => fn cf_realized_p(args) [1] {
@@ -89,6 +101,65 @@ builtins! {
             Some(Kind::Pending) => Ok(Value::bool(crate::obj::pending::get(&args[0]).is_realized())),
             _ => Ok(Value::TRUE),
         }
+    }
+    // Chunked seqs (see `obj/vecseq.rs`): a chunk is a vector of up to 32 elements.
+    "chunked-seq?" => fn cf_chunked_seq_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::VecSeq))) }
+    "chunk-first" => fn cf_chunk_first(args) [1] {
+        let s = chunked(&args[0])?;
+        let chunk = s.chunk();
+        // (The vector itself when it is one whole chunk.)
+        Ok(if chunk.len() == s.items().len() { s.vec } else { vector::from_slice(chunk) })
+    }
+    "chunk-rest" => fn cf_chunk_rest(args) [1] { coll::tail(&chunked(&args[0])?.after_chunk()) }
+    "chunk-cons" => fn cf_chunk_cons(args) [2] {
+        let Some(chunk) = vector::as_vec(&args[0]) else { return err(ILLEGAL_ARGUMENT, "chunk-cons requires a vector") };
+        if !coll::is_seqable(&args[1]) {
+            return err(ILLEGAL_ARGUMENT, format!("Don't know how to create ISeq from: {}", crate::core::type_name(&args[1])));
+        }
+        Ok(if chunk.is_empty() { args[1] } else { crate::obj::vecseq::new(args[0], 0, args[1]) })
+    }
+    // `f` applied to every element of a chunk. (The results are rooted while the
+    // later calls run.)
+    "chunk-map" => @gc fn cf_chunk_map(args) [2] {
+        let Some(chunk) = vector::as_vec(&args[1]) else { return err(ILLEGAL_ARGUMENT, "chunk-map requires a vector") };
+        let root = crate::gc::ArgRoot::empty();
+        let _rooted = root.enter();
+        let mut out = Vec::with_capacity(chunk.len());
+        for x in chunk.iter() {
+            out.push(args[0].call(std::slice::from_ref(x))?);
+            root.set(&out);
+        }
+        Ok(vector::from_slice(&out))
+    }
+    // The elements of a chunk for which `pred` holds (they are in the chunk, which
+    // the arguments keep).
+    "chunk-filter" => @gc fn cf_chunk_filter(args) [2] {
+        let Some(chunk) = vector::as_vec(&args[1]) else { return err(ILLEGAL_ARGUMENT, "chunk-filter requires a vector") };
+        let mut out = Vec::with_capacity(chunk.len());
+        for x in chunk.iter() {
+            if args[0].call(std::slice::from_ref(x))?.truthy() { out.push(*x); }
+        }
+        Ok(vector::from_slice(&out))
+    }
+    // Up to 32 numbers of the arithmetic progression from `start` towards `end`
+    // (none when it is exhausted, or when `step` is zero).
+    "range-chunk" => fn cf_range_chunk(args) [3] {
+        use std::cmp::Ordering;
+        let mut out = Vec::with_capacity(32);
+        if let (Some(mut i), Some(end), Some(step)) = (args[0].as_fixnum(), args[1].as_fixnum(), args[2].as_fixnum()) {
+            while out.len() < 32 && ((step > 0 && i < end) || (step < 0 && i > end)) {
+                out.push(Value::int(i));
+                i += step;
+            }
+            return Ok(vector::from_slice(&out));
+        }
+        let (mut cur, end, step) = (crate::num::expect_num(&args[0])?, crate::num::expect_num(&args[1])?, crate::num::expect_num(&args[2])?);
+        let toward = match crate::num::sign(&step) { Ordering::Greater => Ordering::Less, Ordering::Less => Ordering::Greater, Ordering::Equal => return Ok(vector::empty()) };
+        while out.len() < 32 && crate::num::cmp(&cur, &end) == Some(toward) {
+            out.push(crate::num::to_value(cur.clone()));
+            cur = crate::num::add(cur, step.clone())?;
+        }
+        Ok(vector::from_slice(&out))
     }
     "doall" => @gc fn cf_doall(args) [1, 2] {
         let s = &args[args.len() - 1];

@@ -1454,7 +1454,11 @@ unsafe fn trace(addr: usize, m: &mut Marker) {
                 m.value(&o.first);
                 m.value(&o.more);
             }
-            Kind::VecSeq => m.value(&(*(p as *const vecseq::VecSeqObj)).vec),
+            Kind::VecSeq => {
+                let o = &*(p as *const vecseq::VecSeqObj);
+                m.value(&o.vec);
+                m.value(&o.more);
+            }
             Kind::Symbol => m.value(&(*(p as *const symbol::SymObj)).meta),
             Kind::Fn => {
                 let o = &*(p as *const func::FnObj);

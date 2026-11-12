@@ -814,6 +814,71 @@ fn seqs_over_vectors_are_positions_not_copies() {
 }
 
 #[test]
+fn lazy_seqs_come_in_chunks_where_the_source_does() {
+    with_jit(|j| {
+        def(j, "(def calls (atom 0))");
+        def(j, "(defn counted [x] (swap! calls inc) x)");
+        // A chunk of 32 at a time over a range or a vector...
+        assert_eq!(
+            eval(j, "[(first (map counted (range 100))) @calls]"),
+            "[0 32]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(do (reset! calls 0) [(first (map counted (vec (range 100)))) @calls])"
+            ),
+            "[0 32]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(do (reset! calls 0) [(nth (filter counted (range 100)) 40) @calls])"
+            ),
+            "[40 64]"
+        );
+        // ...and one at a time over a list or an iteration.
+        assert_eq!(
+            eval(
+                j,
+                "(do (reset! calls 0) [(first (map counted (list 1 2 3))) (first (map counted (iterate inc 0))) @calls])"
+            ),
+            "[1 0 2]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(let [s (seq (map inc (range 70)))] [(chunked-seq? s) (count (chunk-first s)) (first (chunk-rest s)) (count s) (nth s 69) (last s) (= s (range 1 71)) (chunked-seq? (seq (list 1)))])"
+            ),
+            "[true 32 33 70 70 70 true false]"
+        );
+        assert_eq!(
+            eval(
+                j,
+                "[(range 3 20 7) (range 5 0 -2) (range 0 1 0.25) (range 2 2) (range 0 3 0) (count (range 1000)) (take 3 (range)) (chunk-cons [1 2] (list 3)) (chunk-cons [] nil)]"
+            ),
+            "[(3 10 17) (5 3 1) (0 0.25 0.5 0.75) () () 1000 (0 1 2) (1 2 3) nil]"
+        );
+        // Long runs of rejected elements do not nest (a chunk with nothing kept
+        // is skipped in a loop), and a pipeline streams.
+        assert_eq!(
+            eval(j, "(first (filter (fn [x] (> x 2999990)) (range 3000000)))"),
+            "2999991"
+        );
+        let before: i64 = def(j, "(gc-count)").parse().unwrap();
+        assert_eq!(
+            eval(
+                j,
+                "(reduce + (map inc (filter odd? (concat (range 2000000) (range 10)))))"
+            ),
+            "1000001000030"
+        );
+        let after: i64 = def(j, "(gc-count)").parse().unwrap();
+        assert!(after > before, "the pipeline allocated nothing?");
+    });
+}
+
+#[test]
 fn dynamic_keywords_are_collected() {
     with_jit(|j| {
         // Keywords made at run time die with their last reference (no table growth);
