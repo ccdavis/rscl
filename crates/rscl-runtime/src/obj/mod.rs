@@ -112,7 +112,7 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
         match (*p).kind {
             Kind::Long => free_obj(p as *mut long::LongObj),
             Kind::Double => free_obj(p as *mut double::DoubleObj),
-            Kind::String => free_obj(p as *mut string::StrObj),
+            Kind::String => string::free(p as *mut string::StrObj),
             Kind::Symbol => free_obj(p as *mut symbol::SymObj),
             // Nothing to drop (such objects are not offered to `free` at all, save
             // under verification).
@@ -123,12 +123,12 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
             | Kind::Map
             | Kind::Set
             | Kind::List
-            | Kind::Cons => {}
+            | Kind::Cons
+            | Kind::Instance => {}
             Kind::Exception => free_obj(p as *mut exception::ExcObj),
             Kind::Atom => free_obj(p as *mut atom::AtomObj),
             Kind::Regex => free_obj(p as *mut regex::RegexObj),
             Kind::Native => free_obj(p as *mut native::NativeObj),
-            Kind::Instance => free_obj(p as *mut types::InstanceObj),
             Kind::SortedMap => free_obj(p as *mut sorted::SortedMapObj),
             Kind::SortedSet => free_obj(p as *mut sorted::SortedSetObj),
             Kind::Pending => free_obj(p as *mut pending::PendingObj),

@@ -1474,7 +1474,7 @@ unsafe fn trace(addr: usize, m: &mut Marker) {
             }
             Kind::Instance => {
                 let o = &*(p as *const types::InstanceObj);
-                for f in o.fields.iter() {
+                for f in o.fields() {
                     m.value(f);
                 }
                 m.value(&o.ext);

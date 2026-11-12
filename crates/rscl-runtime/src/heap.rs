@@ -14,7 +14,7 @@
 //! bytes requested from the allocator, so the process's resident size is somewhat
 //! larger. A hard allocation failure (the allocator itself returns null) still aborts
 //! the process, as in any Rust program; a message points at the limit.
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
@@ -51,16 +51,16 @@ thread_local! {
 
 const FLUSH: isize = 1 << 16;
 
-/// Wraps an allocator with the accounting above.
-pub struct Counting<A>(pub A);
+/// The system allocator with the accounting above.
+pub struct Counting;
 
-// SAFETY: every method forwards to the wrapped allocator and only adds bookkeeping
+// SAFETY: every method forwards to the system allocator and only adds bookkeeping
 // on atomics and a `const` thread-local without a destructor (so it is usable at any
 // point of a thread's life and never allocates).
-unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
+unsafe impl GlobalAlloc for Counting {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = unsafe { self.0.alloc(layout) };
+        let p = unsafe { System.alloc(layout) };
         if p.is_null() {
             hard_failure(layout.size());
         } else {
@@ -71,7 +71,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let p = unsafe { self.0.alloc_zeroed(layout) };
+        let p = unsafe { System.alloc_zeroed(layout) };
         if p.is_null() {
             hard_failure(layout.size());
         } else {
@@ -82,13 +82,13 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { self.0.dealloc(ptr, layout) };
+        unsafe { System.dealloc(ptr, layout) };
         account(-(layout.size() as isize));
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = unsafe { self.0.realloc(ptr, layout, new_size) };
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
         if p.is_null() {
             hard_failure(new_size);
         } else {

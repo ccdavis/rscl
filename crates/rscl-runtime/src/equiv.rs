@@ -54,10 +54,7 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
             // Records of the same type compare by value; deftype instances by identity.
             std::ptr::eq(x.ty, y.ty)
                 && x.ty().is_record
-                && x.fields
-                    .iter()
-                    .zip(y.fields.iter())
-                    .all(|(p, q)| equiv(p, q))
+                && x.fields().iter().zip(y.fields()).all(|(p, q)| equiv(p, q))
                 && equiv(&x.ext, &y.ext)
         }
         _ => false,

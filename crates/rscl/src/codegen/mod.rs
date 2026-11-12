@@ -61,6 +61,9 @@ pub use rscl_runtime::trace::{FrameInfo, Line as LineEntry};
 
 pub struct Compiler<M: Module> {
     pub module: M,
+    /// The compilation context, reused from one function to the next so that its
+    /// buffers are grown once (taken out while a function is being compiled).
+    ctx: Option<cranelift_codegen::Context>,
     fb_ctx: FunctionBuilderContext,
     rt_ids: HashMap<RtFn, FuncId>,
     builtin_ids: HashMap<&'static str, FuncId>,
@@ -227,6 +230,7 @@ impl<M: Module> Compiler<M> {
     pub fn new(module: M) -> Self {
         Compiler {
             module,
+            ctx: None,
             fb_ctx: FunctionBuilderContext::new(),
             rt_ids: HashMap::new(),
             builtin_ids: HashMap::new(),
@@ -488,7 +492,10 @@ impl<M: Module> Compiler<M> {
     where
         F: FnOnce(&mut FnCtx<'_, M>) -> CResult<()>,
     {
-        let mut ctx = self.module.make_context();
+        let mut ctx = self
+            .ctx
+            .take()
+            .unwrap_or_else(|| self.module.make_context());
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.index() as u32);
         {
@@ -522,7 +529,6 @@ impl<M: Module> Compiler<M> {
             // The half-built function is abandoned: the shared builder context still
             // describes it and must not leak into the next compilation.
             self.fb_ctx = FunctionBuilderContext::new();
-            self.module.clear_context(&mut ctx);
             Err(e)
         })?;
         if self.debug_ir {
@@ -608,6 +614,7 @@ impl<M: Module> Compiler<M> {
         }
         u.fns.push(f);
         self.module.clear_context(&mut ctx);
+        self.ctx = Some(ctx);
         Ok(())
     }
 

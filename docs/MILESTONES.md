@@ -210,7 +210,7 @@ nil
 Unboxed `long`/`double` locals (inferred from literals and arithmetic, or forced with
 `^long`/`^double`), inline fixnum and primitive arithmetic and comparisons, direct
 calls to Rust builtins, lock-free var reads for permanent roots, capture-less fns as
-shared permanent objects, mimalloc, and `--gc-sections` for built binaries.
+shared permanent objects, and `--gc-sections` for built binaries.
 
 ```
 $ scripts/bench.sh --runs 5          # bench/*.clj; same source for Clojure 1.12 on OpenJDK 21; CPython 3.14
@@ -326,6 +326,10 @@ Elapsed time: 121.963399 msecs
 user=> (let [s (seq (map inc (range 100)))] [(chunked-seq? s) (count (chunk-first s))])
 [true 32]
 ```
+
+Strings (up to 4 KB) and records keep their contents in the object too, so the
+runtime uses the system allocator for little besides the compiler, and no longer
+bundles mimalloc: a start-up `rscl -e 1` takes 21 MB instead of 46 MB.
 
 `scripts/bench.sh` (milliseconds, median of 3; the first row of each pair is from
 before this work):

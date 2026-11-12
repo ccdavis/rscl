@@ -17,11 +17,12 @@
 //! back, frees the unmarked slots and releases blocks that became empty to the
 //! operating system.
 //!
-//! Reclaiming is cheap for most garbage too. Objects that own Rust data (strings,
-//! records, sorted collections) live in blocks of their own; the others (cons
-//! cells, closures, lazy-seq cells, boxed numbers, vectors, maps, sets and their
-//! nodes) need no finalising, so the sweep frees the dead ones in such a block by
-//! clearing bits a word at a time, without reading them.
+//! Reclaiming is cheap for most garbage too. Objects that own Rust data (long
+//! strings, sorted collections, big integers, regexes, exceptions) live in blocks
+//! of their own; the others (cons cells, closures, lazy-seq cells, boxed numbers,
+//! strings, records, vectors, maps, sets and their nodes) need no finalising, so
+//! the sweep frees the dead ones in such a block by clearing bits a word at a
+//! time, without reading them.
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};

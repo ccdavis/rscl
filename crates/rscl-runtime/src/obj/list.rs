@@ -87,7 +87,9 @@ impl ListObj {
         if self.count <= 1 { empty() } else { self.rest }
     }
     pub fn to_vec(&self) -> Vec<Value> {
-        self.iter().cloned().collect()
+        let mut out = Vec::with_capacity(self.count as usize);
+        out.extend(self.iter().copied());
+        out
     }
 }
 

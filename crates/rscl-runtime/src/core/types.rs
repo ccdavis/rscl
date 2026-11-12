@@ -160,8 +160,7 @@ builtins! {
         Ok(types::new_type(&name, fields, args[2].truthy()))
     }
     "instance*" => fn ct_instance(args) [; 1] {
-        let fields: Vec<Value> = args[1..].to_vec();
-        types::instance(&args[0], fields, Value::NIL)
+        types::instance(&args[0], &args[1..], Value::NIL)
     }
     "map->instance*" => fn ct_map_instance(args) [2] {
         let t = expect_type(&args[0], "type")?;
@@ -178,7 +177,7 @@ builtins! {
             }
         }
         let ext = if ext.is_empty() { Value::NIL } else { map::new(ext) };
-        types::instance(&args[0], fields, ext)
+        types::instance(&args[0], &fields, ext)
     }
     "field*" => fn ct_field(args) [2] {
         let Some(i) = types::as_instance(&args[0]) else {
@@ -189,7 +188,7 @@ builtins! {
         };
         let name = named(&args[1], "field")?;
         match i.field_index(&name) {
-            Some(ix) => Ok(i.fields[ix]),
+            Some(ix) => Ok(i.fields()[ix]),
             None => err(ILLEGAL_ARGUMENT, format!("No matching field found: {name} for class {}", i.ty().name)),
         }
     }
@@ -200,7 +199,7 @@ builtins! {
             return err(ILLEGAL_ARGUMENT, format!("{} has no fields", crate::core::type_name(&args[0])));
         };
         let ix = args::int(&args[1], "field index")?;
-        match usize::try_from(ix).ok().and_then(|ix| i.fields.get(ix)) {
+        match usize::try_from(ix).ok().and_then(|ix| i.fields().get(ix)) {
             Some(v) => Ok(*v),
             None => err(ILLEGAL_ARGUMENT, format!("No field {ix} in class {}", i.ty().name)),
         }

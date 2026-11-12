@@ -5,14 +5,18 @@ use crate::builtins;
 use crate::obj::{self, Kind, string};
 use crate::value::Value;
 
-fn join_args(args: &[Value], readably: bool, sep: &str) -> String {
-    let mut out = String::new();
+fn write_args(out: &mut String, args: &[Value], readably: bool, sep: &str) {
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
             out.push_str(sep);
         }
-        crate::printer::write(&mut out, a, readably, 0);
+        crate::printer::write(out, a, readably, 0);
     }
+}
+
+fn join_args(args: &[Value], readably: bool, sep: &str) -> String {
+    let mut out = String::new();
+    write_args(&mut out, args, readably, sep);
     out
 }
 
@@ -57,14 +61,14 @@ builtins! {
     "fn?" => fn cf_fn_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Fn))) }
     "var?" => fn cf_var_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Var))) }
     "str" => @gc fn cf_str(args) [; 0] {
-        let mut out = String::new();
-        for a in args {
-            crate::printer::write_str(&mut out, a);
-        }
-        Ok(string::from_string(out))
+        Ok(string::build(|out| {
+            for a in args {
+                crate::printer::write_str(out, a);
+            }
+        }))
     }
-    "pr-str" => @gc fn cf_pr_str(args) [; 0] { Ok(string::from_string(join_args(args, true, " "))) }
-    "print-str" => @gc fn cf_print_str(args) [; 0] { Ok(string::from_string(join_args(args, false, " "))) }
+    "pr-str" => @gc fn cf_pr_str(args) [; 0] { Ok(string::build(|out| write_args(out, args, true, " "))) }
+    "print-str" => @gc fn cf_print_str(args) [; 0] { Ok(string::build(|out| write_args(out, args, false, " "))) }
     "pr" => @gc fn cf_pr(args) [; 0] { emit(&join_args(args, true, " ")); Ok(Value::NIL) }
     "prn" => @gc fn cf_prn(args) [; 0] { let mut s = join_args(args, true, " "); s.push('\n'); emit(&s); Ok(Value::NIL) }
     "print" => @gc fn cf_print(args) [; 0] { emit(&join_args(args, false, " ")); Ok(Value::NIL) }

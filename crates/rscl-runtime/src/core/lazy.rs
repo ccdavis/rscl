@@ -264,7 +264,7 @@ builtins! {
             Some(Kind::SortedSet) => { let c = obj::sorted::set_new(obj::sorted::set_get(v).s.clone()); obj::set_meta_unshared(&c, args[1]); c }
             Some(Kind::Instance) => {
                 let i = obj::types::inst(v);
-                let c = obj::types::with(v, i.fields.clone(), i.ext);
+                let c = obj::types::with(v, i.fields(), i.ext);
                 obj::set_meta_unshared(&c, args[1]);
                 c
             }

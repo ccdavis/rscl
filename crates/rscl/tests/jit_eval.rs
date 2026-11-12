@@ -879,6 +879,51 @@ fn lazy_seqs_come_in_chunks_where_the_source_does() {
 }
 
 #[test]
+fn strings_and_records_live_in_the_object_heap() {
+    with_jit(|j| {
+        // Short strings keep their bytes in the object, long ones apart; both
+        // survive collections and compare, hash and print alike.
+        def(j, "(def long-s (apply str (repeat 3000 \"héllo \")))");
+        def(
+            j,
+            "(def edge (map (fn [n] (apply str (repeat n \"x\"))) [0 1 4062 4063 4064 4065 9000]))",
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(do (gc) (gc) [(count long-s) (subs long-s 17994) (= long-s (apply str (repeat 3000 \"héllo \"))) (= (hash long-s) (hash (str long-s))) (map count edge) (get {long-s 1} (str long-s \"\"))])"
+            ),
+            "[18000 \"héllo \" true true (0 1 4062 4063 4064 4065 9000) 1]"
+        );
+        // Long strings that die are freed (their bytes are outside the heap).
+        let before: i64 = def(j, "(gc-count)").parse().unwrap();
+        assert_eq!(
+            eval(
+                j,
+                "(loop [i 0 n 0] (if (< i 3000) (recur (inc i) (+ n (count (str long-s i)))) n))"
+            ),
+            "54010890"
+        );
+        let after: i64 = def(j, "(gc-count)").parse().unwrap();
+        assert!(after > before, "55 MB of strings without a collection?");
+        // Records are one object each: fields, extra keys and metadata survive
+        // updates and collections.
+        def(j, "(defrecord Pt [x y])");
+        def(
+            j,
+            "(def pts (vec (map (fn [i] (assoc (->Pt i (str i)) :extra [i])) (range 2000))))",
+        );
+        assert_eq!(
+            eval(
+                j,
+                "(do (gc) (gc) (let [p (nth pts 1234) q (assoc p :x :new)] [p q (:y q) (= p (assoc (->Pt 1234 \"1234\") :extra [1234])) (meta (with-meta q {:m 1})) (reduce + (map :x pts))]))"
+            ),
+            "[#user.Pt{:x 1234, :y \"1234\", :extra [1234]} #user.Pt{:x :new, :y \"1234\", :extra [1234]} \"1234\" true {:m 1} 1999000]"
+        );
+    });
+}
+
+#[test]
 fn dynamic_keywords_are_collected() {
     with_jit(|j| {
         // Keywords made at run time die with their last reference (no table growth);

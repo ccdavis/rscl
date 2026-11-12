@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
-use super::{Kind, alloc, cast, keyword};
+use super::{Kind, cast, keyword};
 use crate::exc::{RtResult, err};
 use crate::obj::exception::{ARITY, ILLEGAL_ARGUMENT};
 use crate::value::{ObjHeader, Value};
@@ -241,10 +241,36 @@ pub fn type_of(v: &Value) -> Value {
 pub struct InstanceObj {
     pub hdr: ObjHeader,
     pub ty: *const TypeObj,
-    pub fields: Vec<Value>,
     /// Records: extra keys beyond the declared fields (a map or `nil`).
     pub ext: Value,
     pub meta: Value,
+    // followed by the field values, as many as the type declares
+}
+
+const FIELDS_OFFSET: usize = std::mem::size_of::<InstanceObj>();
+
+/// Allocate an instance of `ty` with these field values (one object, nothing to
+/// drop when it dies).
+fn alloc_instance(ty: *const TypeObj, fields: &[Value], ext: Value, meta: Value) -> Value {
+    debug_assert_eq!(fields.len(), unsafe { &*ty }.fields.len());
+    let p = super::raw_alloc(
+        std::alloc::Layout::from_size_align(FIELDS_OFFSET + 8 * fields.len(), 8)
+            .expect("instance layout"),
+    ) as *mut InstanceObj;
+    unsafe {
+        std::ptr::write(
+            p,
+            InstanceObj {
+                hdr: ObjHeader::new(Kind::Instance),
+                ty,
+                ext,
+                meta,
+            },
+        );
+        let slots = (p as *mut u8).add(FIELDS_OFFSET) as *mut Value;
+        std::ptr::copy_nonoverlapping(fields.as_ptr(), slots, fields.len());
+        Value::from_obj(p)
+    }
 }
 
 // SAFETY: `ty` is permanent.
@@ -255,6 +281,13 @@ impl InstanceObj {
     pub fn ty(&self) -> &TypeObj {
         unsafe { &*self.ty }
     }
+    /// The field values, in declaration order.
+    pub fn fields(&self) -> &[Value] {
+        unsafe {
+            let p = (self as *const InstanceObj as *const u8).add(FIELDS_OFFSET) as *const Value;
+            std::slice::from_raw_parts(p, self.ty().fields.len())
+        }
+    }
     pub fn field_index(&self, name: &str) -> Option<usize> {
         self.ty().fields.iter().position(|f| &**f == name)
     }
@@ -262,7 +295,7 @@ impl InstanceObj {
     pub fn get_kw(&self, k: &Value) -> Option<Value> {
         let ty = self.ty();
         if let Some(i) = ty.field_kws.iter().position(|fk| fk.identical(k)) {
-            return Some(self.fields[i]);
+            return Some(self.fields()[i]);
         }
         super::map::as_map(&self.ext).and_then(|m| m.m.get(k).cloned())
     }
@@ -273,7 +306,7 @@ impl InstanceObj {
             .field_kws
             .iter()
             .cloned()
-            .zip(self.fields.iter().cloned())
+            .zip(self.fields().iter().cloned())
             .collect();
         if let Some(m) = super::map::as_map(&self.ext) {
             out.extend(m.m.iter().map(|(k, v)| (*k, *v)));
@@ -281,11 +314,11 @@ impl InstanceObj {
         out
     }
     pub fn count(&self) -> usize {
-        self.fields.len() + super::map::as_map(&self.ext).map_or(0, |m| m.m.len())
+        self.fields().len() + super::map::as_map(&self.ext).map_or(0, |m| m.m.len())
     }
 }
 
-pub fn instance(ty: &Value, fields: Vec<Value>, ext: Value) -> RtResult<Value> {
+pub fn instance(ty: &Value, fields: &[Value], ext: Value) -> RtResult<Value> {
     let t = as_type(ty).ok_or_else(|| crate::exc::throw_new(ILLEGAL_ARGUMENT, "not a type"))?;
     if t.id < 1000 {
         return err(
@@ -303,13 +336,7 @@ pub fn instance(ty: &Value, fields: Vec<Value>, ext: Value) -> RtResult<Value> {
             ),
         );
     }
-    Ok(alloc(InstanceObj {
-        hdr: ObjHeader::new(Kind::Instance),
-        ty: t as *const TypeObj,
-        fields,
-        ext,
-        meta: Value::NIL,
-    }))
+    Ok(alloc_instance(t as *const TypeObj, fields, ext, Value::NIL))
 }
 
 pub fn inst(v: &Value) -> &InstanceObj {
@@ -330,15 +357,21 @@ pub fn is_record(v: &Value) -> bool {
 }
 
 /// A copy with `fields`/`ext` replaced (keeps type and metadata).
-pub fn with(v: &Value, fields: Vec<Value>, ext: Value) -> Value {
+pub fn with(v: &Value, fields: &[Value], ext: Value) -> Value {
     let i = inst(v);
-    alloc(InstanceObj {
-        hdr: ObjHeader::new(Kind::Instance),
-        ty: i.ty,
-        fields,
-        ext,
-        meta: i.meta,
-    })
+    alloc_instance(i.ty, fields, ext, i.meta)
+}
+
+/// A copy with field `ix` replaced (keeps type, extra keys and metadata).
+pub fn with_field(v: &Value, ix: usize, x: Value) -> Value {
+    let i = inst(v);
+    let copy = alloc_instance(i.ty, i.fields(), i.ext, i.meta);
+    // (The copy is not shared yet.)
+    unsafe {
+        let slots = copy.ptr().add(FIELDS_OFFSET) as *mut Value;
+        *slots.add(ix) = x;
+    }
+    copy
 }
 
 // ---- protocols ---------------------------------------------------------------------

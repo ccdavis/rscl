@@ -273,9 +273,28 @@ builtins! {
         Ok(if keyed.is_empty() { list::empty() } else { list::from_iter(keyed.into_iter().map(|(_, x)| x).collect::<Vec<_>>()) })
     }
     "apply" => @gc fn cf_apply(args) [; 2] {
-        let mut fargs: Vec<Value> = args[1..args.len() - 1].to_vec();
-        fargs.extend(coll::to_vec(&args[args.len() - 1])?);
-        args[0].call(&fargs)
+        // The arguments are gathered on the stack when there are few of them (the
+        // spread collection keeps its elements alive; `call` roots what it is
+        // given).
+        const INLINE: usize = 12;
+        let fixed = &args[1..args.len() - 1];
+        let last = &args[args.len() - 1];
+        let mut inline = [Value::NIL; INLINE];
+        let mut n = fixed.len().min(INLINE);
+        inline[..n].copy_from_slice(&fixed[..n]);
+        let mut spill: Vec<Value> = Vec::new();
+        if n < fixed.len() { spill.extend_from_slice(fixed); }
+        for x in coll::seq_iter(last) {
+            let x = x?;
+            if spill.is_empty() && n < INLINE {
+                inline[n] = x;
+                n += 1;
+            } else {
+                if spill.is_empty() { spill.extend_from_slice(&inline[..n]); }
+                spill.push(x);
+            }
+        }
+        args[0].call(if spill.is_empty() { &inline[..n] } else { &spill })
     }
     "list?" => fn cf_list_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::List))) }
     "vector?" => fn cf_vector_p(args) [1] { Ok(Value::bool(args[0].is_kind(Kind::Vector))) }

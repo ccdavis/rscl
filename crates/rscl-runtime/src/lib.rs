@@ -38,13 +38,8 @@ pub use exc::{Exc, RtResult};
 pub use obj::Kind;
 pub use value::Value;
 
-/// Allocation-heavy workloads (persistent collections, lazy seqs) spend a quarter of
-/// their time in malloc; mimalloc roughly halves that. The staticlib carries it into
-/// AOT-built programs too.
-#[cfg(feature = "mimalloc")]
+/// The system allocator, with the bytes in use counted for the heap limit (see
+/// `heap.rs`). Heap objects do not come from it (see `arena.rs`); it serves the
+/// runtime's own data, the compiler, and the contents of strings.
 #[global_allocator]
-static GLOBAL: heap::Counting<mimalloc::MiMalloc> = heap::Counting(mimalloc::MiMalloc);
-
-#[cfg(not(feature = "mimalloc"))]
-#[global_allocator]
-static GLOBAL: heap::Counting<std::alloc::System> = heap::Counting(std::alloc::System);
+static GLOBAL: heap::Counting = heap::Counting;

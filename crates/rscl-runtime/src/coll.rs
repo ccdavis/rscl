@@ -129,11 +129,13 @@ impl Cursor {
 pub struct SeqIter {
     cur: Cursor,
     done: bool,
-    /// The chunk being handed out (a vector) and the next index in it, or `nil`:
-    /// a chunked seq is walked a vector at a time, with the cursor already at
-    /// what follows the vector.
+    /// A vector or a chunked seq is walked a vector at a time, with the cursor
+    /// already at what follows the vector: the vector being handed out (or
+    /// `nil`), the index after the part of it in `part`, and the elements of that
+    /// part still to come (one chunk of the vector).
     chunk: Value,
     at: usize,
+    part: std::slice::Iter<'static, Value>,
 }
 
 pub fn seq_iter(v: &Value) -> SeqIter {
@@ -148,6 +150,7 @@ pub fn seq_iter_at(cur: Cursor) -> SeqIter {
         done: false,
         chunk: Value::NIL,
         at: 0,
+        part: [].iter(),
     }
 }
 
@@ -182,7 +185,14 @@ impl Iterator for CursorIter {
 }
 
 pub fn iter_at(c: Cursor) -> RtResult<CursorIter> {
-    Ok(if c.is_lazy() {
+    // Lists and vectors are walked where they are, like lazy sequences; the other
+    // collections have to produce their elements first (a map its entries).
+    let in_place = c.is_lazy()
+        || matches!(
+            c.get().kind(),
+            Some(Kind::List | Kind::Vector | Kind::VecSeq)
+        );
+    Ok(if in_place {
         CursorIter::Seq(seq_iter_at(c))
     } else {
         let items = to_vec(&c.get())?;
@@ -250,21 +260,48 @@ pub fn nth_at(coll: Cursor, i: i64, not_found: Option<&Value>) -> RtResult<Value
     }
 }
 
+impl SeqIter {
+    /// Move on to the part of `chunk` that starts at `at` (which is in range).
+    fn take_part(&mut self) {
+        let part = vector::get(&self.chunk).chunk_from(self.at);
+        self.at += part.len();
+        // SAFETY: the slice is inside the vector `self.chunk` refers to (or one of
+        // its nodes), which lives as long as this iterator holds that reference.
+        self.part = unsafe { std::mem::transmute::<&[Value], &'static [Value]>(part) }.iter();
+    }
+}
+
 impl Iterator for SeqIter {
     type Item = RtResult<Value>;
     fn next(&mut self) -> Option<RtResult<Value>> {
         if self.done {
             return None;
         }
+        if let Some(x) = self.part.next() {
+            return Some(Ok(*x));
+        }
         if !self.chunk.is_nil() {
-            if let Some(x) = vector::get(&self.chunk).get(self.at) {
-                self.at += 1;
-                return Some(Ok(*x));
+            if self.at < vector::get(&self.chunk).len() {
+                self.take_part();
+                return self.part.next().map(|x| Ok(*x));
             }
             self.chunk = Value::NIL;
         }
         let step = (|| {
-            let s = seq(&self.cur.get())?;
+            let cur = self.cur.get();
+            if cur.is_kind(Kind::Vector) {
+                // (No seq object is needed to walk a vector.)
+                if vector::get(&cur).is_empty() {
+                    self.cur.set(Value::NIL);
+                    return Ok(None);
+                }
+                self.chunk = cur;
+                self.at = 0;
+                self.cur.set(Value::NIL);
+                self.take_part();
+                return Ok(self.part.next().copied());
+            }
+            let s = seq(&cur)?;
             if s.is_nil() {
                 self.cur.set(Value::NIL);
                 return Ok(None);
@@ -272,9 +309,10 @@ impl Iterator for SeqIter {
             if s.is_kind(Kind::VecSeq) {
                 let o = vecseq::get(&s);
                 self.chunk = o.vec;
-                self.at = o.i + 1;
+                self.at = o.i;
                 self.cur.set(o.more);
-                return Ok(Some(o.first()));
+                self.take_part();
+                return Ok(self.part.next().copied());
             }
             let f = first(&s)?;
             self.cur.set(rest(&s)?);
@@ -658,14 +696,12 @@ pub fn assoc(coll: &Value, k: Value, v: Value) -> RtResult<Value> {
         }
         Some(Kind::Instance) if types::is_record(coll) => {
             let i = types::inst(coll);
-            let mut fields = i.fields.clone();
             if let Some(ix) = i.ty().field_kws.iter().position(|fk| fk.identical(&k)) {
-                fields[ix] = v;
-                return Ok(types::with(coll, fields, i.ext));
+                return Ok(types::with_field(coll, ix, v));
             }
             let mut ext = map::as_map(&i.ext).map_or_else(map::empty_map, |m| m.m);
             map::put(&mut ext, k, v);
-            Ok(types::with(coll, fields, map::new(ext)))
+            Ok(types::with(coll, i.fields(), map::new(ext)))
         }
         _ => err(
             CLASS_CAST,
@@ -705,7 +741,7 @@ pub fn dissoc(coll: &Value, k: &Value) -> RtResult<Value> {
             } else {
                 map::new(ext)
             };
-            Ok(types::with(coll, i.fields.clone(), ext))
+            Ok(types::with(coll, i.fields(), ext))
         }
         _ => err(
             CLASS_CAST,
