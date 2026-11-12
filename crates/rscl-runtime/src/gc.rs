@@ -67,9 +67,10 @@
 //! tables), each followed by [`write_barrier`]; compiled code needs no barrier at
 //! all. Being non-moving, the scheme promotes an object by setting a bit for it
 //! (in the manner of "sticky mark bits") rather than by copying it; an object is
-//! promoted when it survives its second collection. What it cannot
-//! see into is the persistent collections (`imbl`): a new version of a large map
-//! is a young object whose elements are all visited, old or not.
+//! promoted when it survives its second collection. The persistent
+//! collections fit the scheme by construction: their nodes are heap objects that
+//! never change (see `obj/node.rs`), so a new version of a large map is a few
+//! young nodes that refer to old ones, and those old ones are not visited.
 //!
 //! # Design notes
 //!
@@ -1288,8 +1289,11 @@ impl Marker {
             // lock guards and field reads by a holder that has the object itself,
             // and a stale one would keep a whole lazy sequence alive (a thunk's
             // captures include the sequence it walks).
+            // A pointer anywhere into a node of a persistent collection counts:
+            // Rust code walks nodes through slices of their slots.
+            let kind = header(obj).kind;
             if matches!(
-                header(obj).kind,
+                kind,
                 Kind::LazySeq
                     | Kind::Cons
                     | Kind::VecSeq
@@ -1298,7 +1302,7 @@ impl Marker {
                     | Kind::Atom
                     | Kind::Pending
                     | Kind::Var
-            ) || w - obj > 8 * INTERIOR_WORDS
+            ) || (kind != Kind::Node && w - obj > 8 * INTERIOR_WORDS)
             {
                 return;
             }
@@ -1477,35 +1481,24 @@ unsafe fn trace(addr: usize, m: &mut Marker) {
             Kind::LazySeq => lazyseq::gc_trace(p as *mut lazyseq::LazySeqObj, &mut |v| m.value(v)),
             Kind::Vector => {
                 let o = &*(p as *const vector::VecObj);
-                for x in o.v.iter() {
-                    m.value(x);
-                }
-                m.value(&o.meta);
+                o.trace(&mut |v| m.value(v));
             }
             Kind::Map => {
                 let o = &*(p as *const map::MapObj);
-                for (k, x) in o.m.iter() {
-                    m.value(k);
-                    m.value(x);
-                }
-                if let Some(order) = &o.order {
-                    for x in order.iter() {
-                        m.value(x);
-                    }
-                }
+                o.m.trace(&mut |v| m.value(v));
                 m.value(&o.meta);
+                m.value(&o.order);
             }
             Kind::Set => {
                 let o = &*(p as *const set::SetObj);
-                for x in o.s.iter() {
-                    m.value(x);
-                }
-                if let Some(order) = &o.order {
-                    for x in order.iter() {
-                        m.value(x);
-                    }
-                }
+                o.s.trace(&mut |v| m.value(v));
                 m.value(&o.meta);
+                m.value(&o.order);
+            }
+            Kind::Node => {
+                for v in obj::node::raw_slots(p as *const obj::node::NodeObj) {
+                    m.value(v);
+                }
             }
             Kind::SortedMap => {
                 let o = &*(p as *const sorted::SortedMapObj);
@@ -1583,16 +1576,17 @@ fn full_collection_due() -> bool {
 /// lazy sequence that happens to be live at a collection would otherwise become
 /// old, and once dead still keep every later cell alive until a full collection.
 fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) -> usize {
-    let started = Instant::now();
     let own_roots = thread_roots(l);
     let mut guard = heap();
     let h = &mut *guard;
     let debug = config().debug;
+    // (Counting the objects for the report is not part of the collection's time.)
     let before = if debug {
         crate::arena::object_count()
     } else {
         0
     };
+    let started = Instant::now();
     let mut m = Marker {
         stack: Vec::new(),
         verify: config().verify,
@@ -1705,6 +1699,7 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
     l.finalizers.borrow_mut().append(&mut finalizers);
     // A permanent object is a root for minor collections until it is old.
     h.new_permanent.retain(|&p| !crate::arena::is_old(p));
+    let elapsed = started.elapsed();
     let after = if debug {
         crate::arena::object_count()
     } else {
@@ -1727,7 +1722,7 @@ fn collect(l: &Local, frame: &Frame, others: &[(usize, Stopped)], full: bool) ->
             others.len() + 1,
             precise_frames,
             precise_slots,
-            started.elapsed().as_secs_f64() * 1e3,
+            elapsed.as_secs_f64() * 1e3,
             crate::heap::used() >> 10,
         );
     }

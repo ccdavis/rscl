@@ -19,7 +19,8 @@ builtins! {
         let items = coll::to_vec(&args[0])?;
         let _root = crate::gc::root_slice(&items);
         let mut s = set::empty_set();
-        for x in &items { if !s.contains(x) { s.insert(*x); } }
+        // (An element equal to one already there is not added.)
+        for x in &items { s.insert(*x); }
         Ok(set::new(s))
     }
     "hash-map" => fn cf_hash_map(args) [; 0] {
@@ -30,7 +31,7 @@ builtins! {
     }
     "hash-set" => fn cf_hash_set(args) [; 0] {
         let mut s = set::empty_set();
-        for x in args { let x = *x; if !s.contains(&x) { s.insert(x); } }
+        for x in args { s.insert(*x); }
         Ok(set::new(s))
     }
     "count" => @gc fn cf_count(args; slots = slots) [1] { Ok(Value::int(coll::count_at(slots.cursor(0))?)) }
@@ -126,9 +127,7 @@ builtins! {
                 items.push(x?);
                 root.set(&items);
             }
-            let mut v = target.v.clone();
-            v.extend(items);
-            return Ok(coll::with_meta_of(&args[0], vector::new(v)));
+            return Ok(target.extend(&items));
         }
         let mut c = args[0];
         for x in coll::iter_at(slots.cursor(1))? { c = coll::conj(&c, x?)?; }
@@ -214,7 +213,7 @@ builtins! {
         let _hold = crate::gc::hold();
         let mut m = map::empty_map();
         for (k, x) in keys.iter().zip(&items) {
-            let cur = m.get(k).cloned().unwrap_or_else(|| vector::new(vector::Vec_::new()));
+            let cur = m.get(k).cloned().unwrap_or_else(vector::empty);
             let v = coll::conj(&cur, *x)?;
             map::put(&mut m, *k, v);
         }

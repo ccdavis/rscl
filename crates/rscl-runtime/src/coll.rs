@@ -26,7 +26,7 @@ pub fn to_vec(v: &Value) -> RtResult<Vec<Value>> {
     Ok(match v.kind() {
         None if v.is_nil() => Vec::new(),
         Some(Kind::List) => list::get(v).to_vec(),
-        Some(Kind::Vector) => vector::get(v).v.iter().cloned().collect(),
+        Some(Kind::Vector) => vector::get(v).iter().cloned().collect(),
         Some(Kind::Map) => map::get(v).m.iter().map(|(k, x)| entry(k, x)).collect(),
         Some(Kind::Set) => set::get(v).s.iter().cloned().collect(),
         Some(Kind::String) => string::get(v).chars().map(Value::char).collect(),
@@ -187,11 +187,7 @@ pub fn count_at(v: Cursor) -> RtResult<i64> {
 pub fn last_at(v: Cursor) -> RtResult<Value> {
     match v.get().kind() {
         Some(Kind::Vector) => {
-            return Ok(vector::get(&v.get())
-                .v
-                .back()
-                .cloned()
-                .unwrap_or(Value::NIL));
+            return Ok(vector::get(&v.get()).back().cloned().unwrap_or(Value::NIL));
         }
         // Never empty.
         Some(Kind::VecSeq) => {
@@ -266,7 +262,7 @@ pub fn count(v: &Value) -> RtResult<i64> {
     Ok(match v.kind() {
         None if v.is_nil() => 0,
         Some(Kind::List) => list::get(v).count,
-        Some(Kind::Vector) => vector::get(v).v.len() as i64,
+        Some(Kind::Vector) => vector::get(v).len() as i64,
         Some(Kind::Map) => map::get(v).m.len() as i64,
         Some(Kind::Set) => set::get(v).s.len() as i64,
         Some(Kind::String) => string::get(v).chars().count() as i64,
@@ -286,7 +282,7 @@ pub fn count(v: &Value) -> RtResult<i64> {
 
 /// The seq of a vector object from index `i`: `nil` past the end.
 fn vec_seq(vec: &Value, i: usize) -> Value {
-    if i < vector::get(vec).v.len() {
+    if i < vector::get(vec).len() {
         vecseq::new(*vec, i)
     } else {
         Value::NIL
@@ -325,7 +321,7 @@ pub fn first(v: &Value) -> RtResult<Value> {
         Some(Kind::Cons) => cons::get(v).first,
         Some(Kind::LazySeq) => first(&lazyseq::realize(v)?)?,
         Some(Kind::VecSeq) => vecseq::get(v).first(),
-        Some(Kind::Vector) => vector::get(v).v.front().cloned().unwrap_or(Value::NIL),
+        Some(Kind::Vector) => vector::get(v).front().cloned().unwrap_or(Value::NIL),
         Some(Kind::String) => string::get(v)
             .chars()
             .next()
@@ -412,26 +408,20 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
         None if coll.is_nil() => Ok(list::from_iter(vec![x])),
         Some(Kind::List) => Ok(list::cons(x, *coll)),
         Some(Kind::Cons | Kind::LazySeq | Kind::VecSeq) => Ok(cons::new(x, *coll)),
-        Some(Kind::Vector) => {
-            let mut v = vector::get(coll).v.clone();
-            v.push_back(x);
-            Ok(with_meta_of(coll, vector::new(v)))
-        }
+        Some(Kind::Vector) => Ok(vector::get(coll).conj(x)),
         Some(Kind::Set) => {
-            let old = &set::get(coll).s;
-            // An equal element is already there (`1` for `1N`): keep it.
-            if old.contains(&x) {
+            let mut s = set::get(coll).s;
+            // An equal element that is already there (`1` for `1N`) stays.
+            if !s.insert(x) {
                 return Ok(*coll);
             }
-            let mut s = old.clone();
-            s.insert(x);
             Ok(with_meta_of(coll, set::new(s)))
         }
         Some(Kind::Map) => {
-            let mut m = map::get(coll).m.clone();
+            let mut m = map::get(coll).m;
             match x.kind() {
-                Some(Kind::Vector) if vector::get(&x).v.len() == 2 => {
-                    let e = &vector::get(&x).v;
+                Some(Kind::Vector) if vector::get(&x).len() == 2 => {
+                    let e = vector::get(&x);
                     map::put(&mut m, e[0], e[1]);
                 }
                 Some(Kind::Map) => {
@@ -443,7 +433,7 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
                 // Any other map (sorted, record): its entries, one by one.
                 Some(Kind::SortedMap | Kind::Instance) if is_map_like(&x) => {
                     for e in to_vec(&x)? {
-                        let e = &vector::get(&e).v;
+                        let e = vector::get(&e);
                         map::put(&mut m, e[0], e[1]);
                     }
                 }
@@ -467,13 +457,13 @@ pub fn conj(coll: &Value, x: Value) -> RtResult<Value> {
             }
             let mut c = *coll;
             match x.kind() {
-                Some(Kind::Vector) if vector::get(&x).v.len() == 2 => {
-                    let e = &vector::get(&x).v;
+                Some(Kind::Vector) if vector::get(&x).len() == 2 => {
+                    let e = vector::get(&x);
                     c = assoc(&c, e[0], e[1])?;
                 }
                 Some(Kind::Map | Kind::SortedMap | Kind::Instance) => {
                     for e in to_vec(&x)? {
-                        let e = &vector::get(&e).v;
+                        let e = vector::get(&e);
                         c = assoc(&c, e[0], e[1])?;
                     }
                 }
@@ -512,7 +502,6 @@ pub fn get(coll: &Value, k: &Value, not_found: Option<&Value>) -> RtResult<Value
         }
         Some(Kind::Vector) => match k.int_value() {
             Some(i) if i >= 0 => vector::get(coll)
-                .v
                 .get(i as usize)
                 .cloned()
                 .unwrap_or_else(nf),
@@ -558,7 +547,7 @@ pub fn nth(coll: &Value, i: i64, not_found: Option<&Value>) -> RtResult<Value> {
     match coll.kind() {
         None if coll.is_nil() => Ok(Value::NIL),
         Some(Kind::Vector) => {
-            let v = &vector::get(coll).v;
+            let v = vector::get(coll);
             match v.get(i as usize) {
                 Some(x) => Ok(*x),
                 None => oob(v.len()),
@@ -601,14 +590,14 @@ pub fn assoc(coll: &Value, k: Value, v: Value) -> RtResult<Value> {
             Ok(map::new(m))
         }
         Some(Kind::Map) => {
-            let mut m = map::get(coll).m.clone();
+            let mut m = map::get(coll).m;
             // An equal key keeps its stored form (`1` stays `1` when `1N` is
             // assoc'ed): only the value is replaced.
             map::put(&mut m, k, v);
             Ok(with_meta_of(coll, map::new(m)))
         }
         Some(Kind::Vector) => {
-            let vec = &vector::get(coll).v;
+            let vec = vector::get(coll);
             let Some(i) = k.int_value() else {
                 return err(ILLEGAL_ARGUMENT, "Key must be integer");
             };
@@ -618,13 +607,11 @@ pub fn assoc(coll: &Value, k: Value, v: Value) -> RtResult<Value> {
                     format!("index {i} out of bounds for length {}", vec.len()),
                 );
             }
-            let mut nv = vec.clone();
-            if i as usize == vec.len() {
-                nv.push_back(v)
+            Ok(if i as usize == vec.len() {
+                vec.conj(v)
             } else {
-                nv.set(i as usize, v);
-            }
-            Ok(with_meta_of(coll, vector::new(nv)))
+                vec.assoc(i as usize, v)
+            })
         }
         Some(Kind::SortedMap) => {
             let m = sorted::map_assoc(&sorted::map_get(coll).m, k, v)?;
@@ -637,7 +624,7 @@ pub fn assoc(coll: &Value, k: Value, v: Value) -> RtResult<Value> {
                 fields[ix] = v;
                 return Ok(types::with(coll, fields, i.ext));
             }
-            let mut ext = map::as_map(&i.ext).map_or_else(map::empty_map, |m| m.m.clone());
+            let mut ext = map::as_map(&i.ext).map_or_else(map::empty_map, |m| m.m);
             map::put(&mut ext, k, v);
             Ok(types::with(coll, fields, map::new(ext)))
         }
@@ -652,7 +639,7 @@ pub fn dissoc(coll: &Value, k: &Value) -> RtResult<Value> {
     match coll.kind() {
         None if coll.is_nil() => Ok(Value::NIL),
         Some(Kind::Map) => {
-            let mut m = map::get(coll).m.clone();
+            let mut m = map::get(coll).m;
             m.remove(k);
             Ok(with_meta_of(coll, map::new(m)))
         }
@@ -672,7 +659,7 @@ pub fn dissoc(coll: &Value, k: &Value) -> RtResult<Value> {
                 }
                 return Ok(with_meta_of(coll, map::new(m)));
             }
-            let mut ext = map::as_map(&i.ext).map_or_else(map::empty_map, |m| m.m.clone());
+            let mut ext = map::as_map(&i.ext).map_or_else(map::empty_map, |m| m.m);
             ext.remove(k);
             let ext = if ext.is_empty() {
                 Value::NIL
@@ -692,7 +679,7 @@ pub fn disj(coll: &Value, k: &Value) -> RtResult<Value> {
     match coll.kind() {
         None if coll.is_nil() => Ok(Value::NIL),
         Some(Kind::Set) => {
-            let mut s = set::get(coll).s.clone();
+            let mut s = set::get(coll).s;
             s.remove(k);
             Ok(with_meta_of(coll, set::new(s)))
         }
@@ -714,7 +701,7 @@ pub fn contains(coll: &Value, k: &Value) -> RtResult<bool> {
         Some(Kind::Set) => set::get(coll).s.contains(k),
         Some(Kind::Vector) => k
             .int_value()
-            .is_some_and(|i| i >= 0 && (i as usize) < vector::get(coll).v.len()),
+            .is_some_and(|i| i >= 0 && (i as usize) < vector::get(coll).len()),
         Some(Kind::String) => k
             .int_value()
             .is_some_and(|i| i >= 0 && (i as usize) < string::get(coll).chars().count()),
@@ -739,7 +726,6 @@ pub fn find(coll: &Value, k: &Value) -> RtResult<Value> {
             .map_or(Value::NIL, |(sk, v)| entry(sk, v)),
         Some(Kind::Vector) => match k.int_value() {
             Some(i) if i >= 0 => vector::get(coll)
-                .v
                 .get(i as usize)
                 .map_or(Value::NIL, |v| entry(k, v)),
             _ => Value::NIL,
@@ -774,7 +760,7 @@ pub fn map_entries(v: &Value, what: &str) -> RtResult<Vec<(Value, Value)>> {
     Ok(to_vec(v)?
         .iter()
         .map(|e| {
-            let e = &vector::get(e).v;
+            let e = vector::get(e);
             (e[0], e[1])
         })
         .collect())
@@ -793,7 +779,7 @@ pub fn keys(coll: &Value) -> RtResult<Value> {
         None if coll.is_nil() => Ok(Value::NIL),
         Some(Kind::Map) => Ok(list_or_nil(map::get(coll).m.keys().cloned().collect())),
         _ if is_map_like(coll) => {
-            let ks = to_vec(coll)?.iter().map(|e| vector::get(e).v[0]).collect();
+            let ks = to_vec(coll)?.iter().map(|e| vector::get(e)[0]).collect();
             Ok(list_or_nil(ks))
         }
         _ => err(
@@ -808,7 +794,7 @@ pub fn vals(coll: &Value) -> RtResult<Value> {
         None if coll.is_nil() => Ok(Value::NIL),
         Some(Kind::Map) => Ok(list_or_nil(map::get(coll).m.values().cloned().collect())),
         _ if is_map_like(coll) => {
-            let vs = to_vec(coll)?.iter().map(|e| vector::get(e).v[1]).collect();
+            let vs = to_vec(coll)?.iter().map(|e| vector::get(e)[1]).collect();
             Ok(list_or_nil(vs))
         }
         _ => err(
@@ -822,7 +808,7 @@ pub fn vals(coll: &Value) -> RtResult<Value> {
 pub fn peek(coll: &Value) -> RtResult<Value> {
     match coll.kind() {
         None if coll.is_nil() => Ok(Value::NIL),
-        Some(Kind::Vector) => Ok(vector::get(coll).v.back().cloned().unwrap_or(Value::NIL)),
+        Some(Kind::Vector) => Ok(vector::get(coll).back().cloned().unwrap_or(Value::NIL)),
         Some(Kind::List) => Ok(list::get(coll).first),
         _ => err(
             CLASS_CAST,
@@ -835,13 +821,11 @@ pub fn pop(coll: &Value) -> RtResult<Value> {
     match coll.kind() {
         None if coll.is_nil() => Ok(Value::NIL),
         Some(Kind::Vector) => {
-            let v = &vector::get(coll).v;
+            let v = vector::get(coll);
             if v.is_empty() {
                 return err(ILLEGAL_ARGUMENT, "Can't pop empty vector");
             }
-            let mut nv = v.clone();
-            nv.pop_back();
-            Ok(vector::new(nv))
+            Ok(v.pop())
         }
         Some(Kind::List) => {
             let l = list::get(coll);
@@ -861,7 +845,7 @@ pub fn pop(coll: &Value) -> RtResult<Value> {
 pub fn empty(coll: &Value) -> Value {
     match coll.kind() {
         Some(Kind::List | Kind::Cons | Kind::LazySeq | Kind::VecSeq) => list::empty(),
-        Some(Kind::Vector) => vector::new(vector::Vec_::new()),
+        Some(Kind::Vector) => vector::empty(),
         Some(Kind::Map) => map::new(map::empty_map()),
         Some(Kind::Set) => set::new(set::empty_set()),
         Some(Kind::SortedMap) => sorted::map_new(sorted::OMap::new()),
@@ -903,8 +887,7 @@ pub fn compare(a: &Value, b: &Value) -> RtResult<Ordering> {
             Ok(x.ns().cmp(&y.ns()).then_with(|| x.name().cmp(y.name())))
         }
         (Some(Kind::Vector), Some(Kind::Vector)) => {
-            // Clones: see `equiv`.
-            let (x, y) = (vector::get(a).v.clone(), vector::get(b).v.clone());
+            let (x, y) = (vector::get(a), vector::get(b));
             if x.len() != y.len() {
                 return Ok(x.len().cmp(&y.len()));
             }

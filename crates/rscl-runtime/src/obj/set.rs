@@ -1,17 +1,17 @@
-//! Persistent hash set backed by `imbl::HashSet` (hasher shared with map.rs).
-use super::map::Hasher;
-use super::{Kind, alloc, cast};
+//! Persistent hash set: a hash trie (see `hamt.rs`) with metadata.
+use super::{Kind, alloc, cast, vector};
 use crate::value::{ObjHeader, Value};
 
-pub type Set_ = imbl::GenericHashSet<Value, Hasher, imbl::shared_ptr::DefaultSharedPtr>;
+pub use super::hamt::Set_;
 
 #[repr(C)]
 pub struct SetObj {
     pub hdr: ObjHeader,
     pub s: Set_,
     pub meta: Value,
-    /// Elements in source order, for a set the reader built.
-    pub order: Option<Box<Vec<Value>>>,
+    /// For a set the reader built: a vector of its elements in source order.
+    /// Otherwise `nil`.
+    pub order: Value,
 }
 
 pub fn new(s: Set_) -> Value {
@@ -19,7 +19,7 @@ pub fn new(s: Set_) -> Value {
         hdr: ObjHeader::new(Kind::Set),
         s,
         meta: Value::NIL,
-        order: None,
+        order: Value::NIL,
     })
 }
 
@@ -29,37 +29,37 @@ pub fn new_ordered(s: Set_, items: Vec<Value>) -> Value {
         hdr: ObjHeader::new(Kind::Set),
         s,
         meta: Value::NIL,
-        order: Some(Box::new(items)),
+        order: vector::from_slice(&items),
+    })
+}
+
+/// A new set object with the contents of `o` (and no metadata).
+pub fn copy_of(o: &SetObj) -> Value {
+    alloc(SetObj {
+        hdr: ObjHeader::new(Kind::Set),
+        s: o.s,
+        meta: Value::NIL,
+        order: o.order,
     })
 }
 
 /// The elements in source order when the set came from the reader.
 pub fn ordered_items(v: &Value) -> Vec<Value> {
     let o = get(v);
-    match &o.order {
+    match vector::as_vec(&o.order) {
         Some(items) if items.len() == o.s.len() => items.to_vec(),
-        _ => o.s.iter().cloned().collect(),
+        _ => o.s.iter().copied().collect(),
     }
 }
 
-/// The element of `s` equal to `k`, as stored. Only a number or a sequential
-/// collection can be equal to a key without being the same kind of value (`1` and
-/// `1N`, a list and a vector); for those the set is searched.
+/// The element of `s` equal to `k`, as stored (`1` for `1N`, a list for an equal
+/// vector).
 pub fn stored(s: &Set_, k: &Value) -> Option<Value> {
-    if !s.contains(k) {
-        return None;
-    }
-    if matches!(
-        k.kind(),
-        Some(Kind::BigInt | Kind::List | Kind::Vector | Kind::Cons | Kind::LazySeq | Kind::VecSeq)
-    ) {
-        return s.iter().find(|x| crate::equiv::equiv(x, k)).cloned();
-    }
-    Some(*k)
+    s.get(k).copied()
 }
 
 pub fn empty_set() -> Set_ {
-    Set_::with_hasher(Hasher)
+    Set_::new()
 }
 
 pub fn from_slice(items: &[Value]) -> Value {

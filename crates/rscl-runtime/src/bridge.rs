@@ -109,7 +109,7 @@ unsafe extern "C" fn api_to_vector(v: u64) -> u64 {
     }
 }
 unsafe extern "C" fn api_vector_len(v: u64) -> i64 {
-    vector::as_vec(&val(v)).map_or(0, |x| x.v.len() as i64)
+    vector::as_vec(&val(v)).map_or(0, |x| x.len() as i64)
 }
 unsafe extern "C" fn api_vector_get(v: u64, i: i64) -> u64 {
     let v = val(v);
@@ -117,7 +117,7 @@ unsafe extern "C" fn api_vector_get(v: u64, i: i64) -> u64 {
         return NIL;
     }
     vector::as_vec(&v)
-        .and_then(|x| x.v.get(i as usize).cloned())
+        .and_then(|x| x.get(i as usize).cloned())
         .map_or(NIL, |v| v.bits())
 }
 unsafe extern "C" fn api_vector_new(items: *const u64, n: i64) -> u64 {

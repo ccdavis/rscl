@@ -9,12 +9,14 @@ pub mod cons;
 pub mod double;
 pub mod exception;
 pub mod func;
+pub mod hamt;
 pub mod keyword;
 pub mod lazyseq;
 pub mod list;
 pub mod long;
 pub mod map;
 pub mod native;
+pub mod node;
 pub mod pending;
 pub mod regex;
 pub mod set;
@@ -60,6 +62,9 @@ pub enum Kind {
     BigInt = 25,
     /// A seq over a vector (see `vecseq.rs`).
     VecSeq = 26,
+    /// An interior node of a vector, map or set (see `node.rs`); never a value a
+    /// program sees.
+    Node = 27,
 }
 
 impl Kind {
@@ -91,6 +96,7 @@ impl Kind {
             Kind::Pending => "Pending",
             Kind::BigInt => "BigInt",
             Kind::VecSeq => "VecSeq",
+            Kind::Node => "Node",
         }
     }
 }
@@ -108,10 +114,16 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
             Kind::Double => free_obj(p as *mut double::DoubleObj),
             Kind::String => free_obj(p as *mut string::StrObj),
             Kind::Symbol => free_obj(p as *mut symbol::SymObj),
-            Kind::Vector => free_obj(p as *mut vector::VecObj),
-            Kind::Map => free_obj(p as *mut map::MapObj),
-            Kind::Set => free_obj(p as *mut set::SetObj),
-            Kind::Fn | Kind::VecSeq => {}
+            // Nothing to drop (such objects are not offered to `free` at all, save
+            // under verification).
+            Kind::Fn
+            | Kind::VecSeq
+            | Kind::Node
+            | Kind::Vector
+            | Kind::Map
+            | Kind::Set
+            | Kind::List
+            | Kind::Cons => {}
             Kind::Exception => free_obj(p as *mut exception::ExcObj),
             Kind::Atom => free_obj(p as *mut atom::AtomObj),
             Kind::Regex => free_obj(p as *mut regex::RegexObj),
@@ -121,8 +133,6 @@ pub(crate) unsafe fn free(p: *mut ObjHeader) {
             Kind::SortedSet => free_obj(p as *mut sorted::SortedSetObj),
             Kind::Pending => free_obj(p as *mut pending::PendingObj),
             Kind::BigInt => free_obj(p as *mut bigint::BigIntObj),
-            Kind::List => free_obj(p as *mut list::ListObj),
-            Kind::Cons => free_obj(p as *mut cons::ConsObj),
             Kind::LazySeq => free_obj(p as *mut lazyseq::LazySeqObj),
             Kind::Keyword => free_obj(p as *mut keyword::KwObj),
             // Permanent kinds are never swept.

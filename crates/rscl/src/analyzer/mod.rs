@@ -567,7 +567,7 @@ impl Analyzer {
                 self.analyze_list(form, tail)
             }
             Some(Kind::Vector) => {
-                let items = vector::get(form).v.iter().cloned().collect::<Vec<_>>();
+                let items = vector::get(form).iter().cloned().collect::<Vec<_>>();
                 self.analyze_coll(form, CollKind::Vector, &items)
             }
             Some(Kind::Map) => {
@@ -929,7 +929,7 @@ impl Analyzer {
             }
         };
         // Symbol metadata (`^:dynamic`, `^{:doc ..}`) plus a docstring become var meta.
-        let mut meta = rscl_runtime::obj::map::as_map(&sym.meta).map(|m| m.m.clone());
+        let mut meta = rscl_runtime::obj::map::as_map(&sym.meta).map(|m| m.m);
         if let Some(d) = doc {
             let mut m = meta.unwrap_or_else(rscl_runtime::obj::map::empty_map);
             m.insert(rscl_runtime::obj::keyword::intern(None, "doc"), d);
@@ -990,7 +990,7 @@ impl Analyzer {
         let Some(bv) = vector::as_vec(&items[1]) else {
             return fail(form, format!("{what} requires a vector for its binding"));
         };
-        if bv.v.len() % 2 != 0 {
+        if bv.len() % 2 != 0 {
             return fail(
                 form,
                 format!("{what} requires an even number of forms in binding vector"),
@@ -999,7 +999,7 @@ impl Analyzer {
         self.push_scope();
         let mut bindings = Vec::new();
         let mut hinted = Vec::new();
-        let pairs: Vec<Value> = bv.v.iter().cloned().collect();
+        let pairs: Vec<Value> = bv.iter().cloned().collect();
         for kv in pairs.chunks(2) {
             let Some(sym) = symbol::as_sym(&kv[0]) else {
                 self.pop_scope();
@@ -1188,7 +1188,7 @@ impl Analyzer {
             let Some(pv) = af.first().and_then(vector::as_vec) else {
                 return fail(form, "fn arity requires a parameter vector");
             };
-            let params_src: Vec<Value> = pv.v.iter().cloned().collect();
+            let params_src: Vec<Value> = pv.iter().cloned().collect();
             self.push_scope();
             let mut params = Vec::new();
             let mut rest = None;
@@ -1360,7 +1360,7 @@ impl Analyzer {
         let Some(tv) = vector::as_vec(&items[3]) else {
             return fail(&items[3], "native argument types must be a vector");
         };
-        let params = tv.v.iter().map(native_ty).collect::<CResult<Vec<_>>>()?;
+        let params = tv.iter().map(native_ty).collect::<CResult<Vec<_>>>()?;
         if params.contains(&NativeTy::Void) {
             return fail(&items[3], "void is not a valid argument type");
         }
@@ -1436,7 +1436,7 @@ fn quote_tag(meta: &Value) -> Value {
     let tag = keyword::intern(None, "tag");
     match m.m.get(&tag) {
         Some(t) if t.is_kind(Kind::Symbol) => {
-            let mut out = m.m.clone();
+            let mut out = m.m;
             out.insert(tag, list::from_slice(&[symbol::new(None, "quote"), *t]));
             map::new(out)
         }
@@ -1502,7 +1502,7 @@ pub fn is_constant(v: &Value) -> bool {
     match v.kind() {
         None => true,
         Some(Kind::Long | Kind::Double | Kind::BigInt | Kind::String | Kind::Keyword) => true,
-        Some(Kind::Vector) => vector::get(v).v.iter().all(is_constant),
+        Some(Kind::Vector) => vector::get(v).iter().all(is_constant),
         Some(Kind::Map) => map::get(v)
             .m
             .iter()

@@ -38,7 +38,7 @@ fn readable(v: &Value) -> bool {
             | Kind::Regex,
         ) => true,
         Some(Kind::List) => obj::list::get(v).iter().all(readable),
-        Some(Kind::Vector) => obj::vector::get(v).v.iter().all(readable),
+        Some(Kind::Vector) => obj::vector::get(v).iter().all(readable),
         Some(Kind::Set) => obj::set::get(v).s.iter().all(readable),
         Some(Kind::Map) => obj::map::get(v)
             .m
@@ -149,18 +149,16 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
         }
         Kind::Vector => {
             out.push('[');
-            // An O(1) clone, sharing the vector's nodes.
-            let items = obj::vector::get(v).v.clone();
-            write_items(out, items.iter(), readably, depth);
+            write_items(out, obj::vector::get(v).iter(), readably, depth);
             out.push(']');
         }
         Kind::Map => {
-            let m = obj::map::get(v).m.clone();
+            let m = obj::map::get(v).m;
             write_entries(out, m.iter(), readably, depth)
         }
         Kind::Set => {
             out.push_str("#{");
-            let items = obj::set::get(v).s.clone();
+            let items = obj::set::get(v).s;
             write_items(out, items.iter(), readably, depth);
             out.push('}');
         }
@@ -236,6 +234,7 @@ pub fn write(out: &mut String, v: &Value, readably: bool, depth: usize) {
             out.push(']');
         }
         Kind::Type => out.push_str(&obj::types::get(v).name),
+        Kind::Node => out.push_str("#object[Node]"),
         Kind::Pending => {
             let p = obj::pending::get(v);
             let status = if p.is_cancelled() {

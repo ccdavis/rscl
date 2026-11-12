@@ -18,16 +18,18 @@
 //! operating system.
 //!
 //! Reclaiming is cheap for most garbage too. Objects that own Rust data (strings,
-//! collections) live in blocks of their own; the others (cons cells, closures,
-//! lazy-seq cells, boxed numbers) need no finalising, so the sweep frees the dead
-//! ones in such a block by clearing bits a word at a time, without reading them.
+//! records, sorted collections) live in blocks of their own; the others (cons
+//! cells, closures, lazy-seq cells, boxed numbers, vectors, maps, sets and their
+//! nodes) need no finalising, so the sweep frees the dead ones in such a block by
+//! clearing bits a word at a time, without reading them.
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::value::ObjHeader;
 
-/// Empty blocks kept mapped after a collection (64 MB).
+/// Empty blocks kept mapped after a collection (64 MB): what the next cycle is
+/// likely to allocate into.
 const KEEP_FREE: usize = 1024;
 const BLOCK_SHIFT: usize = 16;
 pub const BLOCK: usize = 1 << BLOCK_SHIFT;
@@ -35,15 +37,19 @@ pub const BLOCK: usize = 1 << BLOCK_SHIFT;
 const GRAIN: usize = 16;
 /// Bitmap words per block (one bit per `GRAIN` bytes).
 const WORDS: usize = BLOCK / GRAIN / 64;
-/// Classes 1..=16 are multiples of 16 bytes up to 256; then powers of two to a block.
-const SMALL_CLASSES: usize = 16;
-pub const NCLASSES: usize = SMALL_CLASSES + 8 + 1;
+/// Classes 1..=32 are multiples of 16 bytes up to 512 (a full node of a persistent
+/// vector is 280 bytes); then powers of two to a block.
+const SMALL_CLASSES: usize = 32;
+/// log2 of the largest small class.
+const SMALL_SHIFT: usize = 9;
+pub const NCLASSES: usize = SMALL_CLASSES + (BLOCK_SHIFT - SMALL_SHIFT) + 1;
 /// Blocks come in two sorts per size class: *plain* blocks hold only objects
 /// that own nothing outside the object heap (cons cells, closures, boxed
 /// numbers), *drop* blocks hold objects with Rust data to drop when they die
 /// (strings, collections). A plain block is swept without looking at the dead
 /// objects in it. A pool is a (class, sort) pair.
 const NPOOLS: usize = 2 * NCLASSES;
+const _: () = assert!(NCLASSES <= CLASS_MASK as usize + 1);
 /// A block's class byte: the size class (0: the block is free), and two flags.
 const CLASS_MASK: u8 = 0x3f;
 /// The block holds a permanent object: the sweep looks at each unreached object
@@ -65,7 +71,7 @@ fn class_of(size: usize) -> usize {
             p <= BLOCK,
             "object of {size} bytes is too large for the heap"
         );
-        SMALL_CLASSES + (p.trailing_zeros() as usize - 8)
+        SMALL_CLASSES + (p.trailing_zeros() as usize - SMALL_SHIFT)
     }
 }
 
@@ -74,7 +80,7 @@ fn class_size(class: usize) -> usize {
     if class <= SMALL_CLASSES {
         class * GRAIN
     } else {
-        1 << (class - SMALL_CLASSES + 8)
+        1 << (class - SMALL_CLASSES + SMALL_SHIFT)
     }
 }
 
@@ -184,8 +190,10 @@ static EPOCH: AtomicU64 = AtomicU64::new(1);
 struct Pool {
     /// Blocks handed out so far (indices below this may be in use).
     next: usize,
-    /// Blocks that were emptied and released.
+    /// Empty blocks whose memory is still mapped (the most recently emptied last).
     free: Vec<u32>,
+    /// Empty blocks whose memory was given back to the operating system.
+    released: Vec<u32>,
     /// Per pool: blocks with free slots that no thread holds.
     partial: [Vec<u32>; NPOOLS],
     /// Blocks threads have taken since the last collection: every object
@@ -199,6 +207,7 @@ fn pool() -> MutexGuard<'static, Pool> {
         Mutex::new(Pool {
             next: 0,
             free: Vec::new(),
+            released: Vec::new(),
             partial: [const { Vec::new() }; NPOOLS],
             young: Vec::new(),
         })
@@ -513,7 +522,7 @@ fn acquire(l: &Layout, pc: usize) -> usize {
         p.young.push(b);
         return b as usize;
     }
-    let block = match p.free.pop() {
+    let block = match p.free.pop().or_else(|| p.released.pop()) {
         Some(b) => b as usize,
         None => {
             if p.next >= l.blocks {
@@ -753,11 +762,6 @@ pub fn sweep(
         }
         if live == 0 {
             unsafe { *class_ptr(l, block) = 0 };
-            // A reserve of empty blocks stays mapped (the next cycle will want
-            // them); the rest goes back to the operating system.
-            if p.free.len() >= KEEP_FREE {
-                unsafe { madvise(block_addr(l, block) as *mut u8, BLOCK, MADV_DONTNEED) };
-            }
             p.free.push(block as u32);
         } else {
             if live < slots {
@@ -767,6 +771,22 @@ pub fn sweep(
                 // Its aged objects are examined again by the next collection.
                 p.young.push(block as u32);
             }
+        }
+    }
+    // A reserve of empty blocks stays mapped (the next cycle will want them); the
+    // rest, the ones emptied longest ago, goes back to the operating system, once.
+    if p.free.len() > KEEP_FREE {
+        let excess = p.free.len() - KEEP_FREE;
+        let Pool { free, released, .. } = &mut *p;
+        for block in free.drain(..excess) {
+            unsafe {
+                madvise(
+                    block_addr(l, block as usize) as *mut u8,
+                    BLOCK,
+                    MADV_DONTNEED,
+                )
+            };
+            released.push(block);
         }
     }
     crate::heap::account_object(-(freed_bytes as isize));

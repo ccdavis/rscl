@@ -406,7 +406,7 @@ builtins! {
         // (subseq coll test key) / (subseq coll start-test start-key end-test end-key)
         let items = coll::to_vec(&args[0])?;
         let key_of = |e: &Value| -> Value {
-            if args[0].is_kind(Kind::SortedMap) { vector::get(e).v[0] } else { *e }
+            if args[0].is_kind(Kind::SortedMap) { vector::get(e)[0] } else { *e }
         };
         let mut out = Vec::new();
         for e in &items {

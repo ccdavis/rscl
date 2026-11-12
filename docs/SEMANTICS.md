@@ -26,6 +26,11 @@ crates' unit tests. When the code and this document disagree, fix one of them.
 - `(= 1 1.0)` is false; `(== 1 1.0)` is true. `=` on collections is structural;
   lists and vectors are equal when their elements are. Fns, vars and atoms compare by
   identity.
+- Vectors, hash maps and hash sets are persistent tries like Clojure's: a vector
+  is a 32-way trie with its last chunk kept in the vector itself (`conj`, `nth`,
+  `assoc`, `pop` are effectively constant-time), a map or set a hash trie
+  consuming five bits of the hash per level. Versions share structure; nothing
+  is updated in place (there are no transients).
 - Strings count Unicode scalar values, not UTF-16 units. `(str nil)` is `""`.
 - Keywords are interned, so `=` is identity, but the table holds them weakly: a
   keyword created at run time (`(keyword s)`) is freed with its last reference, so
@@ -289,7 +294,8 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   sweep; objects never move). Nothing counts references. Compile-time constants are
   permanent. Allocation moves a per-thread pointer through runs of free slots, and
   dead objects that own no Rust data (cons cells, closures, lazy-seq cells, boxed
-  numbers) are reclaimed a bitmap word at a time without being read.
+  numbers, vectors, hash maps, sets and their nodes) are reclaimed a bitmap word
+  at a time without being read.
 - Hash maps and sets use a deterministic hash by default (iteration order is the
   same in every run and in JIT and AOT, as in Clojure). `RSCL_HASH_SEED=random`
   (or `0`) mixes keys with a per-process secret so attacker-chosen keys cannot be
@@ -316,9 +322,10 @@ crates' unit tests. When the code and this document disagree, fix one of them.
   barrier in the runtime; compiled code has none. Two survivals rather than one,
   because the single cell of a lazy sequence that is live when a collection runs
   would otherwise become old and, once dead, keep the rest of the sequence alive
-  until a full collection. One limit: a new version of a large persistent
-  collection is a young object, and a minor collection visits all of its
-  elements.
+  until a full collection. Vectors, hash maps and sets are tries whose nodes are
+  heap objects that never change, so a new version of a large collection is a few
+  young nodes referring to old ones, and a minor collection does not visit the
+  old part.
 - **When.** A collection is requested when 32 MB have been allocated since the
   last one (`RSCL_GC_MIN_MB`), and runs at the next safepoint: a fn entry, a
   loop iteration or a blocking wait, with every other thread stopped at one too.

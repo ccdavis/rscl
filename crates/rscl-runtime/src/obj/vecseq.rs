@@ -19,7 +19,7 @@ pub struct VecSeqObj {
 
 /// The seq of `vec` from index `i`, which must be in range.
 pub fn new(vec: Value, i: usize) -> Value {
-    debug_assert!(i < vector::get(&vec).v.len());
+    debug_assert!(i < vector::get(&vec).len());
     alloc(VecSeqObj {
         hdr: ObjHeader::new(Kind::VecSeq),
         vec,
@@ -33,8 +33,8 @@ pub fn get(v: &Value) -> &VecSeqObj {
 }
 
 impl VecSeqObj {
-    pub fn items(&self) -> &vector::Vec_ {
-        &vector::get(&self.vec).v
+    pub fn items(&self) -> &vector::VecObj {
+        vector::get(&self.vec)
     }
     pub fn count(&self) -> usize {
         self.items().len() - self.i

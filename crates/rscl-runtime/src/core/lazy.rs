@@ -186,9 +186,9 @@ builtins! {
         let copy = match v.kind() {
             Some(Kind::Symbol) => symbol::with_meta(v, args[1]),
             Some(Kind::List | Kind::Cons | Kind::LazySeq | Kind::VecSeq) => { let c = list::from_iter(coll::to_vec(v)?); obj::set_meta_unshared(&c, args[1]); c }
-            Some(Kind::Vector) => { let c = vector::new(vector::get(v).v.clone()); obj::set_meta_unshared(&c, args[1]); c }
-            Some(Kind::Map) => { let o = obj::map::get(v); let c = match &o.order { Some(k) => obj::map::new_ordered(o.m.clone(), k.to_vec()), None => obj::map::new(o.m.clone()) }; obj::set_meta_unshared(&c, args[1]); c }
-            Some(Kind::Set) => { let o = obj::set::get(v); let c = match &o.order { Some(k) => obj::set::new_ordered(o.s.clone(), k.to_vec()), None => obj::set::new(o.s.clone()) }; obj::set_meta_unshared(&c, args[1]); c }
+            Some(Kind::Vector) => vector::get(v).with_meta(args[1]),
+            Some(Kind::Map) => { let c = obj::map::copy_of(obj::map::get(v)); obj::set_meta_unshared(&c, args[1]); c }
+            Some(Kind::Set) => { let c = obj::set::copy_of(obj::set::get(v)); obj::set_meta_unshared(&c, args[1]); c }
             Some(Kind::SortedMap) => { let c = obj::sorted::map_new(obj::sorted::map_get(v).m.clone()); obj::set_meta_unshared(&c, args[1]); c }
             Some(Kind::SortedSet) => { let c = obj::sorted::set_new(obj::sorted::set_get(v).s.clone()); obj::set_meta_unshared(&c, args[1]); c }
             Some(Kind::Instance) => {

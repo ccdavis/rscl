@@ -44,9 +44,9 @@ pub fn equiv(a: &Value, b: &Value) -> bool {
         ) => seq_equiv(a, b),
         // Clones (O(1)): comparing elements can run rscl code (lazy seqs), during
         // which a collection may replace the node trees of `a` and `b` themselves.
-        (Kind::Map, Kind::Map) => obj::map::get(a).m.clone() == obj::map::get(b).m.clone(),
+        (Kind::Map, Kind::Map) => obj::map::get(a).m == obj::map::get(b).m,
         (Kind::Map | Kind::SortedMap, Kind::Map | Kind::SortedMap) => map_equiv(a, b),
-        (Kind::Set, Kind::Set) => obj::set::get(a).s.clone() == obj::set::get(b).s.clone(),
+        (Kind::Set, Kind::Set) => obj::set::get(a).s == obj::set::get(b).s,
         (Kind::Set | Kind::SortedSet, Kind::Set | Kind::SortedSet) => set_equiv(a, b),
         (Kind::Regex, Kind::Regex) => obj::regex::get(a).source == obj::regex::get(b).source,
         (Kind::Instance, Kind::Instance) => {
@@ -163,7 +163,7 @@ fn seq_equiv(a: &Value, b: &Value) -> bool {
 fn fast_count(v: &Value) -> Option<usize> {
     match v.kind() {
         Some(Kind::List) => Some(obj::list::get(v).count as usize),
-        Some(Kind::Vector) => Some(obj::vector::get(v).v.len()),
+        Some(Kind::Vector) => Some(obj::vector::get(v).len()),
         _ => None,
     }
 }
@@ -257,7 +257,7 @@ pub fn hasheq(v: &Value) -> u64 {
         }
         Kind::Regex => mix64(hash_bytes(obj::regex::get(v).source.as_bytes()) ^ 0x5e5e),
         // Sorted and hashed collections with the same contents must hash alike.
-        Kind::Map => hash_map_entries(obj::map::get(v).m.clone().iter()),
+        Kind::Map => hash_map_entries(obj::map::get(v).m.iter()),
         Kind::SortedMap => hash_map_entries(
             obj::sorted::map_get(v)
                 .m
@@ -265,7 +265,7 @@ pub fn hasheq(v: &Value) -> u64 {
                 .iter()
                 .map(|(k, val)| (&k.0, val)),
         ),
-        Kind::Set => hash_set_items(obj::set::get(v).s.clone().iter()),
+        Kind::Set => hash_set_items(obj::set::get(v).s.iter()),
         Kind::SortedSet => hash_set_items(obj::sorted::set_get(v).s.clone().iter().map(|k| &k.0)),
         Kind::Instance => {
             let i = obj::types::inst(v);
@@ -281,7 +281,8 @@ pub fn hasheq(v: &Value) -> u64 {
             mix64(h)
         }
         // Identity-hashed kinds.
-        Kind::Fn
+        Kind::Node
+        | Kind::Fn
         | Kind::Var
         | Kind::Exception
         | Kind::Atom

@@ -559,7 +559,7 @@ impl<'a> Reader<'a> {
             Some(Kind::List | Kind::Vector | Kind::Map | Kind::Set | Kind::Symbol) => {
                 let merged = match obj::meta(&target) {
                     Some(existing) if !existing.is_nil() => {
-                        let mut m = map::get(&existing).m.clone();
+                        let mut m = map::get(&existing).m;
                         for (k, v) in map::get(&meta).m.iter() {
                             m.insert(*k, *v);
                         }
@@ -773,7 +773,7 @@ impl<'a> Reader<'a> {
                 Ok(list::from_slice(&[core_sym("seq"), c]))
             }
             Some(Kind::Vector) => {
-                let items: Vec<Value> = vector::get(form).v.iter().cloned().collect();
+                let items: Vec<Value> = vector::get(form).iter().cloned().collect();
                 let c = self.sq_concat(&items)?;
                 Ok(list::from_slice(&[
                     core_sym("apply"),

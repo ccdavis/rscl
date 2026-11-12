@@ -79,7 +79,7 @@ fn defnative(form: &Value, args: &[Value]) -> CResult<Value> {
     }
     let mut param_syms = Vec::new();
     let mut types = Vec::new();
-    for p in params.v.iter() {
+    for p in params.iter() {
         let Some(sym) = symbol::as_sym(p) else {
             return fail(p, "defnative parameters must be symbols with a ^type tag");
         };
@@ -157,7 +157,7 @@ fn defmacro(form: &Value, args: &[Value]) -> CResult<Value> {
             return fail(&a[0], "defmacro requires a parameter vector");
         };
         let mut ps = vec![sym("&form"), sym("&env")];
-        ps.extend(params.v.iter().cloned());
+        ps.extend(params.iter().cloned());
         let mut arity = vec![vector::from_slice(&ps)];
         arity.extend_from_slice(&a[1..]);
         f.push(lst(&arity));

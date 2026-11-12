@@ -319,10 +319,8 @@ pub unsafe extern "C" fn rt_set_from_slice(items: *const Value, n: i64) -> Value
     let _hold = crate::gc::hold();
     let mut s = set::empty_set();
     for x in unsafe { args_slice(items, n) } {
-        // An equal element already there stays (as `hash-set` does).
-        if !s.contains(x) {
-            s.insert(*x);
-        }
+        // (An element equal to one already there is not added.)
+        s.insert(*x);
     }
     set::new(s)
 }
@@ -369,7 +367,7 @@ fn flag_contents(v: &Value) {
             }
         }
         Some(Kind::Vector) => {
-            for x in vector::get(v).v.iter() {
+            for x in vector::get(v).iter() {
                 flag(x);
             }
             flag(&vector::get(v).meta);

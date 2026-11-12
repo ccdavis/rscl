@@ -281,6 +281,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Some(Kind::Namespace) => "Namespace",
         Some(Kind::Cons) => "Cons",
         Some(Kind::VecSeq) => "VectorSeq",
+        Some(Kind::Node) => "Node",
         Some(Kind::Regex) => "Pattern",
         Some(Kind::Native) => "Native",
         Some(Kind::Type) => "Type",
